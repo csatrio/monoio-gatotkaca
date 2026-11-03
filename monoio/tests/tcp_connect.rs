@@ -1,7 +1,6 @@
 use std::{
     io::Write,
     net::{IpAddr, SocketAddr},
-    sync::LazyLock,
     thread::sleep,
     time::Duration,
 };
@@ -107,7 +106,7 @@ async fn connect_timeout_dst() {
         };
 
         let res = monoio::select! {
-            a = connect => false,
+            _ = connect => false,
             _ = monoio::time::sleep(std::time::Duration::from_secs(1)) => { true }
         };
         assert!(res);
@@ -125,7 +124,7 @@ fn create_test_server() -> u16 {
     let addr = listener.local_addr().unwrap();
 
     // the listener will not be closed until the test is done
-    let handler = std::thread::spawn(move || {
+    let _handler = std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(mut stream) => {
