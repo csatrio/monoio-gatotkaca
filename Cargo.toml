@@ -3,7 +3,6 @@
 members = [
     "monoio",
     "monoio-macros",
-    "monoio-compat",
 
     # Internal
     "examples",
