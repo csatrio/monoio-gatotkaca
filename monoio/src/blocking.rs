@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn hello_blocking() {
         let shared_pool = Box::new(NaiveThreadPool);
-        let mut rt = crate::RuntimeBuilder::<crate::FusionDriver>::new()
+        let mut rt = crate::RuntimeBuilder::<crate::IoUringDriver>::new()
             .attach_thread_pool(shared_pool)
             .enable_timer()
             .build()
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn blocking_panic() {
-        let mut rt = crate::RuntimeBuilder::<crate::FusionDriver>::new()
+        let mut rt = crate::RuntimeBuilder::<crate::IoUringDriver>::new()
             .with_blocking_strategy(crate::blocking::BlockingStrategy::Panic)
             .enable_timer()
             .build()
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn blocking_current() {
-        let mut rt = crate::RuntimeBuilder::<crate::FusionDriver>::new()
+        let mut rt = crate::RuntimeBuilder::<crate::IoUringDriver>::new()
             .with_blocking_strategy(crate::blocking::BlockingStrategy::ExecuteLocal)
             .enable_timer()
             .build()
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn drop_task() {
         let shared_pool = Box::new(FakeThreadPool);
-        let mut rt = crate::RuntimeBuilder::<crate::FusionDriver>::new()
+        let mut rt = crate::RuntimeBuilder::<crate::IoUringDriver>::new()
             .attach_thread_pool(shared_pool)
             .enable_timer()
             .build()
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn default_pool() {
         let shared_pool = Box::new(DefaultThreadPool::new(6));
-        let mut rt = crate::RuntimeBuilder::<crate::FusionDriver>::new()
+        let mut rt = crate::RuntimeBuilder::<crate::IoUringDriver>::new()
             .attach_thread_pool(shared_pool)
             .enable_timer()
             .build()

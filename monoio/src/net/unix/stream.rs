@@ -52,14 +52,11 @@ impl UnixStream {
         socklen: libc::socklen_t,
     ) -> io::Result<Self> {
         let socket = new_socket(libc::AF_UNIX, libc::SOCK_STREAM)?;
-        let op = Op::connect_unix(SharedFd::new::<false>(socket)?, sockaddr, socklen)?;
+        let op = Op::connect_unix(SharedFd::new(socket)?, sockaddr, socklen)?;
         let completion = op.await;
         completion.meta.result?;
 
         let stream = Self::from_shared_fd(completion.data.fd);
-        if crate::driver::op::is_legacy() {
-            stream.writable(true).await?;
-        }
         // getsockopt
         let sys_socket = unsafe { std::os::unix::net::UnixStream::from_raw_fd(stream.fd.raw_fd()) };
         let err = sys_socket.take_error();
@@ -86,7 +83,7 @@ impl UnixStream {
 
     /// Creates new `UnixStream` from a `std::os::unix::net::UnixStream`.
     pub fn from_std(stream: std::os::unix::net::UnixStream) -> io::Result<Self> {
-        match SharedFd::new::<false>(stream.as_raw_fd()) {
+        match SharedFd::new(stream.as_raw_fd()) {
             Ok(shared) => {
                 let _ = stream.into_raw_fd();
                 Ok(Self::from_shared_fd(shared))
@@ -109,14 +106,9 @@ impl UnixStream {
     /// Note: Do not use it before every io. It is different from other runtimes!
     ///
     /// Everytime call to this method may pay a syscall cost.
-    /// In uring impl, it will push a PollAdd op; in epoll impl, it will use use
-    /// inner readiness state; if !relaxed, it will call syscall poll after that.
-    ///
-    /// If relaxed, on legacy driver it may return false positive result.
-    /// If you want to do io by your own, you must maintain io readiness and wait
-    /// for io ready with relaxed=false.
-    pub async fn readable(&self, relaxed: bool) -> io::Result<()> {
-        let op = Op::poll_read(&self.fd, relaxed).unwrap();
+    /// It pushes a PollAdd op to the ring.
+    pub async fn readable(&self) -> io::Result<()> {
+        let op = Op::poll_read(&self.fd).unwrap();
         op.wait().await
     }
 
@@ -124,14 +116,9 @@ impl UnixStream {
     /// Note: Do not use it before every io. It is different from other runtimes!
     ///
     /// Everytime call to this method may pay a syscall cost.
-    /// In uring impl, it will push a PollAdd op; in epoll impl, it will use use
-    /// inner readiness state; if !relaxed, it will call syscall poll after that.
-    ///
-    /// If relaxed, on legacy driver it may return false positive result.
-    /// If you want to do io by your own, you must maintain io readiness and wait
-    /// for io ready with relaxed=false.
-    pub async fn writable(&self, relaxed: bool) -> io::Result<()> {
-        let op = Op::poll_write(&self.fd, relaxed).unwrap();
+    /// It pushes a PollAdd op to the ring.
+    pub async fn writable(&self) -> io::Result<()> {
+        let op = Op::poll_write(&self.fd).unwrap();
         op.wait().await
     }
 }
@@ -306,63 +293,5 @@ impl CancelableAsyncReadRent for UnixStream {
         let op = Op::readv(fd, buf).unwrap();
         let _guard = c.associate_op(op.op_canceller());
         op.result().await
-    }
-}
-
-#[cfg(all(unix, feature = "legacy", feature = "tokio-compat"))]
-impl tokio::io::AsyncRead for UnixStream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        unsafe {
-            let slice = buf.unfilled_mut();
-            let raw_buf = crate::buf::RawBuf::new(slice.as_ptr() as *const u8, slice.len());
-            let mut recv = Op::recv_raw(&self.fd, raw_buf);
-            let ret = ready!(crate::driver::op::PollLegacy::poll_legacy(&mut recv, cx));
-
-            std::task::Poll::Ready(ret.result.map(|n| {
-                let n = n.into_inner();
-                buf.assume_init(n as usize);
-                buf.advance(n as usize);
-            }))
-        }
-    }
-}
-
-#[cfg(all(unix, feature = "legacy", feature = "tokio-compat"))]
-impl tokio::io::AsyncWrite for UnixStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, io::Error>> {
-        unsafe {
-            let raw_buf = crate::buf::RawBuf::new(buf.as_ptr(), buf.len());
-            let mut send = Op::send_raw(&self.fd, raw_buf);
-            let ret = ready!(crate::driver::op::PollLegacy::poll_legacy(&mut send, cx));
-
-            std::task::Poll::Ready(ret.result.map(|n| n.into_inner() as usize))
-        }
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), io::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), io::Error>> {
-        let fd = self.as_raw_fd();
-        let res = match unsafe { libc::shutdown(fd, libc::SHUT_WR) } {
-            -1 => Err(io::Error::last_os_error()),
-            _ => Ok(()),
-        };
-        std::task::Poll::Ready(res)
     }
 }

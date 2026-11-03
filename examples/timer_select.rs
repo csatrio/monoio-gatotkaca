@@ -29,10 +29,7 @@ async fn main() {
 
     // A very important thing is if you use select to do timeout io,
     // you must cancel it manually.
-    // In epoll, dropping a read future has no side effect since we
-    // only wait for io ready, after waiting aborted, no syscall
-    // will be made.
-    // In io_uring, kernel may execute syscall at any time. So drop
+    // The kernel may execute the syscall at any time. So drop
     // a read future(even a AsyncCancel op will be issued after
     // dropping) does not mean it will be canceled instantly.
     // It may canceled, success or fail. We encourage you use our

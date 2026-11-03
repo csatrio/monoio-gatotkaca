@@ -34,8 +34,8 @@ impl UnixSeqpacket {
     pub fn pair() -> io::Result<(Self, Self)> {
         let (a, b) = pair(libc::SOCK_SEQPACKET)?;
         Ok((
-            Self::from_shared_fd(SharedFd::new::<false>(a)?),
-            Self::from_shared_fd(SharedFd::new::<false>(b)?),
+            Self::from_shared_fd(SharedFd::new(a)?),
+            Self::from_shared_fd(SharedFd::new(b)?),
         ))
     }
 
@@ -57,7 +57,7 @@ impl UnixSeqpacket {
         socklen: libc::socklen_t,
     ) -> io::Result<Self> {
         let socket = new_socket(libc::AF_UNIX, libc::SOCK_SEQPACKET)?;
-        let op = Op::connect_unix(SharedFd::new::<false>(socket)?, sockaddr, socklen)?;
+        let op = Op::connect_unix(SharedFd::new(socket)?, sockaddr, socklen)?;
         let completion = op.await;
         completion.meta.result?;
 
@@ -78,14 +78,9 @@ impl UnixSeqpacket {
     /// Note: Do not use it before every io. It is different from other runtimes!
     ///
     /// Everytime call to this method may pay a syscall cost.
-    /// In uring impl, it will push a PollAdd op; in epoll impl, it will use use
-    /// inner readiness state; if !relaxed, it will call syscall poll after that.
-    ///
-    /// If relaxed, on legacy driver it may return false positive result.
-    /// If you want to do io by your own, you must maintain io readiness and wait
-    /// for io ready with relaxed=false.
-    pub async fn readable(&self, relaxed: bool) -> io::Result<()> {
-        let op = Op::poll_read(&self.fd, relaxed).unwrap();
+    /// It pushes a PollAdd op to the ring.
+    pub async fn readable(&self) -> io::Result<()> {
+        let op = Op::poll_read(&self.fd).unwrap();
         op.wait().await
     }
 
@@ -93,14 +88,9 @@ impl UnixSeqpacket {
     /// Note: Do not use it before every io. It is different from other runtimes!
     ///
     /// Everytime call to this method may pay a syscall cost.
-    /// In uring impl, it will push a PollAdd op; in epoll impl, it will use use
-    /// inner readiness state; if !relaxed, it will call syscall poll after that.
-    ///
-    /// If relaxed, on legacy driver it may return false positive result.
-    /// If you want to do io by your own, you must maintain io readiness and wait
-    /// for io ready with relaxed=false.
-    pub async fn writable(&self, relaxed: bool) -> io::Result<()> {
-        let op = Op::poll_write(&self.fd, relaxed).unwrap();
+    /// It pushes a PollAdd op to the ring.
+    pub async fn writable(&self) -> io::Result<()> {
+        let op = Op::poll_write(&self.fd).unwrap();
         op.wait().await
     }
 

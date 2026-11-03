@@ -32,67 +32,11 @@ impl UCred {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "openbsd"))]
 pub(crate) use self::impl_linux::get_peer_cred;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-pub(crate) use self::impl_macos::get_peer_cred;
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-pub(crate) mod impl_macos {
-    use std::{
-        io,
-        mem::{size_of, MaybeUninit},
-        os::unix::io::AsRawFd,
-    };
-
-    use libc::{c_void, getpeereid, getsockopt, pid_t, LOCAL_PEEREPID, SOL_LOCAL};
-
-    use crate::net::unix::UnixStream;
-
-    pub(crate) fn get_peer_cred(sock: &UnixStream) -> io::Result<super::UCred> {
-        unsafe {
-            let raw_fd = sock.as_raw_fd();
-
-            let mut uid = MaybeUninit::uninit();
-            let mut gid = MaybeUninit::uninit();
-            let mut pid: MaybeUninit<pid_t> = MaybeUninit::uninit();
-            let mut pid_size: MaybeUninit<u32> = MaybeUninit::new(size_of::<pid_t>() as u32);
-
-            if getsockopt(
-                raw_fd,
-                SOL_LOCAL,
-                LOCAL_PEEREPID,
-                pid.as_mut_ptr() as *mut c_void,
-                pid_size.as_mut_ptr(),
-            ) != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-
-            assert!(pid_size.assume_init() == (size_of::<pid_t>() as u32));
-
-            let ret = getpeereid(raw_fd, uid.as_mut_ptr(), gid.as_mut_ptr());
-
-            if ret == 0 {
-                Ok(super::UCred {
-                    uid: uid.assume_init(),
-                    gid: gid.assume_init(),
-                    pid: Some(pid.assume_init()),
-                })
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        }
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "openbsd"))]
 pub(crate) mod impl_linux {
     use std::{io, mem};
 
-    #[cfg(target_os = "openbsd")]
-    use libc::sockpeercred as ucred;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     use libc::ucred;
     use libc::{c_void, getsockopt, socklen_t, SOL_SOCKET, SO_PEERCRED};
 

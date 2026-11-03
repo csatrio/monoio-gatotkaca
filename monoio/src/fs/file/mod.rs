@@ -8,14 +8,8 @@ use crate::{
     BufResult,
 };
 
-#[cfg(unix)]
 mod unix;
-#[cfg(unix)]
 use unix as file_impl;
-#[cfg(windows)]
-mod windows;
-#[cfg(windows)]
-use windows as file_impl;
 
 use crate::io::{AsyncReadRentAt, AsyncWriteRentAt};
 
@@ -156,28 +150,8 @@ impl File {
     /// It is not an error if the returned value `n` is smaller than the buffer
     /// size, even when the file contains enough data to fill the buffer.
     ///
-    /// # Platform-specific behavior
-    ///
-    /// - On unix-like platform
-    ///     - this function will **not** change the file pointer, and the `pos` always start from
-    ///       the begin of file.
-    /// - On windows
-    ///     - this function will change the file pointer, but the `pos` always start from the begin
-    ///       of file.
-    ///
-    /// Addtionally,
-    ///
-    /// - On Unix and Windows (without the `iouring` feature enabled or not support the `iouring`):
-    ///     - If the sync feature is enabled and the thread pool is attached, this operation will be
-    ///       executed on the blocking thread pool, preventing it from blocking the current thread.
-    ///     - If the sync feature is enabled but the thread pool is not attached, or if the sync
-    ///       feature is disabled, the operation will be executed on the local thread, blocking the
-    ///       current thread.
-    ///
-    /// - On Linux (with iouring enabled and supported):
-    ///
-    ///     This operation will use io-uring to execute the task asynchronously.
-    ///
+    /// This function will **not** change the file pointer, and the `pos` always start from
+    /// the begin of file. It uses io-uring to execute the task asynchronously.
     ///
     /// # Errors
     ///
@@ -313,18 +287,7 @@ impl File {
     /// underlying file is no longer able to accept bytes and will likely not be
     /// able to in the future as well, or that the buffer provided is empty.
     ///
-    /// # Platform-specific behavior
-    ///
-    /// - On Unix and Windows (without the `iouring` feature enabled or not support the `iouring`):
-    ///     - If the sync feature is enabled and the thread pool is attached, this operation will be
-    ///       executed on the blocking thread pool, preventing it from blocking the current thread.
-    ///     - If the sync feature is enabled but the thread pool is not attached, or if the sync
-    ///       feature is disabled, the operation will be executed on the local thread, blocking the
-    ///       current thread.
-    ///
-    /// - On Linux (with iouring enabled and supported):
-    ///
-    ///     This operation will use io-uring to execute the task asynchronously.
+    /// This operation uses io-uring to execute the task asynchronously.
     ///
     /// # Errors
     ///
@@ -588,13 +551,6 @@ impl AsyncWriteRent for File {
     /// longer accept bytes and likely won't be able to in the future, or that the provided buffer
     /// is empty.
     ///
-    /// # Platform-specific behavior
-    ///
-    /// - On windows
-    ///     - due to windows does not have syscall like `writev`, so the implement of this function
-    ///       on windows is by internally calling the `WriteFile` syscall to write each buffer into
-    ///       file.
-    ///
     /// # Errors
     ///
     /// Each `write` call may result in an I/O error, indicating the operation couldn't be
@@ -624,8 +580,6 @@ impl AsyncWriteRent for File {
     }
 
     /// Flushes the file, ensuring that all buffered contents are written to their destination.
-    ///
-    /// # Platform-specific behavior
     ///
     /// Since the `File` structure doesn't contain any internal buffers, this function is currently
     /// a no-op.
@@ -667,18 +621,7 @@ impl AsyncReadRent for File {
     /// It is not an error if `n` is smaller than the buffer size, even if there is enough data in
     /// the file to fill the buffer.
     ///
-    /// # Platform-specific behavior
-    ///
-    /// - On Unix and Windows (without the `iouring` feature enabled or not support the `iouring`):
-    ///     - If the sync feature is enabled and the thread pool is attached, this operation will be
-    ///       executed on the blocking thread pool, preventing it from blocking the current thread.
-    ///     - If the sync feature is enabled but the thread pool is not attached, or if the sync
-    ///       feature is disabled, the operation will be executed on the local thread, blocking the
-    ///       current thread.
-    ///
-    /// - On Linux (with iouring enabled and supported):
-    ///
-    ///     This operation will use io-uring to execute the task asynchronously.
+    /// This operation uses io-uring to execute the task asynchronously.
     ///
     /// # Errors
     ///
@@ -721,23 +664,7 @@ impl AsyncReadRent for File {
     /// It is not an error if the returned value `n` is smaller than the buffer
     /// size, even when the file contains enough data to fill the buffer.
     ///
-    /// # Platform-specific behavior
-    ///
-    /// - On windows
-    ///     - due to windows does not have syscall like `readv`, so the implement of this function
-    ///       on windows is by internally calling the `ReadFile` syscall to fill each buffer.
-    ///
-    /// - On Unix and Windows (without the `iouring` feature enabled or not support the `iouring`):
-    ///     - If the sync feature is enabled and the thread pool is attached, this operation will be
-    ///       executed on the blocking thread pool, preventing it from blocking the current thread.
-    ///     - If the sync feature is enabled but the thread pool is not attached, or if the sync
-    ///       feature is disabled, the operation will be executed on the local thread, blocking the
-    ///       current thread.
-    ///
-    /// - On Linux (with iouring enabled and supported):
-    ///
-    ///     This operation will use io-uring to execute the task asynchronously.
-    ///
+    /// This operation uses io-uring to execute the task asynchronously.
     ///
     /// # Errors
     ///

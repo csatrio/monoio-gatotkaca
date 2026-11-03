@@ -55,7 +55,7 @@ impl UnixListener {
         sys_listener.bind(&addr)?;
         sys_listener.listen(config.backlog)?;
 
-        let fd = SharedFd::new::<false>(sys_listener.into_raw_fd())?;
+        let fd = SharedFd::new(sys_listener.into_raw_fd())?;
 
         Ok(Self::from_shared_fd(fd))
     }
@@ -77,7 +77,7 @@ impl UnixListener {
         let fd = completion.meta.result?;
 
         // Construct stream
-        let stream = UnixStream::from_shared_fd(SharedFd::new::<false>(fd.into_inner() as _)?);
+        let stream = UnixStream::from_shared_fd(SharedFd::new(fd.into_inner() as _)?);
 
         // Construct SocketAddr
         let mut storage = unsafe { std::mem::MaybeUninit::assume_init(completion.data.addr.0) };
@@ -107,7 +107,7 @@ impl UnixListener {
         let fd = completion.meta.result?;
 
         // Construct stream
-        let stream = UnixStream::from_shared_fd(SharedFd::new::<false>(fd.into_inner() as _)?);
+        let stream = UnixStream::from_shared_fd(SharedFd::new(fd.into_inner() as _)?);
 
         // Construct SocketAddr
         let mut storage = unsafe { std::mem::MaybeUninit::assume_init(completion.data.addr.0) };
@@ -124,20 +124,15 @@ impl UnixListener {
     /// Note: Do not use it before every io. It is different from other runtimes!
     ///
     /// Everytime call to this method may pay a syscall cost.
-    /// In uring impl, it will push a PollAdd op; in epoll impl, it will use use
-    /// inner readiness state; if !relaxed, it will call syscall poll after that.
-    ///
-    /// If relaxed, on legacy driver it may return false positive result.
-    /// If you want to do io by your own, you must maintain io readiness and wait
-    /// for io ready with relaxed=false.
-    pub async fn readable(&self, relaxed: bool) -> io::Result<()> {
-        let op = Op::poll_read(&self.fd, relaxed).unwrap();
+    /// It pushes a PollAdd op to the ring.
+    pub async fn readable(&self) -> io::Result<()> {
+        let op = Op::poll_read(&self.fd).unwrap();
         op.wait().await
     }
 
     /// Creates new `UnixListener` from a `std::os::unix::net::UnixListener`.
     pub fn from_std(sys_listener: std::os::unix::net::UnixListener) -> io::Result<Self> {
-        match SharedFd::new::<false>(sys_listener.as_raw_fd()) {
+        match SharedFd::new(sys_listener.as_raw_fd()) {
             Ok(shared) => Ok(Self {
                 fd: shared,
                 sys_listener: Some(sys_listener),

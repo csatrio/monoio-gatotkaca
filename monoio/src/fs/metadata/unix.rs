@@ -3,15 +3,10 @@ use libc::mode_t;
 use crate::fs::{file_type::FileType, permissions::FilePermissions};
 
 pub(crate) struct FileAttr {
-    #[cfg(target_os = "linux")]
     pub(crate) stat: libc::stat64,
-    #[cfg(target_os = "macos")]
-    pub(crate) stat: libc::stat,
-    #[cfg(target_os = "linux")]
     pub(crate) statx_extra_fields: Option<StatxExtraFields>,
 }
 
-#[cfg(unix)]
 impl FileAttr {
     pub(crate) fn size(&self) -> u64 {
         self.stat.st_size as u64
@@ -31,7 +26,6 @@ impl FileAttr {
 }
 
 /// Extra fields that are available in `statx` struct.
-#[cfg(target_os = "linux")]
 pub(crate) struct StatxExtraFields {
     pub(crate) stx_mask: u32,
     pub(crate) stx_btime: libc::statx_timestamp,
@@ -39,7 +33,6 @@ pub(crate) struct StatxExtraFields {
 
 /// Convert a `statx` struct to not platform-specific `FileAttr`.
 /// Current implementation is only for Linux.
-#[cfg(target_os = "linux")]
 impl From<libc::statx> for FileAttr {
     fn from(buf: libc::statx) -> Self {
         let mut stat: libc::stat64 = unsafe { std::mem::zeroed() };
@@ -71,12 +64,5 @@ impl From<libc::statx> for FileAttr {
             stat,
             statx_extra_fields: Some(extra),
         }
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl From<libc::stat> for FileAttr {
-    fn from(stat: libc::stat) -> Self {
-        Self { stat }
     }
 }

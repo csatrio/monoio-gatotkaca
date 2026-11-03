@@ -14,7 +14,6 @@ struct FinalConfig {
     entries: Option<u32>,
     timer_enabled: Option<bool>,
     threads: Option<u32>,
-    driver: DriverType,
 }
 
 /// Config used in case of the attribute not being able to build a valid config
@@ -22,21 +21,12 @@ const DEFAULT_ERROR_CONFIG: FinalConfig = FinalConfig {
     entries: None,
     timer_enabled: None,
     threads: None,
-    driver: DriverType::Fusion,
 };
 
 struct Configuration {
     entries: Option<(u32, Span)>,
     timer_enabled: Option<(bool, Span)>,
     threads: Option<(u32, Span)>,
-    driver: Option<(DriverType, Span)>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DriverType {
-    Legacy,
-    Uring,
-    Fusion,
 }
 
 impl Configuration {
@@ -45,18 +35,7 @@ impl Configuration {
             entries: None,
             timer_enabled: None,
             threads: None,
-            driver: None,
         }
-    }
-
-    fn set_driver(&mut self, driver: syn::Lit, span: Span) -> Result<(), syn::Error> {
-        if self.driver.is_some() {
-            return Err(syn::Error::new(span, "`driver` set multiple times."));
-        }
-
-        let driver = parse_driver(driver, span, "driver")?;
-        self.driver = Some((driver, span));
-        Ok(())
     }
 
     fn set_threads(&mut self, threads: syn::Lit, span: Span) -> Result<(), syn::Error> {
@@ -97,7 +76,6 @@ impl Configuration {
             entries: self.entries.map(|(e, _)| e),
             timer_enabled: self.timer_enabled.map(|(t, _)| t),
             threads: self.threads.map(|(t, _)| t),
-            driver: self.driver.map(|(d, _)| d).unwrap_or(DriverType::Fusion),
         })
     }
 }
@@ -115,32 +93,6 @@ fn parse_int(int: syn::Lit, span: Span, field: &str) -> Result<usize, syn::Error
         _ => Err(syn::Error::new(
             span,
             format!("Failed to parse value of `{field}` as integer."),
-        )),
-    }
-}
-
-#[allow(unused)]
-fn parse_string(lit: syn::Lit, span: Span, field: &str) -> Result<String, syn::Error> {
-    match lit {
-        syn::Lit::Str(s) => Ok(s.value()),
-        syn::Lit::Verbatim(s) => Ok(s.to_string()),
-        _ => Err(syn::Error::new(
-            span,
-            format!("Failed to parse value of `{field}` as string."),
-        )),
-    }
-}
-
-#[allow(unused)]
-fn parse_driver(lit: syn::Lit, span: Span, field: &str) -> Result<DriverType, syn::Error> {
-    let val = parse_string(lit, span, field)?;
-    match val.as_str() {
-        "legacy" => Ok(DriverType::Legacy),
-        "uring" | "io_uring" | "iouring" => Ok(DriverType::Uring),
-        "fusion" | "auto" | "detect" => Ok(DriverType::Fusion),
-        _ => Err(syn::Error::new(
-            span,
-            format!("Failed to parse value of `{field}` as DriverType."),
         )),
     }
 }
@@ -198,7 +150,6 @@ fn build_config(input: syn::ItemFn, args: AttributeArgs) -> Result<FinalConfig, 
                             ));
                         }
                     }
-                    "driver" => config.set_driver(lit.clone(), syn::spanned::Spanned::span(lit))?,
                     name => {
                         let msg = format!(
                             "Unknown attribute {name} is specified; expected one of: \
@@ -253,17 +204,7 @@ fn parse_knobs(mut input: syn::ItemFn, is_test: bool, config: FinalConfig) -> To
         (start, end)
     };
 
-    let mut rt = match config.driver {
-        DriverType::Legacy => {
-            quote_spanned! {last_stmt_start_span=>monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()}
-        }
-        DriverType::Uring => {
-            quote_spanned! {last_stmt_start_span=>monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()}
-        }
-        DriverType::Fusion => {
-            quote_spanned! {last_stmt_start_span=>monoio::RuntimeBuilder::<monoio::FusionDriver>::new()}
-        }
-    };
+    let mut rt = quote_spanned! {last_stmt_start_span=>monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()};
 
     if let Some(entries) = config.entries {
         rt = quote! { #rt.with_entries(#entries) }
@@ -349,24 +290,8 @@ fn parse_knobs(mut input: syn::ItemFn, is_test: bool, config: FinalConfig) -> To
     } else {
         quote! {}
     };
-    let cfg_attr = if is_test {
-        match config.driver {
-            DriverType::Legacy => quote! {
-                #[cfg(feature = "legacy")]
-            },
-            DriverType::Uring => quote! {
-                #[cfg(all(target_os = "linux", feature = "iouring"))]
-            },
-            DriverType::Fusion => quote! {
-                #[cfg(any(feature = "legacy", feature = "iouring"))]
-            },
-        }
-    } else {
-        quote! {}
-    };
     let result = quote! {
         #header
-        #cfg_attr
         #input
     };
     result.into()
@@ -448,32 +373,17 @@ pub(crate) fn test_all(args: TokenStream, item: TokenStream) -> TokenStream {
             .parse(args)
             .and_then(|args| build_config(input.clone(), args))
     };
-    let mut config = match config {
+    let config = match config {
         Ok(config) => config,
         Err(e) => {
             return token_stream_with_error(parse_knobs(input, true, DEFAULT_ERROR_CONFIG), e)
         }
     };
 
-    let mut output = TokenStream::new();
-
-    let mut input_uring = input.clone();
+    let mut input_uring = input;
     input_uring.sig.ident = proc_macro2::Ident::new(
         &format!("uring_{}", input_uring.sig.ident),
         input_uring.sig.ident.span(),
     );
-    config.driver = DriverType::Uring;
-    let token_uring = parse_knobs(input_uring, true, config);
-    output.extend(token_uring);
-
-    let mut input_legacy = input;
-    input_legacy.sig.ident = proc_macro2::Ident::new(
-        &format!("legacy_{}", input_legacy.sig.ident),
-        input_legacy.sig.ident.span(),
-    );
-    config.driver = DriverType::Legacy;
-    let token_legacy = parse_knobs(input_legacy, true, config);
-    output.extend(token_legacy);
-
-    output
+    parse_knobs(input_uring, true, config)
 }

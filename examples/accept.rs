@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use monoio::net::TcpListener;
 
-#[monoio::main(driver = "fusion", enable_timer = true)]
+#[monoio::main(enable_timer = true)]
 async fn main() {
     let listener = TcpListener::bind("127.0.0.1:50002").unwrap();
     monoio::spawn(async {

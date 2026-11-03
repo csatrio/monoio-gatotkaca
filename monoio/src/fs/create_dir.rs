@@ -9,7 +9,6 @@ use super::DirBuilder;
 /// - This function require the provided path's parent are all existing.
 ///     - To create a directory and all its missing parents at the same time, use the
 ///       [`create_dir_all`] function.
-/// - Currently this function is supported on unix, windows is unimplement.
 ///
 /// # Errors
 ///
@@ -40,7 +39,6 @@ pub async fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 ///
 /// # Note
 ///
-/// - Currently this function is supported on unix, windows is unimplement.
 ///
 /// # Errors
 ///

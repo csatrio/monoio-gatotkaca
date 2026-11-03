@@ -1,16 +1,9 @@
-#[cfg(unix)]
 mod unix;
-#[cfg(windows)]
-mod windows;
 
-#[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 use std::{io, path::Path};
 
-#[cfg(unix)]
 use unix as sys;
-#[cfg(windows)]
-use windows as sys;
 
 /// A builder used to create directories in various manners.
 ///
@@ -140,7 +133,6 @@ impl Default for DirBuilder {
     }
 }
 
-#[cfg(unix)]
 impl DirBuilderExt for DirBuilder {
     fn mode(&mut self, mode: u32) -> &mut Self {
         self.inner.set_mode(mode);

@@ -1,5 +1,4 @@
 //! A example to show how to use UnixStream.
-#[cfg(unix)]
 use {
     local_sync::oneshot::channel,
     monoio::{
@@ -10,7 +9,6 @@ use {
 
 const ADDRESS: &str = "/tmp/monoio-unix-test.sock";
 
-#[cfg(unix)]
 #[monoio::main]
 async fn main() {
     let (mut tx, rx) = channel::<()>();
@@ -39,7 +37,3 @@ async fn main() {
     drop(listener);
     std::fs::remove_file(ADDRESS).ok();
 }
-
-#[cfg(windows)]
-#[monoio::main]
-async fn main() {}

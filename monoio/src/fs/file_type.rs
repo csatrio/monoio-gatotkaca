@@ -8,7 +8,6 @@ pub struct FileType {
     pub(crate) mode: mode_t,
 }
 
-#[cfg(unix)]
 impl FileType {
     /// Returns `true` if this file type is a directory.
     pub fn is_dir(&self) -> bool {

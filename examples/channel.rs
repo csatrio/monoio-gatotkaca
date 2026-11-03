@@ -10,7 +10,7 @@ async fn main() {
     let (tx, rx) = oneshot::channel::<u8>();
     let t = std::thread::spawn(move || {
         println!("remote thread created");
-        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
             .build()
             .unwrap();
         rt.block_on(async move {

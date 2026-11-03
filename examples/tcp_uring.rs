@@ -1,15 +1,10 @@
 //! An example to show how to use TcpStream.
 
-#[cfg(not(target_os = "linux"))]
-fn main() {}
-
-#[cfg(target_os = "linux")]
 fn main() {
     println!("Will run with IoUringDriver(you must be on linux and enable iouring feature)");
     run::<monoio::IoUringDriver>();
 }
 
-#[cfg(target_os = "linux")]
 fn run<D>()
 where
     D: monoio::Buildable + monoio::Driver,

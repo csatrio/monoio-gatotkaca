@@ -126,23 +126,12 @@ fn write_vectored_logic<C: std::io::Write + ?Sized, T: IoVecBuf>(
     buf_vec: T,
 ) -> BufResult<usize, T> {
     let bufs: &[std::io::IoSlice<'_>];
-    #[cfg(unix)]
     {
         // SAFETY: IoSlice<'_> is repr(transparent) over libc::iovec
         bufs = unsafe {
             std::slice::from_raw_parts(
                 buf_vec.read_iovec_ptr() as *const std::io::IoSlice<'_>,
                 buf_vec.read_iovec_len(),
-            )
-        };
-    }
-    #[cfg(windows)]
-    {
-        // SAFETY: IoSlice<'_> is repr(transparent) over WSABUF
-        bufs = unsafe {
-            std::slice::from_raw_parts(
-                buf_vec.read_wsabuf_ptr() as *const std::io::IoSlice<'_>,
-                buf_vec.read_wsabuf_len(),
             )
         };
     }
@@ -193,7 +182,6 @@ impl AsyncWriteRent for Vec<u8> {
     #[inline]
     fn writev<T: IoVecBuf>(&mut self, buf_vec: T) -> impl Future<Output = BufResult<usize, T>> {
         let total_bytes_to_write: usize;
-        #[cfg(unix)]
         {
             // SAFETY: IoVecBuf guarantees valid iovec array
             let iovec_array_ptr = buf_vec.read_iovec_ptr();
@@ -204,20 +192,6 @@ impl AsyncWriteRent for Vec<u8> {
                 iovec_slice,
                 |iovec: &libc::iovec| iovec.iov_base as *const u8,
                 |iovec: &libc::iovec| iovec.iov_len,
-            );
-        }
-        #[cfg(windows)]
-        {
-            // SAFETY: IoVecBuf guarantees valid WSABUF array
-            let wsabuf_array_ptr = buf_vec.read_wsabuf_ptr();
-            let wsabuf_count = buf_vec.read_wsabuf_len();
-            let wsabuf_slice =
-                unsafe { std::slice::from_raw_parts(wsabuf_array_ptr, wsabuf_count) };
-            total_bytes_to_write = extend_vec_from_platform_bufs(
-                self,
-                wsabuf_slice,
-                |wsabuf: &windows_sys::Win32::Networking::WinSock::WSABUF| wsabuf.buf as *const u8,
-                |wsabuf: &windows_sys::Win32::Networking::WinSock::WSABUF| wsabuf.len as usize,
             );
         }
         std::future::ready((Ok(total_bytes_to_write), buf_vec))

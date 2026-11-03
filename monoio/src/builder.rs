@@ -1,10 +1,6 @@
 use std::{io, marker::PhantomData};
 
-#[cfg(all(target_os = "linux", feature = "iouring"))]
 use crate::driver::IoUringDriver;
-#[cfg(feature = "legacy")]
-use crate::driver::LegacyDriver;
-#[cfg(any(feature = "legacy", feature = "iouring"))]
 use crate::utils::thread_id::gen_id;
 use crate::{
     driver::Driver,
@@ -19,7 +15,6 @@ pub struct RuntimeBuilder<D> {
     // iouring entries
     entries: Option<u32>,
 
-    #[cfg(all(target_os = "linux", feature = "iouring"))]
     urb: io_uring::Builder,
 
     // blocking handle
@@ -59,7 +54,6 @@ impl<T> RuntimeBuilder<T> {
         Self {
             entries: None,
 
-            #[cfg(all(target_os = "linux", feature = "iouring"))]
             urb: io_uring::IoUring::builder(),
 
             #[cfg(feature = "sync")]
@@ -89,39 +83,11 @@ macro_rules! direct_build {
     };
 }
 
-#[cfg(all(target_os = "linux", feature = "iouring"))]
 direct_build!(IoUringDriver);
-#[cfg(all(target_os = "linux", feature = "iouring"))]
 direct_build!(TimeDriver<IoUringDriver>);
-#[cfg(feature = "legacy")]
-direct_build!(LegacyDriver);
-#[cfg(feature = "legacy")]
-direct_build!(TimeDriver<LegacyDriver>);
 
 // ===== builder impl =====
 
-#[cfg(feature = "legacy")]
-impl Buildable for LegacyDriver {
-    fn build(this: RuntimeBuilder<Self>) -> io::Result<Runtime<LegacyDriver>> {
-        let thread_id = gen_id();
-        #[cfg(feature = "sync")]
-        let blocking_handle = this.blocking_handle;
-
-        BUILD_THREAD_ID.set(&thread_id, || {
-            let driver = match this.entries {
-                Some(entries) => LegacyDriver::new_with_entries(entries)?,
-                None => LegacyDriver::new()?,
-            };
-            #[cfg(feature = "sync")]
-            let context = crate::runtime::Context::new(blocking_handle);
-            #[cfg(not(feature = "sync"))]
-            let context = crate::runtime::Context::new();
-            Ok(Runtime::new(context, driver))
-        })
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "iouring"))]
 impl Buildable for IoUringDriver {
     fn build(this: RuntimeBuilder<Self>) -> io::Result<Runtime<IoUringDriver>> {
         let thread_id = gen_id();
@@ -161,127 +127,10 @@ impl<D> RuntimeBuilder<D> {
     /// inner `io_uring` API.
     ///
     /// Refer to the [`io_uring::Builder`] documentation for all the supported methods.
-    #[cfg(all(target_os = "linux", feature = "iouring"))]
     #[must_use]
     pub fn uring_builder(mut self, urb: io_uring::Builder) -> Self {
         self.urb = urb;
         self
-    }
-}
-
-// ===== FusionDriver =====
-
-/// Fake driver only for conditionally building.
-#[cfg(any(all(target_os = "linux", feature = "iouring"), feature = "legacy"))]
-pub struct FusionDriver;
-
-#[cfg(any(all(target_os = "linux", feature = "iouring"), feature = "legacy"))]
-impl RuntimeBuilder<FusionDriver> {
-    /// Build the runtime.
-    #[cfg(all(target_os = "linux", feature = "iouring", feature = "legacy"))]
-    pub fn build(self) -> io::Result<crate::FusionRuntime<IoUringDriver, LegacyDriver>> {
-        if crate::utils::detect_uring() {
-            let builder = RuntimeBuilder::<IoUringDriver> {
-                entries: self.entries,
-                urb: self.urb,
-                #[cfg(feature = "sync")]
-                blocking_handle: self.blocking_handle,
-                _mark: PhantomData,
-            };
-            info!("io_uring driver built");
-            Ok(builder.build()?.into())
-        } else {
-            let builder = RuntimeBuilder::<LegacyDriver> {
-                entries: self.entries,
-                urb: self.urb,
-                #[cfg(feature = "sync")]
-                blocking_handle: self.blocking_handle,
-                _mark: PhantomData,
-            };
-            info!("legacy driver built");
-            Ok(builder.build()?.into())
-        }
-    }
-
-    /// Build the runtime.
-    #[cfg(not(all(target_os = "linux", feature = "iouring")))]
-    pub fn build(self) -> io::Result<crate::FusionRuntime<LegacyDriver>> {
-        let builder = RuntimeBuilder::<LegacyDriver> {
-            entries: self.entries,
-            #[cfg(feature = "sync")]
-            blocking_handle: self.blocking_handle,
-            _mark: PhantomData,
-        };
-        Ok(builder.build()?.into())
-    }
-
-    /// Build the runtime.
-    #[cfg(all(target_os = "linux", feature = "iouring", not(feature = "legacy")))]
-    pub fn build(self) -> io::Result<crate::FusionRuntime<IoUringDriver>> {
-        let builder = RuntimeBuilder::<IoUringDriver> {
-            entries: self.entries,
-            urb: self.urb,
-            #[cfg(feature = "sync")]
-            blocking_handle: self.blocking_handle,
-            _mark: PhantomData,
-        };
-        Ok(builder.build()?.into())
-    }
-}
-
-#[cfg(any(all(target_os = "linux", feature = "iouring"), feature = "legacy"))]
-impl RuntimeBuilder<TimeDriver<FusionDriver>> {
-    /// Build the runtime.
-    #[cfg(all(target_os = "linux", feature = "iouring", feature = "legacy"))]
-    pub fn build(
-        self,
-    ) -> io::Result<crate::FusionRuntime<TimeDriver<IoUringDriver>, TimeDriver<LegacyDriver>>> {
-        if crate::utils::detect_uring() {
-            let builder = RuntimeBuilder::<TimeDriver<IoUringDriver>> {
-                entries: self.entries,
-                urb: self.urb,
-                #[cfg(feature = "sync")]
-                blocking_handle: self.blocking_handle,
-                _mark: PhantomData,
-            };
-            info!("io_uring driver with timer built");
-            Ok(builder.build()?.into())
-        } else {
-            let builder = RuntimeBuilder::<TimeDriver<LegacyDriver>> {
-                entries: self.entries,
-                urb: self.urb,
-                #[cfg(feature = "sync")]
-                blocking_handle: self.blocking_handle,
-                _mark: PhantomData,
-            };
-            info!("legacy driver with timer built");
-            Ok(builder.build()?.into())
-        }
-    }
-
-    /// Build the runtime.
-    #[cfg(not(all(target_os = "linux", feature = "iouring")))]
-    pub fn build(self) -> io::Result<crate::FusionRuntime<TimeDriver<LegacyDriver>>> {
-        let builder = RuntimeBuilder::<TimeDriver<LegacyDriver>> {
-            entries: self.entries,
-            #[cfg(feature = "sync")]
-            blocking_handle: self.blocking_handle,
-            _mark: PhantomData,
-        };
-        Ok(builder.build()?.into())
-    }
-
-    /// Build the runtime.
-    #[cfg(all(target_os = "linux", feature = "iouring", not(feature = "legacy")))]
-    pub fn build(self) -> io::Result<crate::FusionRuntime<TimeDriver<IoUringDriver>>> {
-        let builder = RuntimeBuilder::<TimeDriver<IoUringDriver>> {
-            entries: self.entries,
-            urb: self.urb,
-            #[cfg(feature = "sync")]
-            blocking_handle: self.blocking_handle,
-            _mark: PhantomData,
-        };
-        Ok(builder.build()?.into())
     }
 }
 
@@ -290,12 +139,7 @@ mod time_wrap {
     pub trait TimeWrapable {}
 }
 
-#[cfg(all(target_os = "linux", feature = "iouring"))]
 impl time_wrap::TimeWrapable for IoUringDriver {}
-#[cfg(feature = "legacy")]
-impl time_wrap::TimeWrapable for LegacyDriver {}
-#[cfg(any(all(target_os = "linux", feature = "iouring"), feature = "legacy"))]
-impl time_wrap::TimeWrapable for FusionDriver {}
 
 impl<D: Driver> Buildable for TimeDriver<D>
 where
@@ -308,7 +152,6 @@ where
             mut context,
         } = Buildable::build(RuntimeBuilder::<D> {
             entries: this.entries,
-            #[cfg(all(target_os = "linux", feature = "iouring"))]
             urb: this.urb,
             #[cfg(feature = "sync")]
             blocking_handle: this.blocking_handle,
@@ -336,7 +179,6 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
     pub fn enable_timer(self) -> RuntimeBuilder<TimeDriver<D>> {
         let Self {
             entries,
-            #[cfg(all(target_os = "linux", feature = "iouring"))]
             urb,
             #[cfg(feature = "sync")]
             blocking_handle,
@@ -344,7 +186,6 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
         } = self;
         RuntimeBuilder {
             entries,
-            #[cfg(all(target_os = "linux", feature = "iouring"))]
             urb,
             #[cfg(feature = "sync")]
             blocking_handle,

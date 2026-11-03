@@ -1,9 +1,7 @@
 use std::{fmt::Debug, os::unix::fs::PermissionsExt};
 
-#[cfg(unix)]
 use libc::mode_t;
 
-#[cfg(unix)]
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct FilePermissions {
     pub(crate) mode: mode_t,
@@ -14,7 +12,6 @@ impl FilePermissions {
         self.mode & 0o222 == 0
     }
 
-    #[cfg(target_os = "linux")]
     fn mode(&self) -> u32 {
         self.mode
     }
@@ -26,15 +23,9 @@ impl FilePermissions {
             self.mode |= 0o222;
         }
     }
-
-    #[cfg(not(target_os = "linux"))]
-    fn mode(&self) -> u32 {
-        unimplemented!()
-    }
 }
 
 /// Representation of the various permissions on a file.
-#[cfg(unix)]
 pub struct Permissions(pub(crate) FilePermissions);
 
 impl Permissions {

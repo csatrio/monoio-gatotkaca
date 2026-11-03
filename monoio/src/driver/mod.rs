@@ -1,26 +1,12 @@
 /// Monoio Driver.
 #[allow(dead_code)]
 pub(crate) mod op;
-#[cfg(feature = "poll-io")]
-pub(crate) mod poll;
-#[cfg(any(feature = "legacy", feature = "poll-io"))]
-pub(crate) mod ready;
-#[cfg(any(feature = "legacy", feature = "poll-io"))]
-pub(crate) mod scheduled_io;
 #[allow(dead_code)]
 pub(crate) mod shared_fd;
 #[cfg(feature = "sync")]
 pub(crate) mod thread;
 
-#[cfg(feature = "legacy")]
-mod legacy;
-#[cfg(all(target_os = "linux", feature = "iouring"))]
 mod uring;
-
-#[allow(missing_docs, unreachable_pub, dead_code, unused_imports)]
-#[cfg(all(windows, any(feature = "legacy", feature = "poll-io")))]
-pub(crate) mod iocp;
-
 mod util;
 
 use std::{
@@ -29,15 +15,8 @@ use std::{
     time::Duration,
 };
 
-#[allow(unreachable_pub)]
-#[cfg(feature = "legacy")]
-pub use self::legacy::LegacyDriver;
-#[cfg(feature = "legacy")]
-use self::legacy::LegacyInner;
 use self::op::{CompletionMeta, Op, OpAble};
-#[cfg(all(target_os = "linux", feature = "iouring"))]
 pub use self::uring::IoUringDriver;
-#[cfg(all(target_os = "linux", feature = "iouring"))]
 use self::uring::UringInner;
 
 /// Unpark a runtime of another thread.
@@ -93,173 +72,40 @@ pub trait Driver {
 scoped_thread_local!(pub(crate) static CURRENT: Inner);
 
 #[derive(Clone)]
-pub(crate) enum Inner {
-    #[cfg(all(target_os = "linux", feature = "iouring"))]
-    Uring(std::rc::Rc<std::cell::UnsafeCell<UringInner>>),
-    #[cfg(feature = "legacy")]
-    Legacy(std::rc::Rc<std::cell::UnsafeCell<LegacyInner>>),
-}
+pub(crate) struct Inner(std::rc::Rc<std::cell::UnsafeCell<UringInner>>);
 
 impl Inner {
     fn submit_with<T: OpAble>(&self, data: T) -> io::Result<Op<T>> {
-        match self {
-            #[cfg(all(target_os = "linux", feature = "iouring"))]
-            Inner::Uring(this) => UringInner::submit_with_data(this, data),
-            #[cfg(feature = "legacy")]
-            Inner::Legacy(this) => LegacyInner::submit_with_data(this, data),
-            #[cfg(all(
-                not(feature = "legacy"),
-                not(all(target_os = "linux", feature = "iouring"))
-            ))]
-            _ => {
-                util::feature_panic();
-            }
-        }
+        UringInner::submit_with_data(&self.0, data)
     }
 
-    #[allow(unused)]
     fn poll_op<T: OpAble>(
         &self,
-        data: &mut T,
+        _data: &mut T,
         index: usize,
         cx: &mut Context<'_>,
     ) -> Poll<CompletionMeta> {
-        match self {
-            #[cfg(all(target_os = "linux", feature = "iouring"))]
-            Inner::Uring(this) => UringInner::poll_op(this, index, cx),
-            #[cfg(feature = "legacy")]
-            Inner::Legacy(this) => LegacyInner::poll_op::<T>(this, data, cx),
-            #[cfg(all(
-                not(feature = "legacy"),
-                not(all(target_os = "linux", feature = "iouring"))
-            ))]
-            _ => {
-                util::feature_panic();
-            }
-        }
+        UringInner::poll_op(&self.0, index, cx)
     }
 
-    #[cfg(feature = "poll-io")]
-    fn poll_legacy_op<T: OpAble>(
-        &self,
-        data: &mut T,
-        cx: &mut Context<'_>,
-    ) -> Poll<CompletionMeta> {
-        match self {
-            #[cfg(all(target_os = "linux", feature = "iouring"))]
-            Inner::Uring(this) => UringInner::poll_legacy_op(this, data, cx),
-            #[cfg(feature = "legacy")]
-            Inner::Legacy(this) => LegacyInner::poll_op::<T>(this, data, cx),
-            #[cfg(all(
-                not(feature = "legacy"),
-                not(all(target_os = "linux", feature = "iouring"))
-            ))]
-            _ => {
-                util::feature_panic();
-            }
-        }
-    }
-
-    #[cfg(all(target_os = "linux", feature = "iouring"))]
     #[inline]
     fn drop_op<T: 'static>(&self, index: usize, data: &mut Option<T>, skip_cancel: bool) {
-        match self {
-            Inner::Uring(this) => UringInner::drop_op(this, index, data, skip_cancel),
-            #[cfg(feature = "legacy")]
-            Inner::Legacy(_) => {}
-        }
+        UringInner::drop_op(&self.0, index, data, skip_cancel)
     }
 
-    #[allow(unused)]
     pub(super) unsafe fn cancel_op(&self, op_canceller: &op::OpCanceller) {
-        match self {
-            #[cfg(all(target_os = "linux", feature = "iouring"))]
-            Inner::Uring(this) => UringInner::cancel_op(this, op_canceller.index),
-            #[cfg(feature = "legacy")]
-            Inner::Legacy(this) => {
-                if let Some(direction) = op_canceller.direction {
-                    LegacyInner::cancel_op(this, op_canceller.index, direction)
-                }
-            }
-            #[cfg(all(
-                not(feature = "legacy"),
-                not(all(target_os = "linux", feature = "iouring"))
-            ))]
-            _ => {
-                util::feature_panic();
-            }
-        }
-    }
-
-    #[cfg(all(target_os = "linux", feature = "iouring", feature = "legacy"))]
-    fn is_legacy(&self) -> bool {
-        matches!(self, Inner::Legacy(..))
-    }
-
-    #[cfg(all(target_os = "linux", feature = "iouring", not(feature = "legacy")))]
-    fn is_legacy(&self) -> bool {
-        false
-    }
-
-    #[allow(unused)]
-    #[cfg(not(all(target_os = "linux", feature = "iouring")))]
-    fn is_legacy(&self) -> bool {
-        true
+        UringInner::cancel_op(&self.0, op_canceller.index)
     }
 }
 
-/// The unified UnparkHandle.
+/// The UnparkHandle.
 #[cfg(feature = "sync")]
-#[derive(Clone)]
-pub(crate) enum UnparkHandle {
-    #[cfg(all(target_os = "linux", feature = "iouring"))]
-    Uring(self::uring::UnparkHandle),
-    #[cfg(feature = "legacy")]
-    Legacy(self::legacy::UnparkHandle),
-}
-
-#[cfg(feature = "sync")]
-impl unpark::Unpark for UnparkHandle {
-    fn unpark(&self) -> io::Result<()> {
-        match self {
-            #[cfg(all(target_os = "linux", feature = "iouring"))]
-            UnparkHandle::Uring(inner) => inner.unpark(),
-            #[cfg(feature = "legacy")]
-            UnparkHandle::Legacy(inner) => inner.unpark(),
-            #[cfg(all(
-                not(feature = "legacy"),
-                not(all(target_os = "linux", feature = "iouring"))
-            ))]
-            _ => {
-                util::feature_panic();
-            }
-        }
-    }
-}
-
-#[cfg(all(feature = "sync", target_os = "linux", feature = "iouring"))]
-impl From<self::uring::UnparkHandle> for UnparkHandle {
-    fn from(inner: self::uring::UnparkHandle) -> Self {
-        Self::Uring(inner)
-    }
-}
-
-#[cfg(all(feature = "sync", feature = "legacy"))]
-impl From<self::legacy::UnparkHandle> for UnparkHandle {
-    fn from(inner: self::legacy::UnparkHandle) -> Self {
-        Self::Legacy(inner)
-    }
-}
+pub(crate) use self::uring::UnparkHandle;
 
 #[cfg(feature = "sync")]
 impl UnparkHandle {
     #[allow(unused)]
     pub(crate) fn current() -> Self {
-        CURRENT.with(|inner| match inner {
-            #[cfg(all(target_os = "linux", feature = "iouring"))]
-            Inner::Uring(this) => UringInner::unpark(this).into(),
-            #[cfg(feature = "legacy")]
-            Inner::Legacy(this) => LegacyInner::unpark(this).into(),
-        })
+        CURRENT.with(|inner| UringInner::unpark(&inner.0))
     }
 }

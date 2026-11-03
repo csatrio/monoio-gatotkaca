@@ -12,7 +12,7 @@ pub use buf_writer::BufWriter;
 pub(crate) use cancel::operation_canceled;
 pub use cancel::{CancelHandle, Canceller};
 pub use copy::copy;
-#[cfg(all(target_os = "linux", feature = "splice"))]
+#[cfg(feature = "splice")]
 pub use copy::zero_copy;
 pub use prefixed_io::PrefixedReadIo;
 pub use split::{OwnedReadHalf, OwnedWriteHalf, Split, Splitable};

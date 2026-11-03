@@ -1,6 +1,5 @@
 //! Detect if current platform support io_uring.
 
-#[cfg(all(target_os = "linux", feature = "iouring"))]
 macro_rules! err_to_false {
     ($e: expr) => {
         match $e {
@@ -11,16 +10,7 @@ macro_rules! err_to_false {
         }
     };
 }
-#[cfg(all(target_os = "linux", feature = "iouring"))]
 fn detect_uring_inner() -> bool {
-    let val = std::env::var("MONOIO_FORCE_LEGACY_DRIVER");
-    match val {
-        Ok(v) if matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes") => {
-            return false;
-        }
-        _ => {}
-    }
-
     use io_uring::opcode::*;
     auto_const_array::auto_const_array! {
         const USED_OP: [u8; _] = [
@@ -62,7 +52,6 @@ fn detect_uring_inner() -> bool {
 }
 
 /// Detect if current platform supports our needed uring ops.
-#[cfg(all(target_os = "linux", feature = "iouring"))]
 pub fn detect_uring() -> bool {
     static mut URING_SUPPORTED: bool = false;
     static INIT: std::sync::Once = std::sync::Once::new();
@@ -75,15 +64,8 @@ pub fn detect_uring() -> bool {
     }
 }
 
-/// Detect if current platform supports our needed uring ops.
-#[cfg(not(all(target_os = "linux", feature = "iouring")))]
-pub fn detect_uring() -> bool {
-    false
-}
-
 #[cfg(test)]
 mod tests {
-    #[cfg(all(target_os = "linux", feature = "iouring"))]
     #[test]
     fn test_detect() {
         assert!(

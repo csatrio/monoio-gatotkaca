@@ -1,7 +1,5 @@
 use std::{ffi::CString, io, path::Path};
 
-#[cfg(any(feature = "legacy", feature = "poll-io"))]
-use super::{driver::ready::Direction, MaybeFd};
 use super::{Op, OpAble};
 use crate::driver::util::cstr;
 
@@ -21,24 +19,10 @@ impl Op<Symlink> {
 }
 
 impl OpAble for Symlink {
-    #[cfg(all(target_os = "linux", feature = "iouring"))]
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
         use io_uring::{opcode, types};
         let from_ref = self.from.as_c_str().as_ptr();
         let to_ref = self.to.as_c_str().as_ptr();
         opcode::SymlinkAt::new(types::Fd(libc::AT_FDCWD), from_ref, to_ref).build()
-    }
-
-    #[cfg(any(feature = "legacy", feature = "poll-io"))]
-    fn legacy_interest(&self) -> Option<(Direction, usize)> {
-        None
-    }
-
-    #[cfg(any(feature = "legacy", feature = "poll-io"))]
-    fn legacy_call(&mut self) -> std::io::Result<MaybeFd> {
-        crate::syscall!(symlink@NON_FD(
-            self.from.as_c_str().as_ptr(),
-            self.to.as_c_str().as_ptr()
-        ))
     }
 }

@@ -38,18 +38,11 @@ use std::future::Future;
 #[cfg(feature = "sync")]
 pub use blocking::spawn_blocking;
 pub use builder::{Buildable, RuntimeBuilder};
-pub use driver::Driver;
-#[cfg(all(target_os = "linux", feature = "iouring"))]
-pub use driver::IoUringDriver;
-#[cfg(feature = "legacy")]
-pub use driver::LegacyDriver;
-#[cfg(all(target_os = "linux", feature = "iouring"))]
+pub use driver::{Driver, IoUringDriver};
 pub use io_uring::IoUring;
 #[cfg(feature = "macros")]
 pub use monoio_macros::{main, test, test_all};
 pub use runtime::{spawn, Runtime};
-#[cfg(any(all(target_os = "linux", feature = "iouring"), feature = "legacy"))]
-pub use {builder::FusionDriver, runtime::FusionRuntime};
 
 /// Start a monoio runtime.
 ///
@@ -59,8 +52,7 @@ pub use {builder::FusionDriver, runtime::FusionRuntime};
 ///
 /// ```no_run
 /// fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     #[cfg(not(all(target_os = "linux", feature = "iouring")))]
-///     let r = monoio::start::<monoio::LegacyDriver, _>(async {
+///     monoio::start::<monoio::IoUringDriver, _>(async {
 ///         // Open a file
 ///         let file = monoio::fs::File::open("hello.txt").await?;
 ///
@@ -75,10 +67,7 @@ pub use {builder::FusionDriver, runtime::FusionRuntime};
 ///         println!("{:?}", &buf[..n]);
 ///
 ///         Ok(())
-///     });
-///     #[cfg(all(target_os = "linux", feature = "iouring"))]
-///     let r = Ok(());
-///     r
+///     })
 /// }
 /// ```
 pub fn start<D, F>(future: F) -> F::Output
@@ -103,8 +92,7 @@ where
 ///
 /// ```no_run
 /// fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     #[cfg(not(all(target_os = "linux", feature = "iouring")))]
-///     let r = monoio::start::<monoio::LegacyDriver, _>(async {
+///     monoio::start::<monoio::IoUringDriver, _>(async {
 ///         // Open a file
 ///         let file = monoio::fs::File::open("hello.txt").await?;
 ///
@@ -119,10 +107,7 @@ where
 ///         println!("{:?}", &buf[..n]);
 ///
 ///         Ok(())
-///     });
-///     #[cfg(all(target_os = "linux", feature = "iouring"))]
-///     let r = Ok(());
-///     r
+///     })
 /// }
 /// ```
 pub type BufResult<T, B> = (std::io::Result<T>, B);

@@ -1,5 +1,4 @@
 mod unix;
-mod windows;
 
 use std::{os::unix::fs::MetadataExt, path::Path, time::SystemTime};
 
@@ -39,14 +38,9 @@ use crate::driver::op::Op;
 /// }
 /// ```
 pub async fn metadata<P: AsRef<Path>>(path: P) -> std::io::Result<Metadata> {
-    #[cfg(target_os = "linux")]
     let flags = libc::AT_STATX_SYNC_AS_STAT;
 
-    #[cfg(target_os = "linux")]
     let op = Op::statx_using_path(path, flags)?;
-
-    #[cfg(target_os = "macos")]
-    let op = Op::statx_using_path(path, true)?;
 
     op.result().await.map(FileAttr::from).map(Metadata)
 }
@@ -79,19 +73,13 @@ pub async fn metadata<P: AsRef<Path>>(path: P) -> std::io::Result<Metadata> {
 /// }
 /// ```
 pub async fn symlink_metadata<P: AsRef<Path>>(path: P) -> std::io::Result<Metadata> {
-    #[cfg(target_os = "linux")]
     let flags = libc::AT_STATX_SYNC_AS_STAT | libc::AT_SYMLINK_NOFOLLOW;
 
-    #[cfg(target_os = "linux")]
     let op = Op::statx_using_path(path, flags)?;
-
-    #[cfg(target_os = "macos")]
-    let op = Op::statx_using_path(path, false)?;
 
     op.result().await.map(FileAttr::from).map(Metadata)
 }
 
-#[cfg(unix)]
 pub(crate) use unix::FileAttr;
 
 /// Metadata information about a file.
@@ -100,7 +88,6 @@ pub(crate) use unix::FileAttr;
 /// [`symlink_metadata`] function or method and represents known
 /// metadata about a file such as its permissions, size, modification
 /// times, etc.
-#[cfg(unix)]
 pub struct Metadata(pub(crate) FileAttr);
 
 impl Metadata {
@@ -239,7 +226,6 @@ impl Metadata {
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(target_os = "linux")]
     pub fn created(&self) -> std::io::Result<SystemTime> {
         if let Some(extra) = self.0.statx_extra_fields.as_ref() {
             return if extra.stx_mask & libc::STATX_BTIME != 0 {
@@ -270,7 +256,6 @@ impl Metadata {
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(unix)]
     pub fn permissions(&self) -> Permissions {
         use super::permissions::Permissions;
 
@@ -292,7 +277,6 @@ impl Metadata {
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(unix)]
     pub fn file_type(&self) -> FileType {
         self.0.file_type()
     }
@@ -310,7 +294,6 @@ impl std::fmt::Debug for Metadata {
         if let Ok(accessed) = self.accessed() {
             debug.field("accessed", &accessed);
         }
-        #[cfg(target_os = "linux")]
         if let Ok(created) = self.created() {
             debug.field("created", &created);
         }
@@ -318,7 +301,7 @@ impl std::fmt::Debug for Metadata {
     }
 }
 
-#[cfg(all(target_os = "linux", not(target_pointer_width = "32")))]
+#[cfg(not(target_pointer_width = "32"))]
 impl MetadataExt for Metadata {
     fn dev(&self) -> u64 {
         self.0.stat.st_dev
@@ -393,74 +376,7 @@ impl MetadataExt for Metadata {
     }
 }
 
-#[cfg(all(target_os = "macos", not(target_pointer_width = "32")))]
-impl MetadataExt for Metadata {
-    fn dev(&self) -> u64 {
-        self.0.stat.st_dev as u64
-    }
-
-    fn ino(&self) -> u64 {
-        self.0.stat.st_ino
-    }
-
-    fn mode(&self) -> u32 {
-        self.0.stat.st_mode as u32
-    }
-
-    fn nlink(&self) -> u64 {
-        self.0.stat.st_nlink.into()
-    }
-
-    fn uid(&self) -> u32 {
-        self.0.stat.st_uid
-    }
-
-    fn gid(&self) -> u32 {
-        self.0.stat.st_gid
-    }
-
-    fn rdev(&self) -> u64 {
-        self.0.stat.st_rdev as u64
-    }
-
-    fn size(&self) -> u64 {
-        self.0.stat.st_size as u64
-    }
-
-    fn atime(&self) -> i64 {
-        self.0.stat.st_atime
-    }
-
-    fn atime_nsec(&self) -> i64 {
-        self.0.stat.st_atime_nsec
-    }
-
-    fn mtime(&self) -> i64 {
-        self.0.stat.st_mtime
-    }
-
-    fn mtime_nsec(&self) -> i64 {
-        self.0.stat.st_mtime_nsec
-    }
-
-    fn ctime(&self) -> i64 {
-        self.0.stat.st_ctime
-    }
-
-    fn ctime_nsec(&self) -> i64 {
-        self.0.stat.st_ctime_nsec
-    }
-
-    fn blksize(&self) -> u64 {
-        self.0.stat.st_blksize as u64
-    }
-
-    fn blocks(&self) -> u64 {
-        self.0.stat.st_blocks as u64
-    }
-}
-
-#[cfg(all(unix, target_pointer_width = "32"))]
+#[cfg(target_pointer_width = "32")]
 impl MetadataExt for Metadata {
     fn dev(&self) -> u64 {
         self.0.stat.st_dev.into()

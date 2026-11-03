@@ -1,8 +1,5 @@
 // use super::shared_buf::Shared;
 
-#[cfg(windows)]
-use windows_sys::Win32::Networking::WinSock::WSABUF;
-
 /// An `io_uring` compatible iovec buffer.
 ///
 /// # Safety
@@ -21,36 +18,22 @@ pub unsafe trait IoVecBuf: Unpin + 'static {
     /// The implementation must ensure that, while the runtime owns the value,
     /// the pointer returned by `stable_mut_ptr` **does not** change.
     /// Also, the value pointed must be a valid iovec struct.
-    #[cfg(unix)]
     fn read_iovec_ptr(&self) -> *const libc::iovec;
 
     /// Returns the count of iovec struct behind the pointer.
     ///
     /// # Safety
     /// There must be really that number of iovec here.
-    #[cfg(unix)]
     fn read_iovec_len(&self) -> usize;
-
-    /// Returns a raw pointer to WSABUF struct.
-    #[cfg(windows)]
-    fn read_wsabuf_ptr(&self) -> *const WSABUF;
-
-    /// Returns the count of WSABUF struct behind the pointer.
-    #[cfg(windows)]
-    fn read_wsabuf_len(&self) -> usize;
 }
 
 /// A intermediate struct that impl IoVecBuf and IoVecBufMut.
 #[derive(Clone)]
 pub struct VecBuf {
-    #[cfg(unix)]
     iovecs: Vec<libc::iovec>,
-    #[cfg(windows)]
-    wsabufs: Vec<WSABUF>,
     raw: Vec<Vec<u8>>,
 }
 
-#[cfg(unix)]
 unsafe impl IoVecBuf for VecBuf {
     fn read_iovec_ptr(&self) -> *const libc::iovec {
         self.iovecs.read_iovec_ptr()
@@ -60,7 +43,6 @@ unsafe impl IoVecBuf for VecBuf {
     }
 }
 
-#[cfg(unix)]
 unsafe impl IoVecBuf for Vec<libc::iovec> {
     fn read_iovec_ptr(&self) -> *const libc::iovec {
         self.as_ptr()
@@ -71,30 +53,8 @@ unsafe impl IoVecBuf for Vec<libc::iovec> {
     }
 }
 
-#[cfg(windows)]
-unsafe impl IoVecBuf for VecBuf {
-    fn read_wsabuf_ptr(&self) -> *const WSABUF {
-        self.wsabufs.read_wsabuf_ptr()
-    }
-    fn read_wsabuf_len(&self) -> usize {
-        self.wsabufs.read_wsabuf_len()
-    }
-}
-
-#[cfg(windows)]
-unsafe impl IoVecBuf for Vec<WSABUF> {
-    fn read_wsabuf_ptr(&self) -> *const WSABUF {
-        self.as_ptr()
-    }
-
-    fn read_wsabuf_len(&self) -> usize {
-        self.len()
-    }
-}
-
 impl From<Vec<Vec<u8>>> for VecBuf {
     fn from(vs: Vec<Vec<u8>>) -> Self {
-        #[cfg(unix)]
         {
             let iovecs = vs
                 .iter()
@@ -104,17 +64,6 @@ impl From<Vec<Vec<u8>>> for VecBuf {
                 })
                 .collect();
             Self { iovecs, raw: vs }
-        }
-        #[cfg(windows)]
-        {
-            let wsabufs = vs
-                .iter()
-                .map(|v| WSABUF {
-                    buf: v.as_ptr() as _,
-                    len: v.len() as _,
-                })
-                .collect();
-            Self { wsabufs, raw: vs }
         }
     }
 }
@@ -200,20 +149,10 @@ pub unsafe trait IoVecBufMut: Unpin + 'static {
     /// The implementation must ensure that, while the runtime owns the value,
     /// the pointer returned by `write_iovec_ptr` **does not** change.
     /// Also, the value pointed must be a valid iovec struct.
-    #[cfg(unix)]
     fn write_iovec_ptr(&mut self) -> *mut libc::iovec;
 
     /// Returns the count of iovec struct behind the pointer.
-    #[cfg(unix)]
     fn write_iovec_len(&mut self) -> usize;
-
-    /// Returns a raw mutable pointer to WSABUF struct.
-    #[cfg(windows)]
-    fn write_wsabuf_ptr(&mut self) -> *mut WSABUF;
-
-    /// Returns the count of WSABUF struct behind the pointer.
-    #[cfg(windows)]
-    fn write_wsabuf_len(&mut self) -> usize;
 
     /// Updates the number of initialized bytes.
     ///
@@ -226,7 +165,6 @@ pub unsafe trait IoVecBufMut: Unpin + 'static {
     unsafe fn set_init(&mut self, pos: usize);
 }
 
-#[cfg(unix)]
 unsafe impl IoVecBufMut for VecBuf {
     fn write_iovec_ptr(&mut self) -> *mut libc::iovec {
         self.read_iovec_ptr() as *mut _
@@ -242,32 +180,6 @@ unsafe impl IoVecBufMut for VecBuf {
                 // set_init all
                 self.raw[idx].set_len(iovec.iov_len);
                 len -= iovec.iov_len;
-            } else {
-                if len > 0 {
-                    self.raw[idx].set_len(len);
-                }
-                break;
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-unsafe impl IoVecBufMut for VecBuf {
-    fn write_wsabuf_ptr(&mut self) -> *mut WSABUF {
-        self.read_wsabuf_ptr() as *mut _
-    }
-
-    fn write_wsabuf_len(&mut self) -> usize {
-        self.read_wsabuf_len()
-    }
-
-    unsafe fn set_init(&mut self, mut len: usize) {
-        for (idx, wsabuf) in self.wsabufs.iter_mut().enumerate() {
-            if wsabuf.len as usize <= len {
-                // set_init all
-                self.raw[idx].set_len(wsabuf.len as _);
-                len -= wsabuf.len as usize;
             } else {
                 if len > 0 {
                     self.raw[idx].set_len(len);

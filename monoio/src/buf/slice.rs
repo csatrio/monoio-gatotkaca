@@ -267,12 +267,7 @@ impl<T: IoVecBuf> IoVecWrapper<T> {
     /// Create a new IoVecWrapper with something that impl IoVecBuf.
     #[inline]
     pub fn new(buf: T) -> Result<Self, T> {
-        #[cfg(unix)]
         if buf.read_iovec_len() == 0 {
-            return Err(buf);
-        }
-        #[cfg(windows)]
-        if buf.read_wsabuf_len() == 0 {
             return Err(buf);
         }
         Ok(Self { raw: buf })
@@ -288,29 +283,17 @@ impl<T: IoVecBuf> IoVecWrapper<T> {
 unsafe impl<T: IoVecBuf> IoBuf for IoVecWrapper<T> {
     #[inline]
     fn read_ptr(&self) -> *const u8 {
-        #[cfg(unix)]
         {
             let iovec = unsafe { *self.raw.read_iovec_ptr() };
             iovec.iov_base as *const u8
-        }
-        #[cfg(windows)]
-        {
-            let wsabuf = unsafe { *self.raw.read_wsabuf_ptr() };
-            wsabuf.buf as *const u8
         }
     }
 
     #[inline]
     fn bytes_init(&self) -> usize {
-        #[cfg(unix)]
         {
             let iovec = unsafe { *self.raw.read_iovec_ptr() };
             iovec.iov_len
-        }
-        #[cfg(windows)]
-        {
-            let wsabuf = unsafe { *self.raw.read_wsabuf_ptr() };
-            wsabuf.len as _
         }
     }
 }
@@ -325,12 +308,7 @@ impl<T: IoVecBufMut> IoVecWrapperMut<T> {
     /// Create a new IoVecWrapperMut with something that impl IoVecBufMut.
     #[inline]
     pub fn new(mut iovec_buf: T) -> Result<Self, T> {
-        #[cfg(unix)]
         if iovec_buf.write_iovec_len() == 0 {
-            return Err(iovec_buf);
-        }
-        #[cfg(windows)]
-        if iovec_buf.write_wsabuf_len() == 0 {
             return Err(iovec_buf);
         }
         Ok(Self { raw: iovec_buf })
@@ -345,28 +323,16 @@ impl<T: IoVecBufMut> IoVecWrapperMut<T> {
 
 unsafe impl<T: IoVecBufMut> IoBufMut for IoVecWrapperMut<T> {
     fn write_ptr(&mut self) -> *mut u8 {
-        #[cfg(unix)]
         {
             let iovec = unsafe { *self.raw.write_iovec_ptr() };
             iovec.iov_base as *mut u8
         }
-        #[cfg(windows)]
-        {
-            let wsabuf = unsafe { *self.raw.write_wsabuf_ptr() };
-            wsabuf.buf
-        }
     }
 
     fn bytes_total(&mut self) -> usize {
-        #[cfg(unix)]
         {
             let iovec = unsafe { *self.raw.write_iovec_ptr() };
             iovec.iov_len
-        }
-        #[cfg(windows)]
-        {
-            let wsabuf = unsafe { *self.raw.write_wsabuf_ptr() };
-            wsabuf.len as _
         }
     }
 

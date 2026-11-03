@@ -66,13 +66,7 @@ impl CtrlC {
     pub fn ctrlc() {
         let pid = std::process::id() as _;
         unsafe {
-            #[cfg(unix)]
             libc::kill(pid, libc::SIGINT);
-            #[cfg(windows)]
-            windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent(
-                windows_sys::Win32::System::Console::CTRL_C_EVENT,
-                pid,
-            );
         };
     }
 }

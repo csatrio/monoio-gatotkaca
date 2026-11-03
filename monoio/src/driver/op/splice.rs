@@ -2,13 +2,7 @@
 
 use std::io;
 
-#[cfg(all(target_os = "linux", feature = "iouring"))]
 use io_uring::{opcode, types};
-#[cfg(all(unix, feature = "legacy"))]
-use {
-    crate::driver::{op::MaybeFd, ready::Direction},
-    std::os::unix::prelude::AsRawFd,
-};
 
 use super::{super::shared_fd::SharedFd, Op, OpAble};
 
@@ -58,7 +52,6 @@ impl Op<Splice> {
 }
 
 impl OpAble for Splice {
-    #[cfg(all(target_os = "linux", feature = "iouring"))]
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
         const FLAG: u32 = libc::SPLICE_F_MOVE;
         opcode::Splice::new(
@@ -70,37 +63,5 @@ impl OpAble for Splice {
         )
         .flags(FLAG)
         .build()
-    }
-
-    #[cfg(all(unix, feature = "legacy"))]
-    #[inline]
-    fn legacy_interest(&self) -> Option<(Direction, usize)> {
-        match self.direction {
-            SpliceDirection::FromPipe => self
-                .fd_out
-                .registered_index()
-                .map(|idx| (Direction::Write, idx)),
-            SpliceDirection::ToPipe => self
-                .fd_in
-                .registered_index()
-                .map(|idx| (Direction::Read, idx)),
-        }
-    }
-
-    #[cfg(all(unix, feature = "legacy"))]
-    fn legacy_call(&mut self) -> io::Result<MaybeFd> {
-        const FLAG: u32 = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
-        let fd_in = self.fd_in.as_raw_fd();
-        let fd_out = self.fd_out.as_raw_fd();
-        let off_in = std::ptr::null_mut::<libc::loff_t>();
-        let off_out = std::ptr::null_mut::<libc::loff_t>();
-        crate::syscall!(splice@NON_FD(
-            fd_in,
-            off_in,
-            fd_out,
-            off_out,
-            self.len as usize,
-            FLAG
-        ))
     }
 }

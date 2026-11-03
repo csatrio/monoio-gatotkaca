@@ -37,18 +37,7 @@ impl Pipe {
 /// Create a new pair of pipe.
 pub fn new_pipe() -> io::Result<(Pipe, Pipe)> {
     let mut pipes = [0 as libc::c_int; 2];
-    #[cfg(target_os = "linux")]
-    let flag = {
-        if crate::driver::op::is_legacy() {
-            libc::O_NONBLOCK
-        } else {
-            0
-        }
-    };
-    #[cfg(target_os = "linux")]
-    crate::syscall!(pipe2@RAW(pipes.as_mut_ptr() as _, flag))?;
-    #[cfg(not(target_os = "linux"))]
-    crate::syscall!(pipe@RAW(pipes.as_mut_ptr() as _))?;
+    crate::syscall!(pipe2@RAW(pipes.as_mut_ptr() as _, 0))?;
     Ok((Pipe::from_raw_fd(pipes[0]), Pipe::from_raw_fd(pipes[1])))
 }
 

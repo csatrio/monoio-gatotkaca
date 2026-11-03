@@ -15,12 +15,8 @@ use lifecycle::MaybeFdLifecycle;
 
 use super::{
     op::{CompletionMeta, Op, OpAble},
-    // ready::Ready,
-    // scheduled_io::ScheduledIo,
     util::timespec,
-    Driver,
-    Inner,
-    CURRENT,
+    Driver, Inner, CURRENT,
 };
 use crate::utils::slab::Slab;
 
@@ -35,10 +31,7 @@ pub(crate) const CANCEL_USERDATA: u64 = u64::MAX;
 pub(crate) const TIMEOUT_USERDATA: u64 = u64::MAX - 1;
 #[allow(unused)]
 pub(crate) const EVENTFD_USERDATA: u64 = u64::MAX - 2;
-#[cfg(feature = "poll-io")]
-pub(crate) const POLLER_USERDATA: u64 = u64::MAX - 3;
-
-pub(crate) const MIN_REVERSED_USERDATA: u64 = u64::MAX - 3;
+pub(crate) const MIN_REVERSED_USERDATA: u64 = u64::MAX - 2;
 
 /// Driver with uring.
 pub struct IoUringDriver {
@@ -59,11 +52,6 @@ pub(crate) struct UringInner {
     // Used as read eventfd buffer
     #[cfg(feature = "sync")]
     eventfd_read_dst: [u8; 8],
-
-    #[cfg(feature = "poll-io")]
-    poll: super::poll::Poll,
-    #[cfg(feature = "poll-io")]
-    poller_installed: bool,
 
     /// IoUring bindings
     uring: ManuallyDrop<IoUring>,
@@ -105,10 +93,6 @@ impl IoUringDriver {
         let uring = ManuallyDrop::new(urb.build(entries)?);
 
         let inner = Rc::new(UnsafeCell::new(UringInner {
-            #[cfg(feature = "poll-io")]
-            poll: super::poll::Poll::with_capacity(entries as usize)?,
-            #[cfg(feature = "poll-io")]
-            poller_installed: false,
             ops: Ops::new(),
             timespec: Timespec::new(),
             ext_arg: uring.params().is_feature_ext_arg(),
@@ -137,10 +121,6 @@ impl IoUringDriver {
         let (waker_sender, waker_receiver) = flume::unbounded::<std::task::Waker>();
 
         let inner = Rc::new(UnsafeCell::new(UringInner {
-            #[cfg(feature = "poll-io")]
-            poller_installed: false,
-            #[cfg(feature = "poll-io")]
-            poll: super::poll::Poll::with_capacity(entries as usize)?,
             ops: Ops::new(),
             timespec: Timespec::new(),
             ext_arg: uring.params().is_feature_ext_arg(),
@@ -155,7 +135,7 @@ impl IoUringDriver {
         let driver = IoUringDriver { inner, thread_id };
 
         // Register unpark handle
-        super::thread::register_unpark_handle(thread_id, driver.unpark().into());
+        super::thread::register_unpark_handle(thread_id, driver.unpark());
         super::thread::register_waker_sender(thread_id, waker_sender);
         Ok(driver)
     }
@@ -190,17 +170,6 @@ impl IoUringDriver {
         let mut sq = inner.uring.submission();
         let _ = unsafe { sq.push(&entry) };
         inner.eventfd_installed = true;
-    }
-
-    #[cfg(feature = "poll-io")]
-    fn install_poller(&self, inner: &mut UringInner, fd: RawFd) {
-        let entry = opcode::PollAdd::new(io_uring::types::Fd(fd), libc::POLLIN as _)
-            .build()
-            .user_data(POLLER_USERDATA);
-
-        let mut sq = inner.uring.submission();
-        let _ = unsafe { sq.push(&entry) };
-        inner.poller_installed = true;
     }
 
     fn install_timeout(&self, inner: &mut UringInner, duration: Duration) {
@@ -251,10 +220,6 @@ impl IoUringDriver {
             if !inner.eventfd_installed {
                 space += 1;
             }
-            #[cfg(feature = "poll-io")]
-            if !inner.poller_installed {
-                space += 1;
-            }
             if timeout.is_some() {
                 space += 1;
             }
@@ -262,19 +227,13 @@ impl IoUringDriver {
                 Self::flush_space(inner, space)?;
             }
 
-            // 2.1 install poller
-            #[cfg(feature = "poll-io")]
-            if !inner.poller_installed {
-                self.install_poller(inner, inner.poll.as_raw_fd());
-            }
-
-            // 2.2 install eventfd and timeout
+            // 2.1 install eventfd
             #[cfg(feature = "sync")]
             if !inner.eventfd_installed {
                 self.install_eventfd(inner, inner.shared_waker.as_raw_fd());
             }
 
-            // 2.3 install timeout and submit_and_wait with timeout
+            // 2.2 install timeout and submit_and_wait with timeout
             if let Some(duration) = timeout {
                 match inner.ext_arg {
                     // Submit and Wait with timeout in an TimeoutOp way.
@@ -316,35 +275,13 @@ impl IoUringDriver {
 
         Ok(())
     }
-
-    #[cfg(feature = "poll-io")]
-    #[inline]
-    pub(crate) fn register_poll_io(
-        this: &Rc<UnsafeCell<UringInner>>,
-        source: &mut impl mio::event::Source,
-        interest: mio::Interest,
-    ) -> io::Result<usize> {
-        let inner = unsafe { &mut *this.get() };
-        inner.poll.register(source, interest)
-    }
-
-    #[cfg(feature = "poll-io")]
-    #[inline]
-    pub(crate) fn deregister_poll_io(
-        this: &Rc<UnsafeCell<UringInner>>,
-        source: &mut impl mio::event::Source,
-        token: usize,
-    ) -> io::Result<()> {
-        let inner = unsafe { &mut *this.get() };
-        inner.poll.deregister(source, token)
-    }
 }
 
 impl Driver for IoUringDriver {
     /// Enter the driver context. This enables using uring types.
     fn with<R>(&self, f: impl FnOnce() -> R) -> R {
         // TODO(ihciah): remove clone
-        let inner = Inner::Uring(self.inner.clone());
+        let inner = Inner(self.inner.clone());
         CURRENT.set(&inner, f)
     }
 
@@ -381,11 +318,6 @@ impl UringInner {
             match index {
                 #[cfg(feature = "sync")]
                 EVENTFD_USERDATA => self.eventfd_installed = false,
-                #[cfg(feature = "poll-io")]
-                POLLER_USERDATA => {
-                    self.poller_installed = false;
-                    self.poll.tick(Some(Duration::ZERO))?;
-                }
                 _ if index >= MIN_REVERSED_USERDATA => (),
                 // # Safety
                 // Here we can make sure the result is valid.
@@ -441,7 +373,7 @@ impl UringInner {
         }
 
         // Create the operation
-        let mut op = Self::new_op(data, inner, Inner::Uring(this.clone()));
+        let mut op = Self::new_op(data, inner, Inner(this.clone()));
 
         // Configure the SQE
         let data_mut = unsafe { op.data.as_mut().unwrap_unchecked() };
@@ -476,31 +408,6 @@ impl UringInner {
         let inner = unsafe { &mut *this.get() };
         let lifecycle = unsafe { inner.ops.slab.get(index).unwrap_unchecked() };
         lifecycle.poll_op(cx)
-    }
-
-    #[cfg(feature = "poll-io")]
-    pub(crate) fn poll_legacy_op<T: OpAble>(
-        this: &Rc<UnsafeCell<Self>>,
-        data: &mut T,
-        cx: &mut Context<'_>,
-    ) -> Poll<CompletionMeta> {
-        let inner = unsafe { &mut *this.get() };
-        let (direction, index) = match data.legacy_interest() {
-            Some(x) => x,
-            None => {
-                // if there is no index provided, it means the action does not rely on fd
-                // readiness. do syscall right now.
-                return Poll::Ready(CompletionMeta {
-                    result: OpAble::legacy_call(data),
-                    flags: 0,
-                });
-            }
-        };
-
-        // wait io ready and do syscall
-        inner
-            .poll
-            .poll_syscall(cx, index, direction, || OpAble::legacy_call(data))
     }
 
     pub(crate) fn drop_op<T: 'static>(

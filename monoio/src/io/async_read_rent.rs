@@ -90,29 +90,16 @@ impl AsyncReadRent for &[u8] {
     fn readv<T: IoVecBufMut>(&mut self, mut buf: T) -> impl Future<Output = BufResult<usize, T>> {
         let mut sum = 0;
         {
-            #[cfg(windows)]
-            let buf_slice = unsafe {
-                std::slice::from_raw_parts_mut(buf.write_wsabuf_ptr(), buf.write_wsabuf_len())
-            };
-            #[cfg(unix)]
             let buf_slice = unsafe {
                 std::slice::from_raw_parts_mut(buf.write_iovec_ptr(), buf.write_iovec_len())
             };
             for buf in buf_slice {
-                #[cfg(windows)]
-                let amt = std::cmp::min(self.len(), buf.len as usize);
-                #[cfg(unix)]
                 let amt = std::cmp::min(self.len(), buf.iov_len);
 
                 let (prefix, remainder) = self.split_at(amt);
                 // # Safety
                 // The pointer is valid.
                 unsafe {
-                    #[cfg(windows)]
-                    buf.buf
-                        .cast::<u8>()
-                        .copy_from_nonoverlapping(prefix.as_ptr(), amt);
-                    #[cfg(unix)]
                     buf.iov_base
                         .cast::<u8>()
                         .copy_from_nonoverlapping(prefix.as_ptr(), amt);
@@ -154,18 +141,10 @@ impl AsyncReadRent for &mut [u8] {
     fn readv<T: IoVecBufMut>(&mut self, mut buf: T) -> impl Future<Output = BufResult<usize, T>> {
         let mut sum = 0;
         {
-            #[cfg(windows)]
-            let buf_slice = unsafe {
-                std::slice::from_raw_parts_mut(buf.write_wsabuf_ptr(), buf.write_wsabuf_len())
-            };
-            #[cfg(unix)]
             let buf_slice = unsafe {
                 std::slice::from_raw_parts_mut(buf.write_iovec_ptr(), buf.write_iovec_len())
             };
             for buf in buf_slice {
-                #[cfg(windows)]
-                let amt = std::cmp::min(self.len(), buf.len as usize);
-                #[cfg(unix)]
                 let amt = std::cmp::min(self.len(), buf.iov_len);
 
                 // Compute source and remaining pointers for this chunk
@@ -173,9 +152,6 @@ impl AsyncReadRent for &mut [u8] {
                 let next_ptr = unsafe { src_ptr.add(amt) };
                 let remaining_len = self.len() - amt;
                 unsafe {
-                    #[cfg(windows)]
-                    buf.buf.cast::<u8>().copy_from_nonoverlapping(src_ptr, amt);
-                    #[cfg(unix)]
                     buf.iov_base
                         .cast::<u8>()
                         .copy_from_nonoverlapping(src_ptr, amt);
