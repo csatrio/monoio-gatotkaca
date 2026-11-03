@@ -20,6 +20,10 @@ use std::{
 // (and cannot end up with a mismatching `io_uring` version).
 pub use io_uring::{cqueue, opcode, squeue, types, IoUring, Probe};
 
+pub use super::buf_ring::{BufRing, SelectedBuf};
+// errno and poll constants for SQEs and completions (`libc::ENOBUFS`, `libc::POLLIN`, ...).
+pub use libc;
+
 use super::{
     op::{Completion, Op, OpAble},
     uring::{IoUringDriver, UringInner},
@@ -303,7 +307,7 @@ impl Inner {
         unsafe { (*self.0.get()).external.set(None) }
     }
 
-    fn with_ring<R>(&self, f: impl FnOnce(&mut IoUring) -> R) -> R {
+    pub(super) fn with_ring<R>(&self, f: impl FnOnce(&mut IoUring) -> R) -> R {
         // Caller guarantees exclusive, non re-entrant access, see `with_ring`.
         f(unsafe { &mut (*self.0.get()).uring })
     }

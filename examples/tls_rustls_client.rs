@@ -1,13 +1,13 @@
 //! A TLS (rustls) client for the `tls_rustls_server` / `tls_native_server` examples.
 
+use monoio::tls::rustls::rustls::{
+    pki_types::{pem::PemObject, CertificateDer, ServerName},
+    ClientConfig, RootCertStore,
+};
 use monoio::{
     io::{AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt},
     net::TcpStream,
     tls::rustls::TlsConnector,
-};
-use rustls::{
-    pki_types::{pem::PemObject, CertificateDer, ServerName},
-    ClientConfig, RootCertStore,
 };
 
 #[monoio::main]

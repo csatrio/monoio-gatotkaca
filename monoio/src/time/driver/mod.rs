@@ -341,6 +341,12 @@ where
     }
 }
 
+impl<D: std::os::unix::io::AsRawFd> std::os::unix::io::AsRawFd for TimeDriver<D> {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.park.as_raw_fd()
+    }
+}
+
 impl<D> Drop for TimeDriver<D>
 where
     D: 'static,

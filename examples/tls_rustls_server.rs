@@ -5,14 +5,14 @@
 
 use std::io;
 
+use monoio::tls::rustls::rustls::{
+    pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
+    ServerConfig,
+};
 use monoio::{
     io::{AsyncReadRent, AsyncWriteRentExt},
     net::{TcpListener, TcpStream},
     tls::rustls::TlsAcceptor,
-};
-use rustls::{
-    pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
-    ServerConfig,
 };
 
 #[monoio::main]

@@ -29,7 +29,9 @@ Monoio (published as `adaptif-gatotkaca-monoio`, library name `monoio`): a strip
 - **Communication.** Same thread: `local-sync` (mpsc, oneshot, semaphore, no atomics). Across threads: enable `sync` and use any channel (`flume`, `async-channel`, Tokio's `sync`) or atomics. Prefer per-thread aggregation on hot paths.
 - **Raw io_uring access.** The `io_uring` crate is re-exported as `monoio::io_uring` (and `opcode`, `squeue`, `cqueue`, `types`, `IoUring`, `Probe` as `monoio::uring::*`): use these instead of depending on `io_uring` yourself, so versions always match. `monoio::uring` is the escape hatch for ops the crate doesn't wrap. `unsafe uring::submit(sqe, data)` queues any `squeue::Entry` and resolves to `(Cqe, data)`; `data` must own the heap memory the SQE points to and is kept alive until the kernel finishes. `unsafe uring::with_ring(|ring| ..)` exposes the `IoUring` for registration, probing and `params()`. Both also exist on `IoUringDriver` (`submit_raw`, `with_ring`; reach it with `Runtime::driver()`). `submit` is single-shot only; an fd it returns is yours to close.
   - **Multishot / your own SQEs.** Push them yourself inside `with_ring` with `user_data(uring::user_data(id))` (`id <= uring::MAX_ID`) and receive every completion in a hook: `uring::set_cqe_hook(|id, cqe| ..)` (`Cqe::more()` says a multishot is still armed, `buffer_id()` gives the provided buffer). The driver delivers the hook's batch after it finished its own tick, so the hook may call `with_ring`/`submit`, wake or spawn. Completions are dropped while no hook is installed, so set it first. You own everything those SQEs point to until their last CQE. Never reap the CQ, and never use a `user_data` below 2^62 (it collides with the driver's ops). With the timer enabled, reach the driver with `runtime.driver().inner()`.
-- **Registered buffers.** Not supported natively. Use the raw API: register once with `unsafe uring::with_ring(|r| r.submitter().register_buffers(&iovecs))`, then submit `opcode::ReadFixed`/`WriteFixed` (buffer index) via `uring::submit`. The registered memory must stay valid and unmoved until unregistered; keep it alive in `data`. Same applies to registered files (`register_files`) and buffer rings.
+- **Registered buffers.** Not supported natively. Use the raw API: register once with `unsafe uring::with_ring(|r| r.submitter().register_buffers(&iovecs))`, then submit `opcode::ReadFixed`/`WriteFixed` (buffer index) via `uring::submit`. The registered memory must stay valid and unmoved until unregistered; keep it alive in `data`. Same applies to registered files (`register_files`).
+- **Provided buffers (`IOSQE_BUFFER_SELECT`, Linux 5.19+).** `uring::BufRing::new(bgid, entries, buf_size)` (or `BufRing::new_in(&driver, ..)`; `entries` a power of two) registers a pool the kernel picks from. Set `squeue::Flags::BUFFER_SELECT` and `.buf_group(ring.group())` on a `Recv` (null ptr, len 0) or use `RecvMulti`, submit via `uring::submit` or the hook, then `ring.take(cqe)` gives a `SelectedBuf` (`Deref<[u8]>`) that returns to the pool on drop. Call `take` for every completion that carries a buffer or the pool runs dry (`ENOBUFS`). Finish or cancel ops using the group before dropping the ring.
+- **Sharing the io-wq (`IORING_SETUP_ATTACH_WQ`).** `RuntimeBuilder::attach_wq(fd)` with `fd = primary.driver().as_raw_fd()` (works with `enable_timer()` too; call it after `uring_builder`). The primary runtime must outlive the others.
 - **Blocking work.** `monoio::spawn_blocking` needs `sync`. Attach a pool with `RuntimeBuilder::attach_thread_pool` or choose `with_blocking_strategy` (`Panic` or `ExecuteLocal`).
 
 ## Runtime configuration
@@ -58,7 +60,9 @@ Default: `async-cancel`, `bytes`, `macros`, `utils`.
 | `unlinkat` | `unlinkat` op (kernel 5.11+). |
 | `renameat` | `renameat` op (kernel 5.11+). |
 | `symlinkat` | `symlinkat` op (kernel 5.15+). |
-| `tls-rustls` | `monoio::tls::rustls` (rustls 0.23, TLS 1.2/1.3). Does not pick a crypto provider; see TLS below. |
+| `tls-rustls` | `monoio::tls::rustls` (rustls 0.23, TLS 1.2/1.3). Needs a crypto provider: add `tls-rustls-ring` or `tls-rustls-aws-lc-rs`. |
+| `tls-rustls-ring` | `tls-rustls` plus rustls' `ring` crypto provider. |
+| `tls-rustls-aws-lc-rs` | `tls-rustls` plus rustls' `aws_lc_rs` provider (needs a C toolchain). |
 | `tls-native` | `monoio::tls::native` (native-tls; OpenSSL on Linux, needs the OpenSSL dev package). |
 | `tls-native-alpn` | `tls-native` plus `TlsStream::alpn_protocol()` (OpenSSL ALPN). |
 | `tls-native-vendored` | `tls-native` with OpenSSL built from source. |
@@ -68,10 +72,9 @@ Default: `async-cancel`, `bytes`, `macros`, `utils`.
 ## TLS
 Enable `tls-rustls` and/or `tls-native`. Both wrap any `AsyncReadRent + AsyncWriteRent` (usually `TcpStream`) and yield a stream implementing the rent traits, `Split` (so `into_split()` works) and `shutdown()` (sends close_notify). Handshakes return `Result<_, TlsError>`, which converts into `io::Error`. Tests: `monoio/tests/tls_*.rs`; runnable demos: the `tls-*` examples.
 
-**rustls** (`monoio::tls::rustls`). Add `rustls` to your own `Cargo.toml` and enable a crypto provider (`ring` or `aws_lc_rs`); monoio does not. Pass rustls configs straight in:
+**rustls** (`monoio::tls::rustls`). Enable `tls-rustls-ring` (or `tls-rustls-aws-lc-rs`) for a crypto provider; the rustls crate is re-exported as `monoio::tls::rustls::rustls` (`ServerConfig`, `ClientConfig`, `RootCertStore`, `pki_types`, PEM parsing), so you need no `rustls` dependency. Pass rustls configs straight in:
 ```rust
-use monoio::tls::rustls::{TlsAcceptor, TlsConnector};
-use rustls::pki_types::ServerName;
+use monoio::tls::rustls::{rustls::pki_types::ServerName, TlsAcceptor, TlsConnector};
 
 // server: ServerConfig -> TlsAcceptor (From<ServerConfig> / From<Arc<ServerConfig>>)
 let acceptor = TlsAcceptor::from(server_config);
@@ -86,7 +89,7 @@ let alpn = tls.alpn_protocol();                                // set via config
 ```
 Types: `ClientTlsStream`/`ServerTlsStream` (+ `*ReadHalf`/`*WriteHalf`). There is no single unified stream type.
 
-**native-tls** (`monoio::tls::native`). Wrap the `native_tls` builders' output:
+**native-tls** (`monoio::tls::native`). The crate is re-exported as `monoio::tls::native::native_tls` (`Identity`, `Certificate`, builders). Wrap the `native_tls` builders' output:
 ```rust
 use monoio::tls::native::{TlsAcceptor, TlsConnector};
 
@@ -100,7 +103,7 @@ let mut tls = connector.connect("example.com", tcp_stream).await?;
 ```
 The client verifies the hostname against the domain you pass. `alpn_protocol()` needs `tls-native-alpn` (client side).
 
-Notes: both backends copy through a 16 KiB staging buffer (the sync engines need `std::io`); do not drop a handshake or IO future midway: it takes the staging buffer, so the stream breaks (a later use may panic). Await it to completion. Interop between the two backends works (covered by `tests/tls_interop.rs`).
+Notes: everything above is reachable through this crate alone (`monoio::io_uring`, `monoio::uring::libc`, `monoio::tls::{rustls::rustls, native::native_tls}`); `monoio/tests/reexports.rs` pins those paths. Both backends copy through a 16 KiB staging buffer (the sync engines need `std::io`); do not drop a handshake or IO future midway: it takes the staging buffer, so the stream breaks (a later use may panic). Await it to completion. Interop between the two backends works (covered by `tests/tls_interop.rs`).
 
 ## Environment gotchas
 - io_uring needs kernel 5.6+. Check at runtime with `monoio::utils::detect_uring()`. Containers and sandboxes often block io_uring syscalls.

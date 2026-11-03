@@ -122,6 +122,17 @@ impl<D> RuntimeBuilder<D> {
         self
     }
 
+    /// Share the kernel async worker pool of another ring (`IORING_SETUP_ATTACH_WQ`).
+    ///
+    /// `fd` is the ring fd of an existing runtime, e.g. `runtime.driver().as_raw_fd()`; that
+    /// runtime must outlive this one. Call it after [`uring_builder`](Self::uring_builder), which
+    /// replaces all ring settings. Works with and without the timer.
+    #[must_use]
+    pub fn attach_wq(mut self, fd: std::os::unix::io::RawFd) -> Self {
+        self.urb.setup_attach_wq(fd);
+        self
+    }
+
     /// Replaces the default [`io_uring::Builder`], which controls the settings for the
     /// inner `io_uring` API.
     ///

@@ -2,12 +2,12 @@
 
 use std::io;
 
+use monoio::tls::native::native_tls::{self, Identity};
 use monoio::{
     io::{AsyncReadRent, AsyncWriteRentExt},
     net::{TcpListener, TcpStream},
     tls::native::TlsAcceptor,
 };
-use native_tls::Identity;
 
 #[monoio::main]
 async fn main() {

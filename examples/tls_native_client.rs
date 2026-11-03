@@ -1,11 +1,11 @@
 //! A TLS (native-tls) client for the `tls_rustls_server` / `tls_native_server` examples.
 
+use monoio::tls::native::native_tls::{self, Certificate};
 use monoio::{
     io::{AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt},
     net::TcpStream,
     tls::native::TlsConnector,
 };
-use native_tls::Certificate;
 
 #[monoio::main]
 async fn main() {

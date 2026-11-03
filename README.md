@@ -20,7 +20,7 @@ For the design, feature flags and configuration, see [AGENTS.md](AGENTS.md).
 ## Quick start
 ```toml
 [dependencies]
-adaptif-gatotkaca-monoio = "0.4"
+adaptif-gatotkaca-monoio = "0.5"
 ```
 The library is still named `monoio`, so code says `use monoio::...` and `#[monoio::main]`.
 
@@ -66,12 +66,13 @@ Try it with `nc 127.0.0.1 50002`. More runnable programs live in [examples/](exa
 - **Multiple cores.** Run one runtime per thread. `worker_threads = n` in the macro does this for you. If you need CPU pinning, create the threads yourself and call `monoio::utils::bind_to_cpu_set`.
 - **Talking between tasks.** Within a thread use [local-sync](https://crates.io/crates/local-sync). Across threads enable the `sync` feature and use any async channel, or atomics.
 - **Timeouts and cancellation.** Dropping a future does not reliably cancel the kernel operation. Use the `Cancelable*` IO traits with `Canceller`/`CancelHandle`, then await the future to get your buffer back. A cancelled op may still have completed, so check for `ECANCELED` (os error 125).
-- **Raw io_uring.** The `io_uring` crate is re-exported (`monoio::io_uring`, plus `monoio::uring::{opcode, squeue, cqueue, types, IoUring, Probe}`), so you don't need your own dependency on it. For operations the crate doesn't wrap, `monoio::uring::submit(sqe, data)` (unsafe) queues any `io_uring::squeue::Entry` and resolves to `(Cqe, data)`. `monoio::uring::with_ring(|ring| ..)` (unsafe) gives you the underlying `IoUring` for registering files/buffers or probing opcodes. Both are also methods on `IoUringDriver`, reachable with `Runtime::driver()`. The SQE must point into heap memory owned by `data`; to use multishot or other ops yourself, push SQEs inside `with_ring` tagged with `monoio::uring::user_data(id)` and receive their completions with `monoio::uring::set_cqe_hook(|id, cqe| ..)`. Never reap the completion queue yourself.
+- **Raw io_uring.** The `io_uring` and `libc` crates are re-exported (`monoio::io_uring`, `monoio::uring::libc`, plus `monoio::uring::{opcode, squeue, cqueue, types, IoUring, Probe}`), so you don't need your own dependency on them. The same goes for TLS: `monoio::tls::rustls::rustls` and `monoio::tls::native::native_tls`. For operations the crate doesn't wrap, `monoio::uring::submit(sqe, data)` (unsafe) queues any `io_uring::squeue::Entry` and resolves to `(Cqe, data)`. `monoio::uring::with_ring(|ring| ..)` (unsafe) gives you the underlying `IoUring` for registering files/buffers or probing opcodes. Both are also methods on `IoUringDriver`, reachable with `Runtime::driver()`. The SQE must point into heap memory owned by `data`; to use multishot or other ops yourself, push SQEs inside `with_ring` tagged with `monoio::uring::user_data(id)` and receive their completions with `monoio::uring::set_cqe_hook(|id, cqe| ..)`. Never reap the completion queue yourself.
+- **Provided buffers and shared worker pool.** `monoio::uring::BufRing` registers a kernel-selected buffer pool (`IOSQE_BUFFER_SELECT`, Linux 5.19+): submit a `Recv`/`RecvMulti` with the ring's group and call `ring.take(cqe)` for the data. `RuntimeBuilder::attach_wq(fd)` shares the io-wq of another runtime (`IORING_SETUP_ATTACH_WQ`). Both work with the timer enabled.
 - **Registered buffers.** Not supported natively. Register them through the raw API: `unsafe monoio::uring::with_ring(|r| r.submitter().register_buffers(&iovecs))`, then submit `opcode::ReadFixed`/`WriteFixed` with `monoio::uring::submit`. The memory must stay valid and unmoved while registered.
 - **Tokio types.** `AsyncRead`/`AsyncWrite` from Tokio are not supported. Use the `*Rent` traits.
 
 ## Cargo features
-Defaults: `async-cancel`, `bytes`, `macros`, `utils`. Optional: `sync`, `signal`, `signal-termination`, `zero-copy`, `splice`, `mkdirat`, `unlinkat`, `renameat`, `symlinkat`, `debug`, `unstable`, and TLS: `tls-rustls`, `tls-native`, `tls-native-alpn`, `tls-native-vendored` (`monoio::tls`, see the `tls-*` examples). See [AGENTS.md](AGENTS.md) for what each one does and its kernel requirement.
+Defaults: `async-cancel`, `bytes`, `macros`, `utils`. Optional: `sync`, `signal`, `signal-termination`, `zero-copy`, `splice`, `mkdirat`, `unlinkat`, `renameat`, `symlinkat`, `debug`, `unstable`, and TLS: `tls-rustls` (with `tls-rustls-ring` or `tls-rustls-aws-lc-rs` for the crypto provider), `tls-native`, `tls-native-alpn`, `tls-native-vendored` (`monoio::tls`, see the `tls-*` examples). See [AGENTS.md](AGENTS.md) for what each one does and its kernel requirement.
 
 ## Development
 ```sh
