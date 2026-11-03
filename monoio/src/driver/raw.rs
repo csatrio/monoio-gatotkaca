@@ -16,7 +16,9 @@ use std::{
     task::{Context, Poll},
 };
 
-use io_uring::{squeue, IoUring};
+// The io_uring items needed to build SQEs and use the ring, so callers need no direct dependency
+// (and cannot end up with a mismatching `io_uring` version).
+pub use io_uring::{cqueue, opcode, squeue, types, IoUring, Probe};
 
 use super::{
     op::{Completion, Op, OpAble},

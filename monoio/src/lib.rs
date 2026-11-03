@@ -40,6 +40,9 @@ use std::future::Future;
 pub use blocking::spawn_blocking;
 pub use builder::{Buildable, RuntimeBuilder};
 pub use driver::{raw as uring, Driver, IoUringDriver};
+/// The `io_uring` crate this runtime is built on, re-exported so that users get the exact same
+/// version (`monoio::io_uring::{opcode, squeue, cqueue, types, Probe, ..}`).
+pub use io_uring;
 pub use io_uring::IoUring;
 #[cfg(feature = "macros")]
 pub use monoio_macros::{main, test, test_all};

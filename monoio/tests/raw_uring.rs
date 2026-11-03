@@ -70,3 +70,17 @@ fn driver_handle() {
         assert_eq!(data, "kept");
     });
 }
+
+#[test]
+fn io_uring_is_reexported() {
+    // The same items, whether through the crate root or the `uring` module.
+    let _: fn() -> monoio::io_uring::squeue::Entry =
+        || monoio::io_uring::opcode::Nop::new().build();
+    let _: fn() -> monoio::uring::squeue::Entry = || monoio::uring::opcode::Nop::new().build();
+    let _ = monoio::uring::types::Fd(0);
+    let _: Option<monoio::uring::Probe> = None;
+    let _: Option<monoio::uring::IoUring> = None;
+    let _: Option<monoio::uring::cqueue::Entry> = None;
+    // Same type as the one `with_ring` hands out.
+    let _: Option<monoio::IoUring> = None::<monoio::io_uring::IoUring>;
+}
