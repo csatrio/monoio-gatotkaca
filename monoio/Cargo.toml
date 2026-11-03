@@ -29,6 +29,9 @@ tracing = { version = "0.1", default-features = false, features = [
 ], optional = true }
 ctrlc = { version = "3.5", optional = true }
 once_cell = { version = "1.21", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"], optional = true }
+native-tls = { version = "0.2", optional = true }
+thiserror = { version = "2", optional = true }
 
 # linux dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -36,6 +39,8 @@ io-uring = "0.7"
 nix = { version = "0.31", features = ["sched", "ucontext", "process"], optional = true }
 
 [dev-dependencies]
+# crypto provider for the TLS tests; the library itself leaves the choice to the user
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 futures = "0.3"
 local-sync = "0.1"
 tempfile = "3.27"
@@ -70,6 +75,13 @@ debug = ["tracing"]
 # signal enables setting ctrl_c handler
 signal = ["ctrlc", "sync"]
 signal-termination = ["signal", "ctrlc/termination"]
+# TLS backends (monoio::tls::rustls / monoio::tls::native)
+tls-rustls = ["rustls", "thiserror"]
+tls-native = ["native-tls", "thiserror"]
+# native-tls: expose the negotiated ALPN protocol
+tls-native-alpn = ["tls-native", "native-tls/alpn"]
+# native-tls: build OpenSSL from source
+tls-native-vendored = ["tls-native", "native-tls/vendored"]
 default = ["async-cancel", "bytes", "macros", "utils"]
 
 [lints.rust]

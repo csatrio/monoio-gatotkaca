@@ -30,6 +30,8 @@ pub mod fs;
 pub mod io;
 pub mod net;
 pub mod task;
+#[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
+pub mod tls;
 pub mod utils;
 
 use std::future::Future;

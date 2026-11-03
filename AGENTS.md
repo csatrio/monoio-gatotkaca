@@ -4,10 +4,10 @@ Monoio: a thread-per-core async runtime built only on io_uring. Linux only, kern
 
 ## Layout
 - `monoio/`: the runtime crate.
-  - `src/`: `builder`, `runtime`, `scheduler`, `task`, `driver/uring` (+ `op`), `io` (rent traits), `buf`, `net/{tcp,udp,unix}`, `fs`, `time`, `blocking`, `macros` (`join!`, `select!`, `try_join!`), `utils`.
+  - `src/`: `builder`, `runtime`, `scheduler`, `task`, `driver/uring` (+ `op`), `io` (rent traits), `buf`, `net/{tcp,udp,unix}`, `fs`, `time`, `blocking`, `macros` (`join!`, `select!`, `try_join!`), `utils`, `tls/{rustls,native}` (feature-gated; `tls/io_wrapper.rs` bridges the sync TLS engines to rent IO).
   - `tests/`: integration tests; most need a working io_uring.
 - `monoio-macros/`: proc macros `#[monoio::main]`, `#[monoio::test]`, `#[monoio::test_all]`, and `select!` internals.
-- `examples/`: unpublished crate, built with default features off. Run one with `cargo run -p monoio-examples --example echo`. Examples: accept, builder, channel, echo, echo-tfo, join, macro, proxy, tcp_uring, timer, timer-select, uds.
+- `examples/`: unpublished crate, built with default features off. Run one with `cargo run -p monoio-examples --example echo`. Examples: accept, builder, channel, echo, echo-tfo, join, macro, proxy, tcp_uring, timer, timer-select, uds, tls-{rustls,native}-{server,client} (certs in `monoio/tests/certs`).
 
 ## Commands
 - Check: `cargo check --workspace`
@@ -57,8 +57,49 @@ Default: `async-cancel`, `bytes`, `macros`, `utils`.
 | `unlinkat` | `unlinkat` op (kernel 5.11+). |
 | `renameat` | `renameat` op (kernel 5.11+). |
 | `symlinkat` | `symlinkat` op (kernel 5.15+). |
+| `tls-rustls` | `monoio::tls::rustls` (rustls 0.23, TLS 1.2/1.3). Does not pick a crypto provider; see TLS below. |
+| `tls-native` | `monoio::tls::native` (native-tls; OpenSSL on Linux, needs the OpenSSL dev package). |
+| `tls-native-alpn` | `tls-native` plus `TlsStream::alpn_protocol()` (OpenSSL ALPN). |
+| `tls-native-vendored` | `tls-native` with OpenSSL built from source. |
 | `debug` | Emit `tracing` events describing what the runtime does. For runtime development only. Examples need `tracing-subscriber` to show them. |
 | `unstable` | Enable nightly-only code paths (`io_error_more`, `lazy_cell`, `stmt_expr_attributes`, `thread_local`). Nightly toolchain required. |
+
+## TLS
+Enable `tls-rustls` and/or `tls-native`. Both wrap any `AsyncReadRent + AsyncWriteRent` (usually `TcpStream`) and yield a stream implementing the rent traits, `Split` (so `into_split()` works) and `shutdown()` (sends close_notify). Handshakes return `Result<_, TlsError>`, which converts into `io::Error`. Tests: `monoio/tests/tls_*.rs`; runnable demos: the `tls-*` examples.
+
+**rustls** (`monoio::tls::rustls`). Add `rustls` to your own `Cargo.toml` and enable a crypto provider (`ring` or `aws_lc_rs`); monoio does not. Pass rustls configs straight in:
+```rust
+use monoio::tls::rustls::{TlsAcceptor, TlsConnector};
+use rustls::pki_types::ServerName;
+
+// server: ServerConfig -> TlsAcceptor (From<ServerConfig> / From<Arc<ServerConfig>>)
+let acceptor = TlsAcceptor::from(server_config);
+let mut tls = acceptor.accept(tcp_stream).await?;            // ServerTlsStream<TcpStream>
+
+// client: ClientConfig -> TlsConnector
+let connector = TlsConnector::from(client_config);
+let mut tls = connector.connect(ServerName::try_from("example.com")?, tcp_stream).await?;
+
+let (res, buf) = tls.read(buf).await;                          // normal rent IO
+let alpn = tls.alpn_protocol();                                // set via config.alpn_protocols
+```
+Types: `ClientTlsStream`/`ServerTlsStream` (+ `*ReadHalf`/`*WriteHalf`). There is no single unified stream type.
+
+**native-tls** (`monoio::tls::native`). Wrap the `native_tls` builders' output:
+```rust
+use monoio::tls::native::{TlsAcceptor, TlsConnector};
+
+let acceptor = TlsAcceptor::from(native_tls::TlsAcceptor::new(identity)?);   // Identity::from_pkcs8(chain, key)
+let mut tls = acceptor.accept(tcp_stream).await?;                            // TlsStream<TcpStream>
+
+let connector = TlsConnector::from(native_tls::TlsConnector::builder()
+    .add_root_certificate(ca).build()?)
+    .read_buffer(Some(32 * 1024));                                           // optional; .write_buffer() too, default 16 KiB
+let mut tls = connector.connect("example.com", tcp_stream).await?;
+```
+The client verifies the hostname against the domain you pass. `alpn_protocol()` needs `tls-native-alpn` (client side).
+
+Notes: both backends copy through a 16 KiB staging buffer (the sync engines need `std::io`); do not drop a handshake or IO future midway: it takes the staging buffer, so the stream breaks (a later use may panic). Await it to completion. Interop between the two backends works (covered by `tests/tls_interop.rs`).
 
 ## Environment gotchas
 - io_uring needs kernel 5.6+. Check at runtime with `monoio::utils::detect_uring()`. Containers and sandboxes often block io_uring syscalls.

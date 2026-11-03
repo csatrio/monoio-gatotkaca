@@ -15,6 +15,8 @@ monoio = { path = "../monoio", default-features = false, features = [
     "bytes",
     "macros",
     "utils",
+    "tls-rustls",
+    "tls-native",
 ] }
 
 # Enable tracing and tracing-subscriber for print out runtime debug
@@ -23,6 +25,9 @@ monoio = { path = "../monoio", default-features = false, features = [
 # tracing-subscriber = "0.3"
 
 futures = "0.3"
+# crypto provider for the rustls examples
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+native-tls = "0.2"
 local-sync = "0.1"
 pin-project-lite = "0.2"
 
@@ -74,3 +79,19 @@ path = "channel.rs"
 name = "proxy"
 path = "proxy.rs"
 
+
+[[example]]
+name = "tls-rustls-server"
+path = "tls_rustls_server.rs"
+
+[[example]]
+name = "tls-rustls-client"
+path = "tls_rustls_client.rs"
+
+[[example]]
+name = "tls-native-server"
+path = "tls_native_server.rs"
+
+[[example]]
+name = "tls-native-client"
+path = "tls_native_client.rs"

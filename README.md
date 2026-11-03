@@ -67,7 +67,7 @@ Try it with `nc 127.0.0.1 50002`. More runnable programs live in [examples/](exa
 - **Tokio types.** `AsyncRead`/`AsyncWrite` from Tokio are not supported. Use the `*Rent` traits.
 
 ## Cargo features
-Defaults: `async-cancel`, `bytes`, `macros`, `utils`. Optional: `sync`, `signal`, `signal-termination`, `zero-copy`, `splice`, `mkdirat`, `unlinkat`, `renameat`, `symlinkat`, `debug`, `unstable`. See [AGENTS.md](AGENTS.md) for what each one does and its kernel requirement.
+Defaults: `async-cancel`, `bytes`, `macros`, `utils`. Optional: `sync`, `signal`, `signal-termination`, `zero-copy`, `splice`, `mkdirat`, `unlinkat`, `renameat`, `symlinkat`, `debug`, `unstable`, and TLS: `tls-rustls`, `tls-native`, `tls-native-alpn`, `tls-native-vendored` (`monoio::tls`, see the `tls-*` examples). See [AGENTS.md](AGENTS.md) for what each one does and its kernel requirement.
 
 ## Development
 ```sh
