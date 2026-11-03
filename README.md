@@ -1,58 +1,40 @@
 # Monoio
-A thread-per-core Rust runtime built purely on io_uring.
 
-[![Crates.io][crates-badge]][crates-url]
-[![MIT/Apache-2 licensed][license-badge]][license-url]
-[![Build Status][actions-badge]][actions-url]
-[![Codecov][codecov-badge]][codecov-url]
-[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fbytedance%2Fmonoio.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fbytedance%2Fmonoio?ref=badge_shield)
-[中文说明][zh-readme-url]
+A thread-per-core Rust async runtime built purely on io_uring.
 
-[crates-badge]: https://img.shields.io/crates/v/monoio.svg
-[crates-url]: https://crates.io/crates/monoio
-[license-badge]: https://img.shields.io/crates/l/monoio.svg
-[license-url]: LICENSE-MIT
-[actions-badge]: https://github.com/bytedance/monoio/actions/workflows/ci.yml/badge.svg
-[actions-url]: https://github.com/bytedance/monoio/actions
-[codecov-badge]: https://codecov.io/gh/bytedance/monoio/branch/master/graph/badge.svg?token=3MSAMJ6X3E
-[codecov-url]: https://codecov.io/gh/bytedance/monoio
-[zh-readme-url]: README-zh.md
+- Linux only, kernel 5.6+.
+- Tasks are `!Send`, so thread-local state is safe and cheap.
+- IO takes ownership of buffers, which io_uring requires. Calls return `(result, buffer)`.
+- Intended for IO-bound servers such as proxies and load balancers. It is not a general-purpose replacement for Tokio: with very unbalanced workloads some cores sit idle and Tokio's work stealing can do better.
 
-## Design Goal
-Monoio is a pure io_uring Rust async runtime. Part of the design has been borrowed from Tokio and Tokio-uring. However, unlike Tokio-uring, Monoio does not run on top of another runtime, rendering it more efficient.
+For the design, feature flags and configuration, see [AGENTS.md](AGENTS.md).
 
-Moreover, Monoio is designed with a thread-per-core model in mind. Users do not need to worry about tasks being `Send` or `Sync`, as thread local storage can be used safely. In other words, the data does not escape the thread on await points, unlike on work-stealing runtimes such as Tokio. This is because for some use cases, specifically those targeted by this runtime, it is not necessary to make task schedulable between threads. For example, if we were to write a load balancer like NGINX, we would write it in a thread-per-core way. The thread local data does not need to be shared between threads, so the `Sync` and `Send` do not need to be implemented in the first place.
+## Requirements
+- Rust 1.75 or newer (nightly only for the `unstable` feature).
+- Linux kernel 5.6+ with io_uring enabled. Containers and sandboxes often block it. Check with `monoio::utils::detect_uring()`.
+- A sufficient memlock limit: `ulimit -l` should be at least 512 (KiB), or `unlimited`. If IO fails with os error 105 (`No buffer space available`), raise it in `/etc/security/limits.conf` or via systemd `LimitMEMLOCK`.
 
-As you may have guessed, this runtime is primarily targeted at servers, where operations are io-bound on network sockets, and therefore the use of native asynchronous I/O APIs maximizes the throughput of the server. In order for Monoio to be as efficient as possible, we've enabled some unstable Rust features, and we've designed a whole new IO abstraction, which unfortunately may cause some compatibility problems. [Our benchmarks](https://github.com/bytedance/monoio/blob/master/docs/en/benchmark.md) prove that, for our use-cases, Monoio has a better performance than other Rust runtimes.
-
-## Quick Start
-To use monoio, you need rust 1.75. If you already installed it, please make sure it is the latest version.
-
-Monoio is Linux only and requires io_uring: you must make sure your kernel supports it([5.6+](docs/en/platform-support.md)), and memlock is [configured as a proper number](docs/en/memlock.md).
-
-Here is a basic example of how to use Monoio.
+## Quick start
+```toml
+[dependencies]
+monoio = "0.3"
+```
 
 ```rust,no_run
-/// A echo example.
-///
-/// Run the example and `nc 127.0.0.1 50002` in another shell.
-/// All your input will be echoed out.
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::{TcpListener, TcpStream};
 
 #[monoio::main]
 async fn main() {
     let listener = TcpListener::bind("127.0.0.1:50002").unwrap();
-    println!("listening");
     loop {
-        let incoming = listener.accept().await;
-        match incoming {
+        match listener.accept().await {
             Ok((stream, addr)) => {
-                println!("accepted a connection from {}", addr);
+                println!("accepted a connection from {addr}");
                 monoio::spawn(echo(stream));
             }
             Err(e) => {
-                println!("accepted connection failed: {}", e);
+                println!("accept failed: {e}");
                 return;
             }
         }
@@ -63,44 +45,36 @@ async fn echo(mut stream: TcpStream) -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut res;
     loop {
-        // read
         (res, buf) = stream.read(buf).await;
         if res? == 0 {
             return Ok(());
         }
-
-        // write all
         (res, buf) = stream.write_all(buf).await;
         res?;
-
-        // clear
         buf.clear();
     }
 }
 ```
+Try it with `nc 127.0.0.1 50002`. More runnable programs live in [examples/](examples).
 
-You can find more example code in `examples` of this repository.
+## Using it
+- **Runtime options.** Build one with `RuntimeBuilder` or configure `#[monoio::main(...)]` with `entries`, `timer_enabled` and `worker_threads`. The timer is off by default, and `monoio::time` panics unless you enable it.
+- **Multiple cores.** Run one runtime per thread. `worker_threads = n` in the macro does this for you. If you need CPU pinning, create the threads yourself and call `monoio::utils::bind_to_cpu_set`.
+- **Talking between tasks.** Within a thread use [local-sync](https://crates.io/crates/local-sync). Across threads enable the `sync` feature and use any async channel, or atomics.
+- **Timeouts and cancellation.** Dropping a future does not reliably cancel the kernel operation. Use the `Cancelable*` IO traits with `Canceller`/`CancelHandle`, then await the future to get your buffer back. A cancelled op may still have completed, so check for `ECANCELED` (os error 125).
+- **Tokio types.** `AsyncRead`/`AsyncWrite` from Tokio are not supported. Use the `*Rent` traits.
 
-## Limitations
-1. Monoio runs on Linux 5.6 or newer only, using io_uring for both network and file IO. Other platforms are not supported.
-2. Monoio can not solve all problems. If the workload is very unbalanced, it may cause performance degradation than Tokio since CPU cores may not be fully utilized.
+## Cargo features
+Defaults: `async-cancel`, `bytes`, `macros`, `utils`. Optional: `sync`, `signal`, `signal-termination`, `zero-copy`, `splice`, `mkdirat`, `unlinkat`, `renameat`, `symlinkat`, `debug`, `unstable`. See [AGENTS.md](AGENTS.md) for what each one does and its kernel requirement.
 
-## Contributors
-<a href="https://github.com/bytedance/monoio/graphs/contributors"><img src="https://opencollective.com/monoio/contributors.svg?width=890&button=false" /></a>
+## Development
+```sh
+cargo check --workspace
+cargo test -p monoio
+cargo run -p monoio-examples --example echo
+```
 
-Thanks for their contributions!
-
-## Associated Projects
-- [local-sync](https://github.com/monoio-rs/local-sync): A thread local channel.
-- [monoio-tls](https://github.com/monoio-rs/monoio-tls): TLS wrapper for Monoio.
-- [monoio-codec](https://github.com/monoio-rs/monoio-codec): Codec utility for Monoio.
-
-HTTP framework and RPC framework are on the way.
-
-## Licenses
-Monoio is licensed under the MIT license or Apache license.
-
-During developing we referenced a lot from Tokio, Mio, Tokio-uring and other related projects. We would like to thank the authors of these projects.
-
-
-[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fbytedance%2Fmonoio.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fbytedance%2Fmonoio?ref=badge_large)
+## Related projects
+- [local-sync](https://github.com/monoio-rs/local-sync): thread-local channels.
+- [monoio-tls](https://github.com/monoio-rs/monoio-tls): TLS wrapper.
+- [monoio-codec](https://github.com/monoio-rs/monoio-codec): codec utilities.
