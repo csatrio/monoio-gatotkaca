@@ -6,6 +6,7 @@ pub(crate) mod shared_fd;
 #[cfg(feature = "sync")]
 pub(crate) mod thread;
 
+pub mod raw;
 mod uring;
 mod util;
 

@@ -121,6 +121,11 @@ impl<D> Runtime<D> {
         Self { context, driver }
     }
 
+    /// The driver of this runtime.
+    pub fn driver(&self) -> &D {
+        &self.driver
+    }
+
     /// Block on
     pub fn block_on<F>(&mut self, future: F) -> F::Output
     where

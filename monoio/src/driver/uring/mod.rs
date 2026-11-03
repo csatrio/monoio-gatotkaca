@@ -54,7 +54,7 @@ pub(crate) struct UringInner {
     eventfd_read_dst: [u8; 8],
 
     /// IoUring bindings
-    uring: ManuallyDrop<IoUring>,
+    pub(super) uring: ManuallyDrop<IoUring>,
 
     /// Shared waker
     #[cfg(feature = "sync")]
@@ -138,6 +138,10 @@ impl IoUringDriver {
         super::thread::register_unpark_handle(thread_id, driver.unpark());
         super::thread::register_waker_sender(thread_id, waker_sender);
         Ok(driver)
+    }
+
+    pub(super) fn handle(&self) -> Inner {
+        Inner(self.inner.clone())
     }
 
     #[allow(unused)]

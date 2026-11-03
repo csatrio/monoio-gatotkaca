@@ -27,6 +27,7 @@ Monoio: a thread-per-core async runtime built only on io_uring. Linux only, kern
   ```
   Always await the future after `cancel()`: you get the buffer back, and the result is either `Err(os error 125)` (ECANCELED) or a completed result you must handle. Wrappers just pass the `CancelHandle` through.
 - **Communication.** Same thread: `local-sync` (mpsc, oneshot, semaphore, no atomics). Across threads: enable `sync` and use any channel (`flume`, `async-channel`, Tokio's `sync`) or atomics. Prefer per-thread aggregation on hot paths.
+- **Raw io_uring access.** `monoio::uring` is the escape hatch for ops the crate doesn't wrap. `unsafe uring::submit(sqe, data)` queues any `squeue::Entry` and resolves to `(Cqe, data)`; `data` must own the heap memory the SQE points to and is kept alive until the kernel finishes. `unsafe uring::with_ring(|ring| ..)` exposes the `IoUring` for registration, probing and `params()`. Both also exist on `IoUringDriver` (`submit_raw`, `with_ring`; reach it with `Runtime::driver()`). Do not push SQEs or reap CQEs on the ring yourself: the driver owns `user_data` and consumes every CQE. Single-shot ops only; an fd returned by a raw op is yours to close.
 - **Blocking work.** `monoio::spawn_blocking` needs `sync`. Attach a pool with `RuntimeBuilder::attach_thread_pool` or choose `with_blocking_strategy` (`Panic` or `ExecuteLocal`).
 
 ## Runtime configuration

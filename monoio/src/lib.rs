@@ -38,7 +38,7 @@ use std::future::Future;
 #[cfg(feature = "sync")]
 pub use blocking::spawn_blocking;
 pub use builder::{Buildable, RuntimeBuilder};
-pub use driver::{Driver, IoUringDriver};
+pub use driver::{raw as uring, Driver, IoUringDriver};
 pub use io_uring::IoUring;
 #[cfg(feature = "macros")]
 pub use monoio_macros::{main, test, test_all};
