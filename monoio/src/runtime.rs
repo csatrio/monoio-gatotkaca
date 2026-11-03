@@ -76,12 +76,11 @@ impl Context {
         }
     }
 
-    #[allow(unused)]
     #[cfg(feature = "sync")]
     pub(crate) fn unpark_thread(&self, id: usize) {
         use crate::driver::{thread::get_unpark_handle, unpark::Unpark};
         if let Some(handle) = self.unpark_cache.borrow().get(&id) {
-            handle.unpark();
+            let _ = handle.unpark();
             return;
         }
 
@@ -89,11 +88,10 @@ impl Context {
             // Write back to local cache
             let w = v.clone();
             self.unpark_cache.borrow_mut().insert(id, w);
-            v.unpark();
+            let _ = v.unpark();
         }
     }
 
-    #[allow(unused)]
     #[cfg(feature = "sync")]
     pub(crate) fn send_waker(&self, id: usize, w: std::task::Waker) {
         use crate::driver::thread::get_waker_sender;

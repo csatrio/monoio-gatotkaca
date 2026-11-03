@@ -242,7 +242,6 @@ async fn sync_doesnt_kill_anything() {
     file.sync_data().await.unwrap();
 }
 
-#[allow(unused)]
 async fn poll_once(future: impl std::future::Future) {
     use std::{pin::pin, task::Poll};
 
@@ -256,7 +255,7 @@ async fn poll_once(future: impl std::future::Future) {
     .await;
 }
 
-#[allow(unused, clippy::needless_return)]
+#[allow(clippy::needless_return)]
 fn assert_invalid_fd(fd: RawFd, base: std::fs::Metadata) {
     use std::fs::File;
     let f = unsafe { File::from_raw_fd(fd) };

@@ -34,15 +34,6 @@ impl<T> Slab<T> {
         }
     }
 
-    /// Get slab len.
-    #[allow(unused)]
-    pub(crate) fn len(&self) -> usize {
-        self.pages.iter().fold(0, |acc, page| match page {
-            Some(page) => acc + page.used,
-            None => acc,
-        })
-    }
-
     pub(crate) fn get(&mut self, key: usize) -> Option<Ref<'_, T>> {
         let page_id = get_page_id(key);
         // here we make 2 mut ref so we must make it safe.
@@ -89,19 +80,6 @@ impl<T> Slab<T> {
         panic!("out of slot");
     }
 
-    /// Remove an element from slab.
-    #[allow(unused)]
-    pub(crate) fn remove(&mut self, key: usize) -> Option<T> {
-        let page_id = get_page_id(key);
-        let page = match unsafe { self.pages.get_unchecked_mut(page_id) } {
-            Some(page) => page,
-            None => return None,
-        };
-        let val = page.remove(key - page.prev_len);
-        self.mark_remove();
-        val
-    }
-
     pub(crate) fn mark_remove(&mut self) {
         // compact
         self.generation = self.generation.wrapping_add(1);
@@ -143,7 +121,6 @@ pub(crate) struct Ref<'a, T> {
 }
 
 impl<T> Ref<'_, T> {
-    #[allow(unused)]
     pub(crate) fn remove(self) -> T {
         // # Safety
         // We make sure the index is valid.
@@ -339,6 +316,26 @@ impl<T> Drop for Page<T> {
                 std::mem::transmute::<Vec<MaybeUninit<Entry<T>>>, Vec<Entry<T>>>(to_drop);
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl<T> Slab<T> {
+    /// Get slab len.
+    pub(crate) fn len(&self) -> usize {
+        self.pages.iter().fold(0, |acc, page| match page {
+            Some(page) => acc + page.used,
+            None => acc,
+        })
+    }
+
+    /// Remove an element from slab.
+    pub(crate) fn remove(&mut self, key: usize) -> Option<T> {
+        let page_id = get_page_id(key);
+        let page = self.pages.get_mut(page_id)?.as_mut()?;
+        let val = page.remove(key - page.prev_len);
+        self.mark_remove();
+        val
     }
 }
 

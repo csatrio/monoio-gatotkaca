@@ -38,10 +38,6 @@ read_result! {
     ReadVec<T: IoVecBufMut> { buf_vec },
 }
 
-read_result! {
-    ReadVecAt<T: IoVecBufMut> { buf_vec },
-}
-
 pub(crate) struct Read<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed
     /// while the operation is in-flight.
@@ -122,35 +118,6 @@ impl<T: IoVecBufMut> OpAble for ReadVec<T> {
         // the readv(2) syscall.
         opcode::Readv::new(types::Fd(self.fd.raw_fd()), ptr, len)
             .offset(-1i64 as u64)
-            .build()
-    }
-}
-
-pub(crate) struct ReadVecAt<T> {
-    /// Holds a strong ref to the FD, preventing the file from being closed
-    /// while the operation is in-flight.
-    fd: SharedFd,
-    /// Reference to the in-flight buffer.
-    pub(crate) buf_vec: T,
-    offset: u64,
-}
-
-impl<T: IoVecBufMut> Op<ReadVecAt<T>> {
-    pub(crate) fn read_vectored_at(fd: SharedFd, buf_vec: T, offset: u64) -> io::Result<Self> {
-        Op::submit_with(ReadVecAt {
-            fd,
-            buf_vec,
-            offset,
-        })
-    }
-}
-
-impl<T: IoVecBufMut> OpAble for ReadVecAt<T> {
-    fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        let ptr = self.buf_vec.write_iovec_ptr() as _;
-        let len = self.buf_vec.write_iovec_len() as _;
-        opcode::Readv::new(types::Fd(self.fd.raw_fd()), ptr, len)
-            .offset(self.offset)
             .build()
     }
 }

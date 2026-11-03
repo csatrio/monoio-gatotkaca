@@ -13,7 +13,6 @@ use crate::{
 pub(crate) struct Send<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed
     /// while the operation is in-flight.
-    #[allow(unused)]
     fd: SharedFd,
 
     pub(crate) buf: T,
@@ -22,14 +21,6 @@ pub(crate) struct Send<T> {
 impl<T: IoBuf> Op<Send<T>> {
     pub(crate) fn send(fd: SharedFd, buf: T) -> io::Result<Self> {
         Op::submit_with(Send { fd, buf })
-    }
-
-    #[allow(unused)]
-    pub(crate) fn send_raw(fd: &SharedFd, buf: T) -> Send<T> {
-        Send {
-            fd: fd.clone(),
-            buf,
-        }
     }
 
     pub(crate) async fn result(self) -> BufResult<usize, T> {
@@ -78,7 +69,6 @@ impl<T: IoBuf> OpAble for Send<T> {
 pub(crate) struct SendMsg<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed
     /// while the operation is in-flight.
-    #[allow(unused)]
     fd: SharedFd,
 
     /// Reference to the in-flight buffer.
@@ -138,7 +128,6 @@ impl<T: IoBuf> OpAble for SendMsg<T> {
 pub(crate) struct SendMsgUnix<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed
     /// while the operation is in-flight.
-    #[allow(unused)]
     fd: SharedFd,
 
     /// Reference to the in-flight buffer.
@@ -201,7 +190,6 @@ impl<T: IoBuf> OpAble for SendMsgUnix<T> {
 pub(crate) struct SendZc<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed
     /// while the operation is in-flight.
-    #[allow(unused)]
     fd: SharedFd,
 
     pub(crate) buf: T,
@@ -233,66 +221,5 @@ impl<T: IoBuf> OpAble for SendZc<T> {
         )
         .flags(FLAGS)
         .build()
-    }
-}
-
-/// Zero-copy sendmsg using IORING_OP_SENDMSG_ZC (Linux 6.1+).
-///
-/// Like `SendZc`, this produces two CQEs and the future only resolves
-/// after the notification CQE arrives.
-pub(crate) struct SendMsgZc<T> {
-    /// Holds a strong ref to the FD, preventing the file from being closed
-    /// while the operation is in-flight.
-    #[allow(unused)]
-    fd: SharedFd,
-
-    /// Reference to the in-flight buffer.
-    pub(crate) buf: T,
-    pub(crate) info: Box<(Option<SockAddr>, IoVecMeta, MsgMeta)>,
-}
-
-impl<T: IoBuf> Op<SendMsgZc<T>> {
-    pub(crate) fn send_msg_zc(
-        fd: SharedFd,
-        buf: T,
-        socket_addr: Option<SocketAddr>,
-    ) -> io::Result<Self> {
-        let mut info: Box<(Option<SockAddr>, IoVecMeta, MsgMeta)> = Box::new((
-            socket_addr.map(Into::into),
-            IoVecMeta::from(&buf),
-            unsafe { std::mem::zeroed() },
-        ));
-
-        info.2.msg_iov = info.1.write_iovec_ptr();
-        info.2.msg_iovlen = info.1.write_iovec_len() as _;
-        match info.0.as_ref() {
-            Some(socket_addr) => {
-                info.2.msg_name = socket_addr.as_ptr() as *mut libc::c_void;
-                info.2.msg_namelen = socket_addr.len();
-            }
-            None => {
-                info.2.msg_name = std::ptr::null_mut();
-                info.2.msg_namelen = 0;
-            }
-        }
-
-        Op::submit_with(SendMsgZc { fd, buf, info })
-    }
-
-    pub(crate) async fn wait(self) -> BufResult<usize, T> {
-        let complete = self.await;
-        let res = complete.meta.result.map(|v| v.into_inner() as _);
-        let buf = complete.data.buf;
-        (res, buf)
-    }
-}
-
-impl<T: IoBuf> OpAble for SendMsgZc<T> {
-    fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        #[allow(deprecated)]
-        const FLAGS: u32 = libc::MSG_NOSIGNAL as u32;
-        opcode::SendMsgZc::new(types::Fd(self.fd.raw_fd()), &*self.info.2)
-            .flags(FLAGS)
-            .build()
     }
 }

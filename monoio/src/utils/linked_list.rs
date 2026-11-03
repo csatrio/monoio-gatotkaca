@@ -7,7 +7,6 @@
 //! specified node is actually contained by the list.
 // Heavily borrowed from tokio.
 // Copyright (c) 2021 Tokio Contributors, licensed under the MIT license.
-#![allow(unused)]
 
 use core::{
     cell::UnsafeCell,
@@ -87,14 +86,12 @@ struct PointersInner<T> {
     ///
     /// This field is accessed through pointer manipulation, so it is not dead
     /// code.
-    #[allow(dead_code)]
     prev: Option<NonNull<T>>,
 
     /// The next node in the list. null if there is no previous node.
     ///
     /// This field is accessed through pointer manipulation, so it is not dead
     /// code.
-    #[allow(dead_code)]
     next: Option<NonNull<T>>,
 
     /// This type is !Unpin due to the heuristic from:
@@ -218,60 +215,9 @@ impl<L: Link> fmt::Debug for LinkedList<L, L::Target> {
     }
 }
 
-impl<L: Link> LinkedList<L, L::Target> {
-    pub(crate) fn last(&self) -> Option<&L::Target> {
-        let tail = self.tail.as_ref()?;
-        unsafe { Some(&*tail.as_ptr()) }
-    }
-}
-
 impl<L: Link> Default for LinkedList<L, L::Target> {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-// ===== impl DrainFilter =====
-
-pub(crate) struct DrainFilter<'a, T: Link, F> {
-    list: &'a mut LinkedList<T, T::Target>,
-    filter: F,
-    curr: Option<NonNull<T::Target>>,
-}
-
-impl<T: Link> LinkedList<T, T::Target> {
-    pub(crate) fn drain_filter<F>(&mut self, filter: F) -> DrainFilter<'_, T, F>
-    where
-        F: FnMut(&mut T::Target) -> bool,
-    {
-        let curr = self.head;
-        DrainFilter {
-            curr,
-            filter,
-            list: self,
-        }
-    }
-}
-
-impl<T, F> Iterator for DrainFilter<'_, T, F>
-where
-    T: Link,
-    F: FnMut(&mut T::Target) -> bool,
-{
-    type Item = T::Handle;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(curr) = self.curr {
-            // safety: the pointer references data contained by the list
-            self.curr = unsafe { T::pointers(curr).as_ref() }.get_next();
-
-            // safety: the value is still owned by the linked list.
-            if (self.filter)(unsafe { &mut *curr.as_ptr() }) {
-                return unsafe { self.list.remove(curr) };
-            }
-        }
-
-        None
     }
 }
 

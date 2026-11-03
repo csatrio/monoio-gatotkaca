@@ -20,7 +20,6 @@ use crate::{
 
 /// Unix pipe.
 pub struct Pipe {
-    #[allow(dead_code)]
     pub(crate) fd: SharedFd,
 }
 

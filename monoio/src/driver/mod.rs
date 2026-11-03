@@ -1,7 +1,5 @@
 /// Monoio Driver.
-#[allow(dead_code)]
 pub(crate) mod op;
-#[allow(dead_code)]
 pub(crate) mod shared_fd;
 #[cfg(feature = "sync")]
 pub(crate) mod thread;
@@ -103,9 +101,8 @@ impl Inner {
 #[cfg(feature = "sync")]
 pub(crate) use self::uring::UnparkHandle;
 
-#[cfg(feature = "sync")]
+#[cfg(feature = "signal")]
 impl UnparkHandle {
-    #[allow(unused)]
     pub(crate) fn current() -> Self {
         CURRENT.with(|inner| UringInner::unpark(&inner.0))
     }

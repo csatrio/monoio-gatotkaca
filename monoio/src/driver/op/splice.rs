@@ -11,11 +11,6 @@ pub(crate) struct Splice {
     fd_in: SharedFd,
     fd_out: SharedFd,
     len: u32,
-    direction: SpliceDirection,
-}
-enum SpliceDirection {
-    FromPipe,
-    ToPipe,
 }
 
 impl Op<Splice> {
@@ -28,7 +23,6 @@ impl Op<Splice> {
             fd_in: fd_in.clone(),
             fd_out: fd_out.clone(),
             len,
-            direction: SpliceDirection::ToPipe,
         })
     }
 
@@ -41,7 +35,6 @@ impl Op<Splice> {
             fd_in: fd_in.clone(),
             fd_out: fd_out.clone(),
             len,
-            direction: SpliceDirection::FromPipe,
         })
     }
 

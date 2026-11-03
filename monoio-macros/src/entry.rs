@@ -80,7 +80,6 @@ impl Configuration {
     }
 }
 
-#[allow(unused)]
 fn parse_int(int: syn::Lit, span: Span, field: &str) -> Result<usize, syn::Error> {
     match int {
         syn::Lit::Int(lit) => match lit.base10_parse::<usize>() {
@@ -97,7 +96,6 @@ fn parse_int(int: syn::Lit, span: Span, field: &str) -> Result<usize, syn::Error
     }
 }
 
-#[allow(unused)]
 fn parse_bool(bool: syn::Lit, span: Span, field: &str) -> Result<bool, syn::Error> {
     match bool {
         syn::Lit::Bool(b) => Ok(b.value),

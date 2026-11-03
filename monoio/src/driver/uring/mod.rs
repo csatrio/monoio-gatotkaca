@@ -26,10 +26,8 @@ mod waker;
 #[cfg(feature = "sync")]
 pub(crate) use waker::UnparkHandle;
 
-#[allow(unused)]
-pub(crate) const CANCEL_USERDATA: u64 = u64::MAX;
 pub(crate) const TIMEOUT_USERDATA: u64 = u64::MAX - 1;
-#[allow(unused)]
+#[cfg(feature = "sync")]
 pub(crate) const EVENTFD_USERDATA: u64 = u64::MAX - 2;
 pub(crate) const MIN_REVERSED_USERDATA: u64 = u64::MAX - 2;
 
@@ -142,12 +140,6 @@ impl IoUringDriver {
 
     pub(super) fn handle(&self) -> Inner {
         Inner(self.inner.clone())
-    }
-
-    #[allow(unused)]
-    fn num_operations(&self) -> usize {
-        let inner = self.inner.get();
-        unsafe { (*inner).ops.slab.len() }
     }
 
     // Flush to make enough space

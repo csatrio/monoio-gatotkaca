@@ -28,10 +28,6 @@ write_result! {
     WriteVec<T: IoVecBuf> { buf_vec },
 }
 
-write_result! {
-    WriteVecAt<T: IoVecBuf> { buf_vec },
-}
-
 pub(crate) struct Write<T> {
     fd: SharedFd,
     pub(crate) buf: T,
@@ -62,7 +58,6 @@ impl<T: IoBuf> OpAble for Write<T> {
 pub(crate) struct WriteAt<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed
     /// while the operation is in-flight.
-    #[allow(unused)]
     fd: SharedFd,
     /// Refers to https://docs.rs/io-uring/latest/io_uring/opcode/struct.Write.html.
     ///
@@ -101,13 +96,6 @@ impl<T: IoVecBuf> Op<WriteVec<T>> {
     pub(crate) fn writev(fd: SharedFd, buf_vec: T) -> io::Result<Self> {
         Op::submit_with(WriteVec { fd, buf_vec })
     }
-
-    pub(crate) fn writev_raw(fd: &SharedFd, buf_vec: T) -> WriteVec<T> {
-        WriteVec {
-            fd: fd.clone(),
-            buf_vec,
-        }
-    }
 }
 
 impl<T: IoVecBuf> OpAble for WriteVec<T> {
@@ -121,27 +109,5 @@ impl<T: IoVecBuf> OpAble for WriteVec<T> {
         opcode::Writev::new(types::Fd(self.fd.raw_fd()), ptr, len)
             .offset(-1i64 as u64)
             .build()
-    }
-}
-
-pub(crate) struct WriteVecAt<T> {
-    fd: SharedFd,
-    /// Refers to https://docs.rs/io-uring/latest/io_uring/opcode/struct.Write.html.
-    ///
-    /// If `offset` is set to `-1`, the offset will use (and advance) the file position, like
-    /// the writev(2) system calls.
-    offset: u64,
-    buf_vec: T,
-}
-
-impl<T: IoVecBuf> OpAble for WriteVecAt<T> {
-    fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        opcode::Writev::new(
-            types::Fd(libc::AT_FDCWD),
-            self.buf_vec.read_iovec_ptr(),
-            self.buf_vec.read_iovec_len() as _,
-        )
-        .offset(self.offset)
-        .build()
     }
 }

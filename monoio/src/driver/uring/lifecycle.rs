@@ -25,7 +25,6 @@ enum Lifecycle {
 
     /// The submitter no longer has interest in the operation result. The state
     /// must be passed to the driver and held until the operation completes.
-    #[allow(dead_code)]
     Ignored(Box<dyn std::any::Any>),
 
     /// The operation has completed.
@@ -40,6 +39,7 @@ enum Lifecycle {
     WaitingMore(Waker, io::Result<MaybeFd>, u32),
 
     /// The future was dropped but a notification CQE is still pending.
+    // Holds the buffer alive; never read, only dropped.
     #[allow(dead_code)]
     IgnoredMore(Box<dyn std::any::Any>),
 }

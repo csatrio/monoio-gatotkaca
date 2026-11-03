@@ -58,7 +58,6 @@ pub(crate) struct Completion<T> {
 #[derive(Debug)]
 pub(crate) struct CompletionMeta {
     pub(crate) result: io::Result<MaybeFd>,
-    #[allow(unused)]
     pub(crate) flags: u32,
 }
 
@@ -81,43 +80,10 @@ impl MaybeFd {
     }
 
     #[inline]
-    pub(crate) unsafe fn new_fd_result(fdr: io::Result<u32>) -> io::Result<Self> {
-        fdr.map(|fd| Self { is_fd: true, fd })
-    }
-
-    #[inline]
-    pub(crate) fn new_non_fd_result(fdr: io::Result<u32>) -> io::Result<Self> {
-        fdr.map(|fd| Self { is_fd: false, fd })
-    }
-
-    #[inline]
-    pub(crate) const unsafe fn new_fd(fd: u32) -> Self {
-        Self { is_fd: true, fd }
-    }
-
-    #[inline]
-    pub(crate) const fn new_non_fd(fd: u32) -> Self {
-        Self { is_fd: false, fd }
-    }
-
-    #[inline]
     pub(crate) const fn into_inner(self) -> u32 {
         let fd = self.fd;
         std::mem::forget(self);
         fd
-    }
-
-    #[inline]
-    pub(crate) const fn zero() -> Self {
-        Self {
-            is_fd: false,
-            fd: 0,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn fd(&self) -> u32 {
-        self.fd
     }
 }
 
@@ -153,7 +119,6 @@ impl<T: OpAble> Op<T> {
     }
 
     /// Try submitting an operation to uring
-    #[allow(unused)]
     pub(super) fn try_submit_with(data: T) -> io::Result<Op<T>> {
         if driver::CURRENT.is_set() {
             Op::submit_with(data)

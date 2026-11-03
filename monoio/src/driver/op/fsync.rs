@@ -5,7 +5,6 @@ use io_uring::{opcode, types};
 use super::{super::shared_fd::SharedFd, Op, OpAble};
 
 pub(crate) struct Fsync {
-    #[allow(unused)]
     fd: SharedFd,
     data_sync: bool,
 }

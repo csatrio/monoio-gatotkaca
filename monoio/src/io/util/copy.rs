@@ -1,9 +1,6 @@
-#![allow(unused)]
-
 use std::io;
 
 use crate::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
-use crate::net::unix::new_pipe;
 
 const BUF_SIZE: usize = 64 * 1024;
 
@@ -16,7 +13,7 @@ where
     let mut buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
     let mut transferred: u64 = 0;
 
-    'r: loop {
+    loop {
         let (read_res, mut buf_read) = reader.read(buf).await;
         match read_res {
             Ok(0) => {
@@ -76,8 +73,8 @@ pub async fn zero_copy<SRC: crate::io::as_fd::AsReadFd, DST: crate::io::as_fd::A
     writer: &mut DST,
 ) -> io::Result<u64> {
     use crate::{
-        driver::op::Op,
         io::splice::{SpliceDestination, SpliceSource},
+        net::unix::new_pipe,
     };
 
     let (mut pr, mut pw) = new_pipe()?;

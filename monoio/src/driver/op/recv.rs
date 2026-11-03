@@ -19,7 +19,6 @@ use crate::{
 pub(crate) struct Recv<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed
     /// while the operation is in-flight.
-    #[allow(unused)]
     fd: SharedFd,
 
     /// Reference to the in-flight buffer.
@@ -29,14 +28,6 @@ pub(crate) struct Recv<T> {
 impl<T: IoBufMut> Op<Recv<T>> {
     pub(crate) fn recv(fd: SharedFd, buf: T) -> io::Result<Self> {
         Op::submit_with(Recv { fd, buf })
-    }
-
-    #[allow(unused)]
-    pub(crate) fn recv_raw(fd: &SharedFd, buf: T) -> Recv<T> {
-        Recv {
-            fd: fd.clone(),
-            buf,
-        }
     }
 
     pub(crate) async fn result(self) -> BufResult<usize, T> {
@@ -68,7 +59,6 @@ impl<T: IoBufMut> OpAble for Recv<T> {
 pub(crate) struct RecvMsg<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed
     /// while the operation is in-flight.
-    #[allow(unused)]
     fd: SharedFd,
 
     /// Reference to the in-flight buffer.
@@ -145,7 +135,6 @@ impl<T: IoBufMut> OpAble for RecvMsg<T> {
 pub(crate) struct RecvMsgUnix<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed
     /// while the operation is in-flight.
-    #[allow(unused)]
     fd: SharedFd,
 
     /// Reference to the in-flight buffer.

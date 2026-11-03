@@ -71,7 +71,6 @@ pub trait Buildable: Sized {
     fn build(this: RuntimeBuilder<Self>) -> io::Result<Runtime<Self>>;
 }
 
-#[allow(unused)]
 macro_rules! direct_build {
     ($ty: ty) => {
         impl RuntimeBuilder<$ty> {

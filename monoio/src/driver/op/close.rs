@@ -10,7 +10,6 @@ pub(crate) struct Close {
 }
 
 impl Op<Close> {
-    #[allow(unused)]
     pub(crate) fn close(fd: RawFd) -> io::Result<Op<Close>> {
         Op::try_submit_with(Close { fd })
     }

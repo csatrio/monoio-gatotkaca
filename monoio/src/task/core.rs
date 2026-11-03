@@ -147,15 +147,6 @@ impl<T: Future> CoreStage<T> {
     }
 }
 
-impl Header {
-    #[allow(unused)]
-    pub(crate) fn get_owner_id(&self) -> usize {
-        // safety: If there are concurrent writes, then that write has violated
-        // the safety requirements on `set_owner_id`.
-        self.owner_id
-    }
-}
-
 impl Trailer {
     pub(crate) unsafe fn set_waker(&self, waker: Option<Waker>) {
         self.waker.with_mut(|ptr| {

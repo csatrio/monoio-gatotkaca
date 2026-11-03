@@ -5,7 +5,6 @@ use super::{super::shared_fd::SharedFd, Op, OpAble};
 pub(crate) struct PollAdd {
     /// Holds a strong ref to the FD, preventing the file from being closed
     /// while the operation is in-flight.
-    #[allow(unused)]
     fd: SharedFd,
     // true: read; false: write
     is_read: bool,

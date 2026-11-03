@@ -19,7 +19,7 @@ pub trait AsWriteFd {
 pub struct SharedFdWrapper(SharedFd);
 
 impl SharedFdWrapper {
-    #[allow(unused)]
+    #[cfg(feature = "splice")]
     pub(crate) fn as_ref(&self) -> &SharedFd {
         &self.0
     }

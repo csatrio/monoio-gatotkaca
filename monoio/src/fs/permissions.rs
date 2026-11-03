@@ -39,7 +39,6 @@ impl Permissions {
     /// This will not change the file's permissions, only the in-memory representation.
     /// Same with the `std::fs`, if you want to change the file's permissions, you should use
     /// `monoio::fs::set_permissions`(currently not support) or `std::fs::set_permissions`.
-    #[allow(unused)]
     pub fn set_readonly(&mut self, readonly: bool) {
         self.0.set_readonly(readonly)
     }

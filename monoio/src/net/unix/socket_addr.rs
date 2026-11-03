@@ -49,7 +49,6 @@ impl SocketAddr {
         }
     }
 
-    #[allow(unused)]
     pub(crate) fn new<F>(f: F) -> io::Result<SocketAddr>
     where
         F: FnOnce(*mut libc::sockaddr, &mut libc::socklen_t) -> io::Result<libc::c_int>,
