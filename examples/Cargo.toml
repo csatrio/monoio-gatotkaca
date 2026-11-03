@@ -1,6 +1,6 @@
 [package]
-edition = "2021"
-license = "MIT/Apache-2.0"
+edition.workspace = true
+license.workspace = true
 name = "monoio-examples"
 publish = false
 version = "0.0.0"
@@ -9,7 +9,7 @@ version = "0.0.0"
 # [dependencies] instead. In additional, if you want to know how runtime
 # works, you can enable "debug" feature.
 [dev-dependencies]
-monoio = { path = "../monoio", default-features = false, features = [
+monoio = { workspace = true, features = [
     "async-cancel",
     "sync",
     "bytes",

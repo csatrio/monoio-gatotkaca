@@ -1,12 +1,12 @@
 [package]
-authors = ["ChiHai <ihciah@gmail.com>"]
+authors.workspace = true
 categories = ["asynchronous"]
-description = "Monoio proc macros."
-edition = "2021"
-keywords = ["runtime", "iouring", "async"]
-license = "MIT OR Apache-2.0"
-name = "monoio-macros"
-repository = "https://github.com/bytedance/monoio"
+description = "Proc macros for adaptif-gatotkaca-monoio (a fork of Monoio): #[monoio::main], #[monoio::test] and select!."
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+name = "adaptif-gatotkaca-monoio-macros"
+repository.workspace = true
 version = "0.2.0"
 
 [lib]

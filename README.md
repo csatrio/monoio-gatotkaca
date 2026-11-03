@@ -2,7 +2,10 @@
 
 A thread-per-core Rust async runtime built purely on io_uring.
 
+This is a stripped-down fork of [Monoio](https://github.com/bytedance/monoio) by ByteDance and the Monoio contributors. It runs only on Linux and only on io_uring. It is the runtime behind the transport system of adaptif-gatotkaca, from [Adaptif](https://www.adaptif.co.id).
+
 - Linux only, kernel 5.6+.
+- TLS support: rustls and native-tls backends behind the `tls-rustls` and `tls-native` features (see `monoio::tls`).
 - Tasks are `!Send`, so thread-local state is safe and cheap.
 - IO takes ownership of buffers, which io_uring requires. Calls return `(result, buffer)`.
 - Intended for IO-bound servers such as proxies and load balancers. It is not a general-purpose replacement for Tokio: with very unbalanced workloads some cores sit idle and Tokio's work stealing can do better.
@@ -17,8 +20,9 @@ For the design, feature flags and configuration, see [AGENTS.md](AGENTS.md).
 ## Quick start
 ```toml
 [dependencies]
-monoio = "0.3"
+adaptif-gatotkaca-monoio = "0.3"
 ```
+The library is still named `monoio`, so code says `use monoio::...` and `#[monoio::main]`.
 
 ```rust,no_run
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
@@ -72,7 +76,7 @@ Defaults: `async-cancel`, `bytes`, `macros`, `utils`. Optional: `sync`, `signal`
 ## Development
 ```sh
 cargo check --workspace
-cargo test -p monoio
+cargo test -p adaptif-gatotkaca-monoio
 cargo run -p monoio-examples --example echo
 ```
 
@@ -80,3 +84,8 @@ cargo run -p monoio-examples --example echo
 - [local-sync](https://github.com/monoio-rs/local-sync): thread-local channels.
 - [monoio-tls](https://github.com/monoio-rs/monoio-tls): TLS wrapper.
 - [monoio-codec](https://github.com/monoio-rs/monoio-codec): codec utilities.
+
+## Credits and license
+This crate is a modified fork of [Monoio](https://github.com/bytedance/monoio), Copyright (c) 2024 Monoio Contributors, and its TLS support is derived from [monoio-tls](https://github.com/monoio-rs/monoio-tls). Both are licensed under MIT or Apache-2.0, as is this crate: see [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE). Code derived from Mio, Tokio, Tokio-uring, Futures-rs and Slab is covered by [LICENSE-THIRD-PARTY](LICENSE-THIRD-PARTY). [NOTICE](NOTICE) lists the changes made to the original.
+
+Maintained by [csatrio](https://github.com/csatrio) for [Adaptif](https://www.adaptif.co.id).

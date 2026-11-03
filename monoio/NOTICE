@@ -1,0 +1,27 @@
+adaptif-gatotkaca-monoio
+https://github.com/csatrio/monoio-gatotkaca
+
+This product is a modified fork of Monoio, https://github.com/bytedance/monoio
+Copyright (c) 2024 Monoio Contributors, released under the MIT or Apache-2.0
+license (see LICENSE-MIT and LICENSE-APACHE). The original copyright and license
+notices are retained. Code derived from Mio, Tokio, Tokio-uring, Futures-rs and Slab
+is covered by the notices in LICENSE-THIRD-PARTY.
+
+TLS support (src/tls) is derived from monoio-tls,
+https://github.com/monoio-rs/monoio-tls
+Copyright (c) 2024 Monoio Contributors, released under the MIT or Apache-2.0 license.
+
+Changes made to Monoio and monoio-tls:
+- Removed the epoll, kqueue, IOCP and poll-io drivers, the legacy driver, the
+  tokio-compat layer and all non-Linux platform support; io_uring is the only driver.
+- Removed the CI configuration, docs and contributing files.
+- Added raw io_uring access (monoio::uring) and Runtime::driver().
+- Ported monoio-rustls, monoio-native-tls and monoio-io-wrapper into monoio::tls, dropped
+  their unsafe_io and qat options and the unified rustls TlsStream alias, and updated them
+  to this crate's APIs.
+- Removed unused code, bumped all dependencies and adapted to their new APIs.
+- Renamed the packages to adaptif-gatotkaca-monoio and adaptif-gatotkaca-monoio-macros
+  (the library name stays `monoio`).
+
+Modifications are made by csatrio for Adaptif (https://www.adaptif.co.id) and are made
+available under the same MIT or Apache-2.0 terms.

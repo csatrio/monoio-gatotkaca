@@ -1,17 +1,17 @@
 # AGENTS.md
 
-Monoio: a thread-per-core async runtime built only on io_uring. Linux only, kernel 5.6+. There is no epoll/legacy/IOCP driver.
+Monoio (published as `adaptif-gatotkaca-monoio`, library name `monoio`): a stripped-down, thread-per-core async runtime built only on io_uring. Linux only, kernel 5.6+. There is no epoll/legacy/IOCP driver. A fork of bytedance/monoio; keep `LICENSE-*` and `NOTICE` when changing licensing or packaging.
 
 ## Layout
-- `monoio/`: the runtime crate.
+- `monoio/`: the runtime crate (package `adaptif-gatotkaca-monoio`; refer to it as `-p adaptif-gatotkaca-monoio`).
   - `src/`: `builder`, `runtime`, `scheduler`, `task`, `driver/uring` (+ `op`), `io` (rent traits), `buf`, `net/{tcp,udp,unix}`, `fs`, `time`, `blocking`, `macros` (`join!`, `select!`, `try_join!`), `utils`, `tls/{rustls,native}` (feature-gated; `tls/io_wrapper.rs` bridges the sync TLS engines to rent IO).
   - `tests/`: integration tests; most need a working io_uring.
-- `monoio-macros/`: proc macros `#[monoio::main]`, `#[monoio::test]`, `#[monoio::test_all]`, and `select!` internals.
+- `monoio-macros/`: separate proc-macro crate (package `adaptif-gatotkaca-monoio-macros`; proc macros cannot live in the runtime crate, so it is published first): proc macros `#[monoio::main]`, `#[monoio::test]`, `#[monoio::test_all]`, and `select!` internals.
 - `examples/`: unpublished crate, built with default features off. Run one with `cargo run -p monoio-examples --example echo`. Examples: accept, builder, channel, echo, echo-tfo, join, macro, proxy, tcp_uring, timer, timer-select, uds, tls-{rustls,native}-{server,client} (certs in `monoio/tests/certs`).
 
 ## Commands
 - Check: `cargo check --workspace`
-- Test: `cargo test -p monoio` (add `--features splice,mkdirat,...` for the optional ops; they need a new enough kernel)
+- Test: `cargo test -p adaptif-gatotkaca-monoio` (add `--features splice,mkdirat,...` for the optional ops; they need a new enough kernel)
 - Format and lint: `cargo fmt`, `cargo clippy --workspace` (style is in `rustfmt.toml`; some options are nightly-only)
 - Stable Rust 1.75+ works. Only the `unstable` feature needs nightly.
 

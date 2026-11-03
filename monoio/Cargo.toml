@@ -1,18 +1,22 @@
 [package]
-authors = ["ChiHai <ihciah@gmail.com>", "XuShuai <dyxushuai@gmail.com>"]
+authors.workspace = true
 categories = ["asynchronous", "network-programming"]
-description = "A thread per core runtime based on iouring."
-edition = "2021"
-keywords = ["runtime", "iouring", "async"]
-license = "MIT OR Apache-2.0"
-name = "monoio"
+description = "Stripped-down, Linux-only, io_uring-only thread-per-core async runtime (a fork of Monoio) used by the adaptif-gatotkaca transport system."
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+name = "adaptif-gatotkaca-monoio"
 readme = "../README.md"
-repository = "https://github.com/bytedance/monoio"
+repository.workspace = true
 version = "0.3.0"
+
+# The library keeps the name `monoio` so `use monoio::..` and the macros keep working.
+[lib]
+name = "monoio"
 
 # common dependencies
 [dependencies]
-monoio-macros = { version = "0.2.0", path = "../monoio-macros", optional = true }
+monoio-macros = { workspace = true, optional = true }
 
 auto-const-array = "0.2"
 rustc-hash = "2.1"
