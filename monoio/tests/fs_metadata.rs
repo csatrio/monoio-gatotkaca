@@ -23,9 +23,7 @@ async fn basic_file_metadata() {
     assert_eq!(m_meta.accessed().unwrap(), std_meta.accessed().unwrap());
     assert_eq!(mf_meta.accessed().unwrap(), std_meta.accessed().unwrap());
 
-    #[cfg(target_os = "linux")]
     assert_eq!(m_meta.created().unwrap(), std_meta.created().unwrap());
-    #[cfg(target_os = "linux")]
     assert_eq!(mf_meta.created().unwrap(), std_meta.created().unwrap());
 
     assert_eq!(m_meta.is_file(), std_meta.is_file());
@@ -48,7 +46,6 @@ async fn dir_metadata() {
 
     assert_eq!(m_meta.accessed().unwrap(), std_meta.accessed().unwrap());
 
-    #[cfg(target_os = "linux")]
     assert_eq!(m_meta.created().unwrap(), std_meta.created().unwrap());
 
     assert_eq!(m_meta.is_file(), std_meta.is_file());
@@ -71,7 +68,6 @@ async fn symlink_metadata() {
 
     assert_eq!(m_meta.accessed().unwrap(), std_meta.accessed().unwrap());
 
-    #[cfg(target_os = "linux")]
     assert_eq!(m_meta.created().unwrap(), std_meta.created().unwrap());
 
     assert_eq!(m_meta.is_file(), std_meta.is_file());

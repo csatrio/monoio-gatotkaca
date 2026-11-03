@@ -1,5 +1,5 @@
 # Monoio
-A thread-per-core Rust runtime with io_uring/epoll/kqueue.
+A thread-per-core Rust runtime built purely on io_uring.
 
 [![Crates.io][crates-badge]][crates-url]
 [![MIT/Apache-2 licensed][license-badge]][license-url]
@@ -19,7 +19,7 @@ A thread-per-core Rust runtime with io_uring/epoll/kqueue.
 [zh-readme-url]: README-zh.md
 
 ## Design Goal
-Monoio is a pure io_uring/epoll/kqueue Rust async runtime. Part of the design has been borrowed from Tokio and Tokio-uring. However, unlike Tokio-uring, Monoio does not run on top of another runtime, rendering it more efficient.
+Monoio is a pure io_uring Rust async runtime. Part of the design has been borrowed from Tokio and Tokio-uring. However, unlike Tokio-uring, Monoio does not run on top of another runtime, rendering it more efficient.
 
 Moreover, Monoio is designed with a thread-per-core model in mind. Users do not need to worry about tasks being `Send` or `Sync`, as thread local storage can be used safely. In other words, the data does not escape the thread on await points, unlike on work-stealing runtimes such as Tokio. This is because for some use cases, specifically those targeted by this runtime, it is not necessary to make task schedulable between threads. For example, if we were to write a load balancer like NGINX, we would write it in a thread-per-core way. The thread local data does not need to be shared between threads, so the `Sync` and `Send` do not need to be implemented in the first place.
 
@@ -28,9 +28,7 @@ As you may have guessed, this runtime is primarily targeted at servers, where op
 ## Quick Start
 To use monoio, you need rust 1.75. If you already installed it, please make sure it is the latest version.
 
-Also, if you want to use io_uring, you must make sure your kernel supports it([5.6+](docs/en/platform-support.md)). And, memlock is [configured as a proper number](docs/en/memlock.md). If your kernel version does not meet the requirements, you can try to use the legacy driver to start, currently supports Linux and macOS([ref here](/docs/en/use-legacy-driver.md)).
-
-🚧Experimental windows support is on the way.
+Monoio is Linux only and requires io_uring: you must make sure your kernel supports it([5.6+](docs/en/platform-support.md)), and memlock is [configured as a proper number](docs/en/memlock.md).
 
 Here is a basic example of how to use Monoio.
 
@@ -84,7 +82,7 @@ async fn echo(mut stream: TcpStream) -> std::io::Result<()> {
 You can find more example code in `examples` of this repository.
 
 ## Limitations
-1. On Linux 5.6 or newer, Monoio can use uring or epoll as io driver. On lower versions of Linux, it can only run in epoll mode. On macOS, kqueue can be used. Other platforms are currently not supported.
+1. Monoio runs on Linux 5.6 or newer only, using io_uring for both network and file IO. Other platforms are not supported.
 2. Monoio can not solve all problems. If the workload is very unbalanced, it may cause performance degradation than Tokio since CPU cores may not be fully utilized.
 
 ## Contributors

@@ -1,9 +1,4 @@
 /// Tests for zero-copy send (`IORING_OP_SEND_ZC`) via `TcpStream::write_zc`.
-///
-/// `write_zc` is gated behind `#[cfg(all(target_os = "linux", feature = "iouring"))]`.
-/// On the legacy/poll-io driver the operation falls back to a regular `send(2)`,
-/// so `test_all` exercises both paths where available.
-#[cfg(all(target_os = "linux", feature = "iouring"))]
 mod send_zc_tests {
     use monoio::{
         buf::IoBufMut,

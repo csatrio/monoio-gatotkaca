@@ -60,7 +60,6 @@ async fn rename_nonexistent_file() {
     assert!(result.is_err());
 }
 
-#[cfg(unix)]
 #[monoio::test_all]
 async fn rename_file_without_permission() {
     use std::{fs::Permissions, os::unix::fs::PermissionsExt};

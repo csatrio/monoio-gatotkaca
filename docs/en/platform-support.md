@@ -6,11 +6,8 @@ author: ihciah
 
 # Platform Support
 
-Linux and macOS are currently supported. On the Linux platform, we can use io_uring or epoll as the IO driver; on the macOS platform, we will use kqueue as the IO driver.
+Monoio supports Linux only, and uses io_uring as its sole IO mechanism for both network and file operations. The kernel must support io_uring and every opcode Monoio uses (Linux 5.6+; some optional features, such as `splice`, `mkdirat`, `unlinkat`, `renameat` and `symlinkat`, require newer kernels, see their notes in `Cargo.toml`). You can check this at runtime with `monoio::utils::detect_uring()`.
 
-The use of the Legacy driver is explained on [this page](/docs/en/use-legacy-driver.md).
+See [memlock](/docs/en/memlock.md) for the memlock limit io_uring needs.
 
-## Future Plans
-🚧Experimental windows support is on the way.
-
-If you want to develop on Windows and deploy on Linux, then you can try wsl.
+If you want to develop on macOS or Windows and deploy on Linux, you can use a Linux VM, a container or WSL.

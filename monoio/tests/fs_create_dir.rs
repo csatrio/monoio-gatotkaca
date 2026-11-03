@@ -86,10 +86,7 @@ async fn create_directory_with_symlink() {
     let link = temp_dir.path().join("bar");
     let to_create = link.join("nested");
 
-    #[cfg(unix)]
     std::os::unix::fs::symlink(&target, &link).unwrap();
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(&target, &link).unwrap();
 
     fs::create_dir_all(&to_create).await.unwrap();
 
@@ -97,7 +94,6 @@ async fn create_directory_with_symlink() {
     assert!(target.join("nested").exists());
 }
 
-#[cfg(unix)]
 #[monoio::test_all]
 async fn create_very_long_path() {
     let temp_dir = tempdir().unwrap();
@@ -112,7 +108,6 @@ async fn create_very_long_path() {
     assert!(path.exists());
 }
 
-#[cfg(unix)]
 #[monoio::test_all]
 async fn create_directory_with_permission_issue() {
     use std::os::unix::fs::PermissionsExt;

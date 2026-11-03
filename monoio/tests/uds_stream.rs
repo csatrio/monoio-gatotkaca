@@ -20,11 +20,8 @@ async fn accept_read_write() -> std::io::Result<()> {
     let ((mut server, _), client) = try_join(accept, connect).await?;
 
     // testing into_raw_fd and from_raw_fd
-    #[cfg(unix)]
     use std::os::fd::{FromRawFd, IntoRawFd};
-    #[cfg(unix)]
     let fd = client.into_raw_fd();
-    #[cfg(unix)]
     let client =
         UnixStream::from_std(unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) }).unwrap();
 

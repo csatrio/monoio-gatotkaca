@@ -1,4 +1,3 @@
-#[cfg(target_os = "linux")]
 #[monoio::test_all]
 async fn test_seqpacket() -> std::io::Result<()> {
     use monoio::net::unix::{UnixSeqpacket, UnixSeqpacketListener};

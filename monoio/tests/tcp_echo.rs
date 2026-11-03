@@ -57,7 +57,6 @@ async fn echo_server() {
     let (mut rd, mut wr) = stream.into_split();
 
     // todo fix these CI in windows
-    #[cfg(not(windows))]
     {
         let n = io::copy(&mut rd, &mut wr).await.unwrap();
         assert_eq!(n, (ITER * (msg.len() + iov_msg.len())) as u64);
@@ -73,31 +72,31 @@ async fn rw_able() {
 
     monoio::select! {
         _ = monoio::time::sleep(std::time::Duration::from_millis(50)) => {},
-        _ = listener.readable(false) => {
+        _ = listener.readable() => {
             panic!("unexpected readable");
         }
     }
     let mut active = TcpStream::connect(listener_addr).await.unwrap();
 
-    assert!(active.writable(false).await.is_ok());
-    assert!(listener.readable(false).await.is_ok());
+    assert!(active.writable().await.is_ok());
+    assert!(listener.readable().await.is_ok());
     let (conn, _) = listener.accept().await.unwrap();
     monoio::select! {
         _ = monoio::time::sleep(std::time::Duration::from_millis(50)) => {},
-        _ = conn.readable(false) => {
+        _ = conn.readable() => {
             panic!("unexpected readable");
         }
-        _ = active.readable(false) => {
+        _ = active.readable() => {
             panic!("unexpected readable");
         }
-        _ = listener.readable(false) => {
+        _ = listener.readable() => {
             // even listener's inner readiness state is ready, we will check it again
             panic!("unexpected readable");
         }
     }
     let (res, _) = active.write_all("MSG").await;
     assert!(res.is_ok());
-    assert!(conn.readable(false).await.is_ok());
+    assert!(conn.readable().await.is_ok());
 }
 
 #[monoio::test_all]

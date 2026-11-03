@@ -66,17 +66,17 @@ async fn rw_able() {
 
     let active = UdpSocket::bind("127.0.0.1:0").unwrap();
 
-    assert!(active.writable(false).await.is_ok());
+    assert!(active.writable().await.is_ok());
     monoio::select! {
         _ = monoio::time::sleep(std::time::Duration::from_millis(50)) => {},
-        _ = passive.readable(false) => {
+        _ = passive.readable() => {
             panic!("unexpected readable");
         }
     }
 
     active.connect(passive_addr).await.unwrap();
     active.send(MSG).await.0.unwrap();
-    assert!(passive.readable(false).await.is_ok());
+    assert!(passive.readable().await.is_ok());
 }
 
 #[monoio::test_all(timer_enabled = true)]

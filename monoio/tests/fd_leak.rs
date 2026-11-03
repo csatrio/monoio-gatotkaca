@@ -1,11 +1,9 @@
-#[cfg(unix)]
 use std::{
     io::{Read, Write},
     sync::mpsc::channel,
     time::Duration,
 };
 
-#[cfg(unix)]
 use monoio::io::AsyncReadRentExt;
 
 // This test is used to prove the runtime can close the cancelled(but failed to cancel) op's fd
@@ -17,7 +15,6 @@ use monoio::io::AsyncReadRentExt;
 // 5. the other thread should be able to get a connection
 // 6. if the other thread can read eof, then it can prove the runtime close the fd correctly
 // 7. if the read blocked, then the runtime failed to close the fd
-#[cfg(unix)]
 #[cfg(feature = "async-cancel")]
 #[monoio::test_all(timer_enabled = true)]
 async fn test_fd_leak_cancel_fail() {
@@ -64,8 +61,7 @@ async fn test_fd_leak_cancel_fail() {
         // So here it will return.
         return;
     }
-    // With legacy driver, the accept syscall is not executed.
-    // So we can accept now and check if it is the connection established by the other thread.
+    // If the runtime did not accept the connection, we can accept now and check if it is the connection established by the other thread.
     // We can read 1 byte to check if it is zero. Then we close the fd and wait for the other
     // thread.
     // So we can prove the connection at server side is either not accepted or closed by the
@@ -80,7 +76,6 @@ async fn test_fd_leak_cancel_fail() {
 }
 
 // This test is used to prove the runtime try best to cancel pending op when op is dropped.
-#[cfg(unix)]
 #[cfg(feature = "async-cancel")]
 #[monoio::test_all(timer_enabled = true)]
 async fn test_fd_leak_try_cancel() {

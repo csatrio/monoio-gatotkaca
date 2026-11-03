@@ -1,8 +1,5 @@
 use std::io::{prelude::*, SeekFrom};
-#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-#[cfg(windows)]
-use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle as RawFd};
 
 use monoio::{
     buf::VecBuf,
@@ -178,7 +175,7 @@ async fn basic_write_all_at() {
     assert_eq!(file, HELLO);
 }
 
-#[monoio::test(driver = "uring")]
+#[monoio::test]
 async fn cancel_read_at() {
     let mut tempfile = tempfile();
     tempfile.write_all(HELLO).unwrap();
@@ -199,10 +196,7 @@ async fn explicit_close() {
     tempfile.as_file_mut().sync_data().unwrap();
 
     let file = File::open(tempfile.path()).await.unwrap();
-    #[cfg(unix)]
     let fd = file.as_raw_fd();
-    #[cfg(windows)]
-    let fd = file.as_raw_handle();
 
     file.close().await.unwrap();
 
@@ -226,19 +220,11 @@ async fn drop_open() {
 #[test]
 fn drop_off_runtime() {
     let tempfile = tempfile();
-    #[cfg(all(target_os = "linux", feature = "iouring"))]
     let file = monoio::start::<monoio::IoUringDriver, _>(async {
         File::open(tempfile.path()).await.unwrap()
     });
-    #[cfg(not(all(target_os = "linux", feature = "iouring")))]
-    let file = monoio::start::<monoio::LegacyDriver, _>(async {
-        File::open(tempfile.path()).await.unwrap()
-    });
 
-    #[cfg(unix)]
     let fd = file.as_raw_fd();
-    #[cfg(windows)]
-    let fd = file.as_raw_handle();
     drop(file);
 
     assert_invalid_fd(fd, tempfile.as_file().metadata().unwrap());
@@ -273,10 +259,7 @@ async fn poll_once(future: impl std::future::Future) {
 #[allow(unused, clippy::needless_return)]
 fn assert_invalid_fd(fd: RawFd, base: std::fs::Metadata) {
     use std::fs::File;
-    #[cfg(unix)]
     let f = unsafe { File::from_raw_fd(fd) };
-    #[cfg(windows)]
-    let f = unsafe { File::from_raw_handle(fd) };
 
     let meta = f.metadata();
     std::mem::forget(f);
@@ -286,7 +269,6 @@ fn assert_invalid_fd(fd: RawFd, base: std::fs::Metadata) {
             return;
         }
 
-        #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             let inode = meta.ino();
@@ -298,7 +280,6 @@ fn assert_invalid_fd(fd: RawFd, base: std::fs::Metadata) {
     }
 }
 
-#[cfg(unix)]
 #[monoio::test_all]
 async fn file_from_std() {
     let tempfile = tempfile();
