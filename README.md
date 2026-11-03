@@ -63,6 +63,7 @@ Try it with `nc 127.0.0.1 50002`. More runnable programs live in [examples/](exa
 - **Talking between tasks.** Within a thread use [local-sync](https://crates.io/crates/local-sync). Across threads enable the `sync` feature and use any async channel, or atomics.
 - **Timeouts and cancellation.** Dropping a future does not reliably cancel the kernel operation. Use the `Cancelable*` IO traits with `Canceller`/`CancelHandle`, then await the future to get your buffer back. A cancelled op may still have completed, so check for `ECANCELED` (os error 125).
 - **Raw io_uring.** For operations the crate doesn't wrap, `monoio::uring::submit(sqe, data)` (unsafe) queues any `io_uring::squeue::Entry` and resolves to `(Cqe, data)`. `monoio::uring::with_ring(|ring| ..)` (unsafe) gives you the underlying `IoUring` for registering files/buffers or probing opcodes. Both are also methods on `IoUringDriver`, reachable with `Runtime::driver()`. The SQE must point into heap memory owned by `data`; do not push SQEs or reap CQEs on the ring yourself, since the driver owns `user_data`.
+- **Registered buffers.** Not supported natively. Register them through the raw API: `unsafe monoio::uring::with_ring(|r| r.submitter().register_buffers(&iovecs))`, then submit `opcode::ReadFixed`/`WriteFixed` with `monoio::uring::submit`. The memory must stay valid and unmoved while registered.
 - **Tokio types.** `AsyncRead`/`AsyncWrite` from Tokio are not supported. Use the `*Rent` traits.
 
 ## Cargo features
