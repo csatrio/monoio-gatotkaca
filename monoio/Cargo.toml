@@ -8,7 +8,7 @@ license.workspace = true
 name = "adaptif-gatotkaca-monoio"
 readme = "README.md"
 repository.workspace = true
-version = "0.3.1"
+version = "0.4.0"
 
 # The library keeps the name `monoio` so `use monoio::..` and the macros keep working.
 [lib]
