@@ -156,6 +156,11 @@ impl<D> TimeDriver<D>
 where
     D: Driver + 'static,
 {
+    /// The wrapped driver, e.g. the `IoUringDriver` to reach its raw ring.
+    pub fn inner(&self) -> &D {
+        &self.park
+    }
+
     /// Creates a new `Driver` instance that uses `park` to block the current
     /// thread and `time_source` to get the current time and convert to ticks.
     ///

@@ -29,7 +29,6 @@ pub(crate) use waker::UnparkHandle;
 pub(crate) const TIMEOUT_USERDATA: u64 = u64::MAX - 1;
 #[cfg(feature = "sync")]
 pub(crate) const EVENTFD_USERDATA: u64 = u64::MAX - 2;
-pub(crate) const MIN_REVERSED_USERDATA: u64 = u64::MAX - 2;
 
 /// Driver with uring.
 pub struct IoUringDriver {
@@ -68,6 +67,9 @@ pub(crate) struct UringInner {
 
     // Uring support ext_arg
     ext_arg: bool,
+
+    /// CQEs of operations the user pushed through `uring::with_ring`.
+    pub(super) external: super::raw::ExternalCqes,
 }
 
 // When dropping the driver, all in-flight operations must have completed. This
@@ -95,6 +97,7 @@ impl IoUringDriver {
             timespec: Timespec::new(),
             ext_arg: uring.params().is_feature_ext_arg(),
             uring,
+            external: Default::default(),
         }));
 
         Ok(IoUringDriver { inner })
@@ -127,6 +130,7 @@ impl IoUringDriver {
             eventfd_installed: false,
             eventfd_read_dst: [0_u8; 8],
             waker_receiver,
+            external: Default::default(),
         }));
 
         let thread_id = crate::builder::BUILD_THREAD_ID.with(|id| *id);
@@ -268,6 +272,7 @@ impl IoUringDriver {
 
         // Process CQ
         inner.tick()?;
+        super::raw::deliver(&self.inner);
 
         Ok(())
     }
@@ -285,6 +290,7 @@ impl Driver for IoUringDriver {
         let inner = unsafe { &mut *self.inner.get() };
         inner.submit()?;
         inner.tick()?;
+        super::raw::deliver(&self.inner);
         Ok(())
     }
 
@@ -314,10 +320,16 @@ impl UringInner {
             match index {
                 #[cfg(feature = "sync")]
                 EVENTFD_USERDATA => self.eventfd_installed = false,
-                _ if index >= MIN_REVERSED_USERDATA => (),
+                // Operations of this driver: `user_data` is a slab index.
                 // # Safety
                 // Here we can make sure the result is valid.
-                _ => unsafe { self.ops.complete(index as _, resultify(&cqe), cqe.flags()) },
+                _ if index >> 62 == 0 => unsafe {
+                    self.ops.complete(index as _, resultify(&cqe), cqe.flags())
+                },
+                // Operations pushed by the user, see `uring::user_data`.
+                _ if index >> 62 == 0b10 => self.external.push(index, &cqe),
+                // Driver internal (cancel, timeout) or unknown: nothing waits for it.
+                _ => (),
             }
         }
         Ok(())
