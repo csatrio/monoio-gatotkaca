@@ -6,6 +6,7 @@ pub(crate) mod thread;
 
 mod buf_ring;
 mod chain;
+pub(crate) mod doorbell;
 mod fixed_buf;
 pub(crate) mod fixed_files;
 mod msg_ring;

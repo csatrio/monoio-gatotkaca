@@ -311,6 +311,9 @@ pub(crate) struct UringInner {
     /// Finished slots of dropped ops, dropped by [`drop_deferred`] once the driver holds no
     /// state: dropping op data may call back into the driver.
     deferred: Vec<MaybeFdLifecycle>,
+
+    /// Doorbells rung by `MSG_RING`, see `driver::doorbell`.
+    pub(super) doorbells: super::doorbell::Doorbells,
 }
 
 // When dropping the driver, all in-flight operations must have completed. This
@@ -339,6 +342,7 @@ impl IoUringDriver {
             external: Default::default(),
             stats: DriverStats::default(),
             deferred: Vec::new(),
+            doorbells: Default::default(),
         }));
 
         Ok(IoUringDriver { inner })
@@ -376,6 +380,7 @@ impl IoUringDriver {
             external: Default::default(),
             stats: DriverStats::default(),
             deferred: Vec::new(),
+            doorbells: Default::default(),
         }));
 
         let thread_id = crate::builder::BUILD_THREAD_ID.with(|id| *id);
@@ -624,6 +629,10 @@ impl UringInner {
                 }
                 // Operations pushed by the user, see `uring::user_data`.
                 _ if index >> 62 == 0b10 => self.external.push(index, &cqe),
+                // Doorbells: a bell rung by another ring, or our own bell message completing.
+                _ if matches!(index >> 60, 0b1101 | 0b1110) => {
+                    self.doorbells.complete(index, cqe.result())
+                }
                 // A link timeout of the driver: `-ETIME` means it fired (and cancelled its op),
                 // `-ECANCELED` that the op completed first.
                 LINK_TIMEOUT_USERDATA if cqe.result() == -libc::ETIME => {
@@ -739,7 +748,7 @@ impl UringInner {
 
     /// Make room for one SQE: flush the SQ (and reap CQEs) while it is full, a few times.
     #[inline]
-    fn reserve_sqe(&mut self) -> io::Result<()> {
+    pub(crate) fn reserve_sqe(&mut self) -> io::Result<()> {
         self.reserve_sqes(1)
     }
 

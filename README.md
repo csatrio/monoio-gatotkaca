@@ -13,7 +13,7 @@ This is a stripped-down fork of [Monoio](https://github.com/bytedance/monoio) by
 For the design, feature flags and configuration, see [AGENTS.md](AGENTS.md).
 
 ## Requirements
-- Rust 1.75 or newer (nightly only for the `unstable` feature).
+- Rust 1.85 or newer (nightly only for the `unstable` feature).
 - Linux kernel 5.6+ with io_uring enabled. Containers and sandboxes often block it. Check with `monoio::utils::detect_uring()`.
 - A sufficient memlock limit: `ulimit -l` should be at least 512 (KiB), or `unlimited`. If IO fails with os error 105 (`No buffer space available`), raise it in `/etc/security/limits.conf` or via systemd `LimitMEMLOCK`.
 

@@ -35,8 +35,8 @@ pub use super::fixed_buf::{
 };
 pub use super::fixed_files::{fixed_file_stats, FixedFileStats};
 pub use super::msg_ring::{
-    event_channel, msg_receiver, msg_ring, msg_ring_nowait, ring_handle, EventReceiver,
-    EventSender, Mailbox, RingHandle,
+    event_channel, msg_receiver, msg_ring, msg_ring_nowait, ring_handle, EventChannelBuilder,
+    EventChannelStats, EventReceiver, EventSender, Mailbox, RingHandle, SendError,
 };
 // errno and poll constants for SQEs and completions (`libc::ENOBUFS`, `libc::POLLIN`, ...).
 pub use libc;

@@ -6,8 +6,8 @@
 //!   Cqe { res, flags: 0 })`. No fd, no syscall on the target side, no flume.
 //! - [`Mailbox`] / [`msg_receiver`]: the receiving side, so the target does not have to write the
 //!   hook itself.
-//! - [`event_channel`]: a channel from any thread (ring or not) to a runtime thread, woken
-//!   through an eventfd that the receiver reads through its ring.
+//! - [`event_channel`]: a lock-free channel from any thread (ring or not) to a runtime thread,
+//!   woken with `MSG_RING` from ring threads and through an eventfd otherwise.
 
 mod event_channel;
 
@@ -23,7 +23,9 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-pub use self::event_channel::{event_channel, EventReceiver, EventSender};
+pub use self::event_channel::{
+    event_channel, EventChannelBuilder, EventChannelStats, EventReceiver, EventSender, SendError,
+};
 use super::raw::{opcode, squeue, types};
 use super::{
     raw::{self, Cqe},

@@ -16,6 +16,9 @@ name = "monoio"
 
 # common dependencies
 [dependencies]
+# Lock-free Treiber stack, cache padding and CAS backoff for `uring::event_channel`.
+adaptif-gatotkaca-utils = "0.11.1"
+crossbeam-utils = "0.8"
 monoio-macros = { workspace = true, optional = true }
 
 auto-const-array = "0.2.2"

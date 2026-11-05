@@ -1,117 +1,276 @@
-//! A channel from any thread into a runtime thread, woken through an eventfd read by the ring.
+//! A channel from any thread into a runtime thread, without locks on the message path.
+//!
+//! - Messages live in nodes of an mmap'd [`arena`]; a sender takes a free node with one CAS.
+//! - The inbox is a Treiber stack (`adaptif-gatotkaca-utils`): a sender pushes with one CAS,
+//!   the receiver takes the whole batch with one swap and reverses it into send order.
+//! - The receiver returns the nodes of a batch to the free list with one CAS.
+//! - Wakeups: the receiver sets `armed` before it sleeps. A sender that sees it clears it and
+//!   rings once: through `MSG_RING` from a ring thread (see `driver::doorbell`), with an
+//!   eventfd write otherwise. A burst of messages costs one wakeup.
+
+mod arena;
 
 use std::{
-    collections::VecDeque,
+    fmt,
+    future::{poll_fn, Future},
     io,
+    marker::PhantomData,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    sync::{Arc, Mutex, MutexGuard},
+    ptr,
+    sync::{
+        atomic::{fence, AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    task::Poll,
 };
 
-use super::super::raw::{self, opcode, types, RawOp};
+use adaptif_gatotkaca_utils::{GkTreiberPtr, GkTreiberStackIterator, TreiberStackIterator};
+use arena::{Arena, Node};
+use crossbeam_utils::CachePadded;
 
-struct State<T> {
-    queue: VecDeque<T>,
-    senders: usize,
-    receiver_alive: bool,
-    // The receiver found the queue empty and waits for an eventfd write.
-    armed: bool,
-    // eventfd writes made so far.
-    wakeups: u64,
+use super::super::{
+    doorbell::{self, BellAddr, Doorbell},
+    raw::{self, opcode, types, RawOp},
+};
+
+/// Largest `max_capacity`.
+const LIMIT: u32 = 1 << 31;
+/// Nodes the receiver collects before returning them to the free list.
+const FREE_BATCH: u32 = 64;
+
+/// Create a channel from any thread to a runtime thread, with the default capacity (1024
+/// slots, growing to 131,072). See [`EventChannelBuilder`].
+pub fn event_channel<T: Send + 'static>() -> io::Result<(EventSender<T>, EventReceiver<T>)> {
+    EventChannelBuilder::new().build()
+}
+
+/// Settings of an [`event_channel`].
+///
+/// Message slots live in mmap'd segments that double in size (`initial_capacity`,
+/// `2 × initial_capacity`, ...) until `max_capacity` slots exist; then [`EventSender::send`]
+/// fails with [`SendError::Full`] until the receiver catches up. Pages are faulted in only
+/// when slots are first used, and stay until the channel is gone.
+#[derive(Debug, Clone, Copy)]
+pub struct EventChannelBuilder {
+    initial: u32,
+    max: u32,
+}
+
+impl Default for EventChannelBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventChannelBuilder {
+    /// Default number of message slots mapped up front.
+    pub const DEFAULT_INITIAL_CAPACITY: u32 = 1024;
+    /// Default limit on queued messages: room for one in-flight message per connection at
+    /// 100k connections, with headroom.
+    pub const DEFAULT_MAX_CAPACITY: u32 = 131_072;
+
+    /// The defaults: [`DEFAULT_INITIAL_CAPACITY`](Self::DEFAULT_INITIAL_CAPACITY) and
+    /// [`DEFAULT_MAX_CAPACITY`](Self::DEFAULT_MAX_CAPACITY).
+    pub fn new() -> Self {
+        Self {
+            initial: Self::DEFAULT_INITIAL_CAPACITY,
+            max: Self::DEFAULT_MAX_CAPACITY,
+        }
+    }
+
+    /// Slots in the first segment. Rounded up to a power of two.
+    pub fn initial_capacity(mut self, slots: u32) -> Self {
+        self.initial = slots;
+        self
+    }
+
+    /// The most messages that can be queued at once (at most 2^31).
+    pub fn max_capacity(mut self, slots: u32) -> Self {
+        self.max = slots;
+        self
+    }
+
+    /// Create the channel. Fails with `InvalidInput` for a zero, too large or inverted
+    /// capacity, and with the OS error if the first segment or the eventfd can't be created.
+    pub fn build<T: Send + 'static>(self) -> io::Result<(EventSender<T>, EventReceiver<T>)> {
+        let invalid = |msg| io::Error::new(io::ErrorKind::InvalidInput, msg);
+        if self.initial == 0 || self.max == 0 {
+            return Err(invalid("event_channel: capacity must not be 0"));
+        }
+        if self.max > LIMIT {
+            return Err(invalid("event_channel: max_capacity above 2^31"));
+        }
+        let initial = self.initial.checked_next_power_of_two().unwrap_or(LIMIT);
+        if initial > self.max.next_power_of_two() {
+            return Err(invalid(
+                "event_channel: initial_capacity above max_capacity",
+            ));
+        }
+        let arena = Arena::new(initial.min(LIMIT / 2), self.max)?;
+        let fd = crate::syscall!(eventfd@RAW(0, libc::EFD_CLOEXEC))?;
+        let shared = Arc::new(Shared {
+            inbox: CachePadded::new(AtomicPtr::new(ptr::null_mut())),
+            armed: CachePadded::new(AtomicBool::new(false)),
+            arena,
+            senders: AtomicUsize::new(1),
+            receiver_alive: AtomicBool::new(true),
+            // SAFETY: `fd` is a fresh fd we own.
+            efd: Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }),
+            bell: Mutex::new(None),
+            counters: Counters::default(),
+        });
+        let receiver = EventReceiver {
+            shared: shared.clone(),
+            batch: None,
+            freed: None,
+            read: None,
+            buf: Some(Box::new([0; 8])),
+            bell: None,
+            _not_send: PhantomData,
+        };
+        Ok((EventSender { shared }, receiver))
+    }
+}
+
+#[derive(Default)]
+struct Counters {
+    eventfd_wakeups: AtomicU64,
+    ring_wakeups: AtomicU64,
+    full: AtomicU64,
 }
 
 struct Shared<T> {
-    state: Mutex<State<T>>,
-    // Blocking (no EFD_NONBLOCK): io_uring would answer EAGAIN on a non-blocking eventfd
-    // instead of waiting. A write blocks only when the counter would overflow, which 1 per wait
-    // never reaches.
-    efd: OwnedFd,
+    /// Treiber stack of sent messages, newest first.
+    inbox: CachePadded<AtomicPtr<Node<T>>>,
+    /// The receiver found the inbox empty and waits for a wakeup.
+    armed: CachePadded<AtomicBool>,
+    arena: Arena<T>,
+    senders: AtomicUsize,
+    receiver_alive: AtomicBool,
+    /// Blocking (no EFD_NONBLOCK): io_uring would answer EAGAIN on a non-blocking eventfd
+    /// instead of waiting. A write blocks only when the counter would overflow, which 1 per
+    /// wait never reaches.
+    efd: Arc<OwnedFd>,
+    /// The receiver's bell, set once it first waited on a ring. Locked only to wake and to
+    /// (re)bind, never per message.
+    bell: Mutex<Option<BellAddr>>,
+    counters: Counters,
 }
+
+// SAFETY: messages (`T: Send`) move between threads through the atomics; nothing else in
+// `Shared` is thread-bound.
+unsafe impl<T: Send> Send for Shared<T> {}
+unsafe impl<T: Send> Sync for Shared<T> {}
 
 impl<T> Shared<T> {
-    fn lock(&self) -> MutexGuard<'_, State<T>> {
-        // A panicking sender cannot leave the queue inconsistent: keep going.
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn notify(&self) {
-        let one = 1u64;
-        // SAFETY: writes 8 bytes from a live u64 to our eventfd. It cannot fail in practice
-        // (see `efd`), and a failure would only delay a wakeup.
-        unsafe {
-            libc::write(
-                self.efd.as_raw_fd(),
-                &one as *const u64 as *const libc::c_void,
-                8,
-            )
-        };
+    /// Wake the receiver if it is waiting. Call after the change it must see (a message
+    /// pushed, the last sender gone), which the fence orders before the `armed` check.
+    fn wake_if_armed(&self) {
+        // Pairs with the fence in `EventReceiver::take`: either we see `armed`, or the
+        // receiver sees our change.
+        fence(Ordering::SeqCst);
+        if !self.armed.load(Ordering::Relaxed) || !self.armed.swap(false, Ordering::Acquire) {
+            return;
+        }
+        let bell = self.bell.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        match bell {
+            Some(addr) if doorbell::ring_from_current(&addr, &self.efd) => {
+                self.counters.ring_wakeups.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                doorbell::write_eventfd(&self.efd);
+                self.counters
+                    .eventfd_wakeups
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 }
 
-/// Create a channel from any thread to a runtime thread.
-///
-/// [`EventSender`] is `Send + Clone` and works from any thread, runtime or not, without the
-/// `sync` feature. [`EventReceiver`] stays on a runtime thread and waits through the ring: an
-/// `opcode::Read` of an eventfd. The senders write the eventfd only when the receiver is waiting
-/// on an empty queue, so a burst of messages costs one `write(2)` and one completion, not one per
-/// message. Messages from one sender arrive in order.
-///
-/// The queue is unbounded and protected by a `std::sync::Mutex`.
-pub fn event_channel<T: Send + 'static>() -> io::Result<(EventSender<T>, EventReceiver<T>)> {
-    let fd = crate::syscall!(eventfd@RAW(0, libc::EFD_CLOEXEC))?;
-    let shared = Arc::new(Shared {
-        state: Mutex::new(State {
-            queue: VecDeque::new(),
-            senders: 1,
-            receiver_alive: true,
-            armed: false,
-            wakeups: 0,
-        }),
-        // SAFETY: `fd` is a fresh fd we own.
-        efd: unsafe { OwnedFd::from_raw_fd(fd) },
-    });
-    let receiver = EventReceiver {
-        shared: shared.clone(),
-        local: VecDeque::new(),
-        read: None,
-        buf: Some(Box::new([0; 8])),
-    };
-    Ok((EventSender { shared }, receiver))
+impl<T> Drop for Shared<T> {
+    fn drop(&mut self) {
+        // Drop the messages nobody received; the arena unmaps the memory afterwards.
+        let chain = self.inbox.reap_all();
+        drop(chain.reversed_iterator());
+    }
 }
+
+/// Why [`EventSender::send`] failed. Holds the message.
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum SendError<T> {
+    /// `max_capacity` messages are queued; try again once the receiver caught up.
+    Full(T),
+    /// The receiver was dropped.
+    Disconnected(T),
+}
+
+impl<T> SendError<T> {
+    /// The message that wasn't sent.
+    pub fn into_inner(self) -> T {
+        match self {
+            Self::Full(v) | Self::Disconnected(v) => v,
+        }
+    }
+}
+
+impl<T> fmt::Debug for SendError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full(_) => f.write_str("Full(..)"),
+            Self::Disconnected(_) => f.write_str("Disconnected(..)"),
+        }
+    }
+}
+
+impl<T> fmt::Display for SendError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full(_) => f.write_str("event channel is full"),
+            Self::Disconnected(_) => f.write_str("event channel receiver was dropped"),
+        }
+    }
+}
+
+impl<T> std::error::Error for SendError<T> {}
 
 /// The sending half of an [`event_channel`]: `Send + Sync + Clone`, usable from any thread.
 pub struct EventSender<T> {
     shared: Arc<Shared<T>>,
 }
 
-impl<T> EventSender<T> {
-    /// Queue `value` and wake the receiver if it waits. Gives `value` back if the receiver was
-    /// dropped.
-    pub fn send(&self, value: T) -> Result<(), T> {
-        let mut state = self.shared.lock();
-        if !state.receiver_alive {
-            return Err(value);
+impl<T: Send> EventSender<T> {
+    /// Queue `value` and wake the receiver if it waits. Never blocks and takes no lock (a
+    /// sender that must map a new segment takes the arena's growth lock).
+    ///
+    /// From a ring thread the wakeup is a `MSG_RING` submitted with that ring's next tick;
+    /// from any other thread it is an eventfd write.
+    pub fn send(&self, value: T) -> Result<(), SendError<T>> {
+        let shared = &*self.shared;
+        if !shared.receiver_alive.load(Ordering::Acquire) {
+            return Err(SendError::Disconnected(value));
         }
-        state.queue.push_back(value);
-        let wake = std::mem::take(&mut state.armed);
-        if wake {
-            state.wakeups += 1;
-        }
-        drop(state);
-        if wake {
-            self.shared.notify();
-        }
+        let Some(node) = shared.arena.alloc() else {
+            shared.counters.full.fetch_add(1, Ordering::Relaxed);
+            return Err(SendError::Full(value));
+        };
+        // SAFETY: `alloc` gave us the node; it holds no value.
+        unsafe { node.write(value) };
+        shared
+            .inbox
+            .push_to_stack(node as *const Node<T> as *mut Node<T>);
+        shared.wake_if_armed();
         Ok(())
     }
 
     /// Whether the receiver was dropped.
     pub fn is_closed(&self) -> bool {
-        !self.shared.lock().receiver_alive
+        !self.shared.receiver_alive.load(Ordering::Acquire)
     }
 }
 
 impl<T> Clone for EventSender<T> {
     fn clone(&self) -> Self {
-        self.shared.lock().senders += 1;
+        self.shared.senders.fetch_add(1, Ordering::Relaxed);
         Self {
             shared: self.shared.clone(),
         }
@@ -120,51 +279,61 @@ impl<T> Clone for EventSender<T> {
 
 impl<T> Drop for EventSender<T> {
     fn drop(&mut self) {
-        let mut state = self.shared.lock();
-        state.senders -= 1;
         // The last sender wakes a waiting receiver, so it can return `None`.
-        let wake = state.senders == 0 && std::mem::take(&mut state.armed);
-        if wake {
-            state.wakeups += 1;
-        }
-        drop(state);
-        if wake {
-            self.shared.notify();
+        if self.shared.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.shared.wake_if_armed();
         }
     }
 }
 
-impl<T> std::fmt::Debug for EventSender<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<T> fmt::Debug for EventSender<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EventSender").finish_non_exhaustive()
     }
 }
 
-type EventRead<T> = RawOp<(Box<[u8; 8]>, Arc<Shared<T>>)>;
+type EventRead = RawOp<(Box<[u8; 8]>, Arc<OwnedFd>)>;
+
+/// Counters of an [`event_channel`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EventChannelStats {
+    /// Wakeups by eventfd write (senders off a ring thread, or a failed `MSG_RING`).
+    pub eventfd_wakeups: u64,
+    /// Wakeups by `MSG_RING` from a ring thread, or rung directly on the receiver's ring.
+    pub ring_wakeups: u64,
+    /// Sends that failed with [`SendError::Full`].
+    pub full: u64,
+    /// Message slots currently mapped.
+    pub capacity: u32,
+}
 
 /// The receiving half of an [`event_channel`]. `!Send`: it lives on a runtime thread.
-pub struct EventReceiver<T: 'static> {
+pub struct EventReceiver<T: Send + 'static> {
     shared: Arc<Shared<T>>,
-    // Messages taken from the shared queue in one swap, handed out one by one.
-    local: VecDeque<T>,
-    // The armed eventfd read. Kept across dropped `recv` futures, so a wakeup is never lost.
-    read: Option<EventRead<T>>,
+    /// The batch taken from the inbox, in send order.
+    batch: Option<TreiberStackIterator<Node<T>>>,
+    /// Nodes received but not yet returned to the free list.
+    freed: Freed,
+    /// The armed eventfd read. Kept across dropped `recv` futures, so a wakeup is never lost.
+    read: Option<EventRead>,
     buf: Option<Box<[u8; 8]>>,
+    bell: Option<Doorbell>,
+    _not_send: PhantomData<*mut ()>,
 }
 
 impl<T: Send + 'static> EventReceiver<T> {
     /// The next message, waiting for one if the queue is empty. `None` once every sender was
     /// dropped and the queue is empty.
     ///
-    /// Cancel safe: dropping the future loses no message, and the eventfd read stays armed for
-    /// the next call.
+    /// Cancel safe: dropping the future loses no message, and the wakeup stays armed for the
+    /// next call.
     ///
     /// # Panics
     /// Panics if called outside of a monoio runtime, or if the eventfd read fails (it cannot,
     /// short of fd exhaustion of the ring).
     pub async fn recv(&mut self) -> Option<T> {
         loop {
-            match self.take() {
+            match self.take(true) {
                 Ok(next) => return next,
                 Err(()) => self.wait().await,
             }
@@ -174,88 +343,179 @@ impl<T: Send + 'static> EventReceiver<T> {
     /// The next message if one is queued, without waiting. `None` also when the queue is empty
     /// but senders are left.
     pub fn try_recv(&mut self) -> Option<T> {
-        self.take().ok().flatten()
+        self.take(false).ok().flatten()
     }
 
-    /// `Ok(Some)` a message, `Ok(None)` closed, `Err` empty (and armed for a wakeup).
-    fn take(&mut self) -> Result<Option<T>, ()> {
-        if let Some(value) = self.local.pop_front() {
-            return Ok(Some(value));
+    /// `Ok(Some)` a message, `Ok(None)` closed, `Err` empty (armed for a wakeup if `arm`).
+    fn take(&mut self, arm: bool) -> Result<Option<T>, ()> {
+        let shared = &*self.shared;
+        loop {
+            if let Some(node) = self.batch.as_mut().and_then(Iterator::next) {
+                // SAFETY: the node came from the inbox: it holds a value and is ours now.
+                let node = unsafe { &*node };
+                let value = unsafe { node.take() };
+                free_later(&shared.arena, &mut self.freed, node.index());
+                return Ok(Some(value));
+            }
+            self.batch = None;
+            flush_freed(&shared.arena, &mut self.freed);
+
+            // Load first: swapping an empty head would still take the cache line from the
+            // senders.
+            if !shared.inbox.is_empty() {
+                self.batch = Some(shared.inbox.reap_all().iterator());
+                continue;
+            }
+            if !arm {
+                if shared.senders.load(Ordering::Acquire) != 0 {
+                    return Err(());
+                }
+                // The last sender may have pushed just before it left: look again.
+                if shared.inbox.is_empty() {
+                    return Ok(None);
+                }
+                continue;
+            }
+
+            shared.armed.store(true, Ordering::Relaxed);
+            // Pairs with the fence in `wake_if_armed`: either the sender sees `armed`, or we
+            // see its message (or its drop) below.
+            fence(Ordering::SeqCst);
+            let closed = shared.senders.load(Ordering::Relaxed) == 0;
+            if !shared.inbox.is_empty() || closed {
+                // A sender may still claim `armed` and wake us: a spurious wakeup at most.
+                shared.armed.store(false, Ordering::Relaxed);
+                if closed && shared.inbox.is_empty() {
+                    return Ok(None);
+                }
+                continue;
+            }
+            return Err(());
         }
-        let mut state = self.shared.lock();
-        if !state.queue.is_empty() {
-            // `local` is empty: swap the buffers, keeping both allocations.
-            std::mem::swap(&mut state.queue, &mut self.local);
-            state.armed = false;
-            drop(state);
-            return Ok(self.local.pop_front());
+    }
+
+    /// Bind the bell to the current ring (again, if the receiver moved to another runtime).
+    fn bind_bell(&mut self) {
+        if self.bell.as_ref().is_some_and(Doorbell::is_current) {
+            return;
         }
-        if state.senders == 0 {
-            return Ok(None);
+        self.bell = None;
+        match Doorbell::register() {
+            Ok(bell) => {
+                *self.shared.bell.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(bell.addr().clone());
+                self.bell = Some(bell);
+            }
+            // Without a ring handle, senders fall back to the eventfd.
+            Err(_) => *self.shared.bell.lock().unwrap_or_else(|e| e.into_inner()) = None,
         }
-        state.armed = true;
-        Err(())
     }
 
     async fn wait(&mut self) {
+        self.bind_bell();
         if self.read.is_none() {
             let buf = self.buf.take().unwrap_or_else(|| Box::new([0; 8]));
-            let mut data = (buf, self.shared.clone());
-            let sqe = opcode::Read::new(
-                types::Fd(self.shared.efd.as_raw_fd()),
-                data.0.as_mut_ptr(),
-                8,
-            )
-            .build();
+            let efd = self.shared.efd.clone();
+            let mut data = (buf, efd);
+            let sqe =
+                opcode::Read::new(types::Fd(data.1.as_raw_fd()), data.0.as_mut_ptr(), 8).build();
             // SAFETY: the SQE points into the boxed buffer owned by `data`, which also keeps the
             // eventfd open; a read is single-shot and returns no fd.
             let op = unsafe { raw::submit(sqe, data) }.expect("event_channel: submit read");
             self.read = Some(op);
         }
-        let op = self.read.as_mut().expect("armed read");
-        let (cqe, (buf, _)) = op.await;
-        self.read = None;
-        self.buf = Some(buf);
-        match cqe.res() {
-            r if r >= 0 => {}
-            r if r == -libc::EINTR || r == -libc::EAGAIN || r == -libc::ECANCELED => {}
-            r => panic!(
-                "event_channel: eventfd read failed: {}",
-                io::Error::from_raw_os_error(-r)
-            ),
-        }
+        poll_fn(|cx| {
+            if let Some(bell) = &self.bell {
+                if bell.poll(cx).is_ready() {
+                    // The eventfd read stays armed for the next wait.
+                    return Poll::Ready(());
+                }
+            }
+            let op = self.read.as_mut().expect("armed read");
+            let (cqe, (buf, _)) = std::task::ready!(std::pin::Pin::new(op).poll(cx));
+            self.read = None;
+            self.buf = Some(buf);
+            match cqe.res() {
+                r if r >= 0 => {}
+                r if r == -libc::EINTR || r == -libc::EAGAIN || r == -libc::ECANCELED => {}
+                r => panic!(
+                    "event_channel: eventfd read failed: {}",
+                    io::Error::from_raw_os_error(-r)
+                ),
+            }
+            Poll::Ready(())
+        })
+        .await
     }
 
-    /// Number of eventfd writes the senders made so far: one per wait that a message (or the
-    /// last sender's drop) ended. A measure of how well messages are batched.
+    /// Wakeups so far (eventfd plus ring): one per wait that a message (or the last sender's
+    /// drop) ended. A measure of how well messages are batched.
     pub fn wakeups(&self) -> u64 {
-        self.shared.lock().wakeups
+        let s = self.stats();
+        s.eventfd_wakeups + s.ring_wakeups
+    }
+
+    /// Counters of this channel.
+    pub fn stats(&self) -> EventChannelStats {
+        let c = &self.shared.counters;
+        EventChannelStats {
+            eventfd_wakeups: c.eventfd_wakeups.load(Ordering::Relaxed),
+            ring_wakeups: c.ring_wakeups.load(Ordering::Relaxed),
+            full: c.full.load(Ordering::Relaxed),
+            capacity: self.shared.arena.capacity(),
+        }
     }
 
     /// Whether every sender was dropped (messages may still be queued).
     pub fn is_closed(&self) -> bool {
-        self.shared.lock().senders == 0
+        self.shared.senders.load(Ordering::Acquire) == 0
     }
 }
 
-impl<T: 'static> Drop for EventReceiver<T> {
+/// Nodes received but not yet returned to the free list: `(first, last, count)` of a chain.
+type Freed = Option<(u32, u32, u32)>;
+
+/// Queue `index` for return to the free list; return the chain once it is long enough.
+fn free_later<T>(arena: &Arena<T>, freed: &mut Freed, index: u32) {
+    *freed = Some(match *freed {
+        None => (index, index, 1),
+        Some((first, last, count)) => {
+            arena.link_free(index, first);
+            (index, last, count + 1)
+        }
+    });
+    if matches!(*freed, Some((_, _, n)) if n >= FREE_BATCH) {
+        flush_freed(arena, freed);
+    }
+}
+
+/// Return the queued nodes with one CAS.
+fn flush_freed<T>(arena: &Arena<T>, freed: &mut Freed) {
+    if let Some((first, last, _)) = freed.take() {
+        arena.free_chain(first, last);
+    }
+}
+
+impl<T: Send + 'static> Drop for EventReceiver<T> {
     fn drop(&mut self) {
-        let mut state = self.shared.lock();
-        state.receiver_alive = false;
-        state.armed = false;
-        drop(state);
+        self.shared.receiver_alive.store(false, Ordering::Release);
+        self.shared.armed.store(false, Ordering::Relaxed);
+        *self.shared.bell.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Messages of the current batch are dropped with it; nodes go back to the arena,
+        // which the channel frees once the senders are gone too.
+        self.batch = None;
+        flush_freed(&self.shared.arena, &mut self.freed);
         // Complete the armed read now, rather than leaving it in the ring (or cancelling it).
         if self.read.is_some() {
-            self.shared.notify();
+            doorbell::write_eventfd(&self.shared.efd);
         }
     }
 }
 
-impl<T: 'static> std::fmt::Debug for EventReceiver<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<T: Send + 'static> fmt::Debug for EventReceiver<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EventReceiver")
-            .field("buffered", &self.local.len())
             .field("armed", &self.read.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }

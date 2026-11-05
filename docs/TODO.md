@@ -7,6 +7,7 @@ Everything in round 1 was checked by tests only. Nothing has been benchmarked.
 - Re-run the transport's `--tune defer` variant. F7 (completions waiting until `park()` on DEFER_TASKRUN rings) may explain why it showed no difference in runs 26–28. Compare `DriverStats` with and without the fix.
 - Benchmark each new opt-in behind a `--tune` flag (ROUND1.md section 5): `skip_empty_enter`, `register_ring_fd`, `min_wait`, `task_budget`, multishot accept/recv, recv bundles, fixed files, fixed buffers, `send_zc_early`.
 - Confirm the TLS write counts (A15) with `strace -c` on a real 64 KiB TLS echo. Today they come from a counting wrapper in `tests/tls_throughput.rs`.
+- `event_channel`: the 1/4/8-producer comparison against the 0.6.0 mutex queue was a throwaway test (1M `u64` messages, best of 5). Add it as a proper benchmark and run it on the target hardware, also with larger `T`.
 - Fixed files (A3): only a quick, uncommitted benchmark was run (about 5–7% on single file reads, no difference on loopback TCP ping-pong). Measure on a real NIC.
 
 ## Not done from ROUND1.md
@@ -24,7 +25,6 @@ Everything in round 1 was checked by tests only. Nothing has been benchmarked.
 - `register_fixed` and `accept_direct` take no cancel handle.
 - `fadvise` lengths above `u32::MAX` are rejected (io-uring 0.7.15 can't set the 64-bit length).
 - No helper to set the pipe size (`F_SETPIPE_SZ`) for splice.
-- `EventSender` has no fast path through `msg_ring` when the sender is itself a ring thread.
 - `DriverStats` doesn't count fixed vs raw SQEs (`fixed_file_stats()` covers table use only).
 
 ## Known limits (documented, may be worth revisiting)

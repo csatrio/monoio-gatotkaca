@@ -58,17 +58,15 @@ async fn send_after_receiver_dropped() {
     assert!(!tx.is_closed());
     drop(rx);
     assert!(tx.is_closed());
-    assert_eq!(tx.send(1), Err(1));
+    assert_eq!(tx.send(1), Err(uring::SendError::Disconnected(1)));
 }
 
-/// A batch sent while the receiver waits costs one eventfd write; sends while it is busy cost
-/// none.
+/// Sends cost no wakeup unless the receiver waits; a batch sent while it waits costs one.
 #[monoio::test]
 async fn batch_wakes_once() {
     let (tx, mut rx) = uring::event_channel::<u32>().unwrap();
-    // Empty: the receiver is now waiting for a wakeup.
+    // `try_recv` doesn't arm a wakeup, so these sends ring nothing.
     assert_eq!(rx.try_recv(), None);
-    assert_eq!(rx.wakeups(), 0);
     let t = thread::spawn(move || {
         for i in 0..100 {
             tx.send(i).unwrap();
@@ -76,27 +74,33 @@ async fn batch_wakes_once() {
         tx
     });
     let tx = t.join().unwrap();
-    assert_eq!(rx.wakeups(), 1);
+    assert_eq!(rx.wakeups(), 0);
     for i in 0..100 {
         assert_eq!(rx.recv().await, Some(i));
     }
-    assert_eq!(rx.wakeups(), 1);
     // Not waiting (queue non-empty or never found empty since): no write.
     tx.send(100).unwrap();
     tx.send(101).unwrap();
-    assert_eq!(rx.wakeups(), 1);
+    assert_eq!(rx.wakeups(), 0);
     assert_eq!(rx.recv().await, Some(100));
     assert_eq!(rx.recv().await, Some(101));
-    // Now the receiver really waits on the ring.
+    // Now the receiver really waits on the ring: a burst of 50 costs one wakeup.
     let t = thread::spawn(move || {
         thread::sleep(Duration::from_millis(20));
-        tx.send(7).unwrap();
+        for i in 0..50 {
+            tx.send(i).unwrap();
+        }
         thread::sleep(Duration::from_millis(20));
     });
-    assert_eq!(rx.recv().await, Some(7));
-    assert_eq!(rx.wakeups(), 2);
+    assert_eq!(rx.recv().await, Some(0));
+    assert_eq!(rx.wakeups(), 1);
+    for i in 1..50 {
+        assert_eq!(rx.recv().await, Some(i));
+    }
     assert_eq!(rx.recv().await, None);
-    assert_eq!(rx.wakeups(), 3);
+    assert_eq!(rx.wakeups(), 2);
+    // A plain thread wakes through the eventfd.
+    assert_eq!(rx.stats().eventfd_wakeups, 2);
     t.join().unwrap();
 }
 
@@ -139,7 +143,7 @@ fn defer_taskrun_and_drop_while_armed() {
             _ = monoio::time::sleep(Duration::from_millis(5)) => {}
         }
         drop(rx);
-        assert_eq!(tx.send(2), Err(2));
+        assert_eq!(tx.send(2), Err(uring::SendError::Disconnected(2)));
         // Let the completed read be reaped.
         monoio::time::sleep(Duration::from_millis(5)).await;
     });
