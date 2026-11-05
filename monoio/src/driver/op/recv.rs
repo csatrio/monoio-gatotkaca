@@ -10,9 +10,10 @@ use {
     libc::{sockaddr_in, sockaddr_in6, sockaddr_storage, socklen_t, AF_INET, AF_INET6},
 };
 
-use super::{super::shared_fd::SharedFd, submit::SubmitResult, Op, OpAble};
+use super::{super::shared_fd::SharedFd, submit::SubmitResult, Completion, Op, OpAble};
 use crate::{
     buf::{IoBufMut, IoVecBufMut, IoVecMeta, MsgMeta},
+    io::futures::BufOp,
     BufResult,
 };
 
@@ -57,7 +58,14 @@ impl<T: IoBufMut> Op<Recv<T>> {
     }
 
     pub(crate) async fn result(self) -> BufResult<usize, T> {
-        let complete = self.await;
+        <Recv<T> as BufOp>::complete(self.await)
+    }
+}
+
+impl<T: IoBufMut> BufOp for Recv<T> {
+    type Buf = T;
+
+    fn complete(complete: Completion<Self>) -> BufResult<usize, T> {
         let res = complete.meta.result.map(|v| v.into_inner() as _);
         let mut buf = complete.data.buf;
 

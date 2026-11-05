@@ -1,8 +1,9 @@
 use io_uring::{opcode, types};
 
-use super::{super::shared_fd::SharedFd, submit::SubmitResult, Op, OpAble};
+use super::{super::shared_fd::SharedFd, submit::SubmitResult, Completion, Op, OpAble};
 use crate::{
     buf::{IoBufMut, IoVecBufMut},
+    io::futures::BufOp,
     BufResult,
 };
 
@@ -10,9 +11,17 @@ macro_rules! read_result {
     ($($name:ident<$T:ident : $Trait:ident> { $buf:ident }),* $(,)?) => {
         $(
             impl<$T: $Trait> super::Op<$name<$T>> {
+                // Unused for the `*At` ops, which only go through the named futures.
+                #[allow(dead_code)]
                 pub(crate) async fn result(self) -> BufResult<usize, $T> {
-                    let complete = self.await;
+                    <$name<$T> as BufOp>::complete(self.await)
+                }
+            }
 
+            impl<$T: $Trait> BufOp for $name<$T> {
+                type Buf = $T;
+
+                fn complete(complete: Completion<Self>) -> BufResult<usize, $T> {
                     // Convert the operation result to `usize`
                     let res = complete.meta.result.map(|v| v.into_inner() as usize);
                     // Recover the buffer

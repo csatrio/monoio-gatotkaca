@@ -3,10 +3,11 @@ use std::net::SocketAddr;
 use io_uring::{opcode, types};
 use socket2::SockAddr;
 
-use super::{super::shared_fd::SharedFd, submit::SubmitResult, Op, OpAble};
+use super::{super::shared_fd::SharedFd, submit::SubmitResult, Completion, Op, OpAble};
 use crate::net::unix::SocketAddr as UnixSocketAddr;
 use crate::{
     buf::{IoBuf, IoVecBuf, IoVecBufMut, IoVecMeta, MsgMeta},
+    io::futures::BufOp,
     BufResult,
 };
 
@@ -35,7 +36,14 @@ impl<T: IoBuf> Op<Send<T>> {
     }
 
     pub(crate) async fn result(self) -> BufResult<usize, T> {
-        let complete = self.await;
+        <Send<T> as BufOp>::complete(self.await)
+    }
+}
+
+impl<T: IoBuf> BufOp for Send<T> {
+    type Buf = T;
+
+    fn complete(complete: Completion<Self>) -> BufResult<usize, T> {
         (
             complete.meta.result.map(|v| v.into_inner() as _),
             complete.data.buf,
@@ -221,6 +229,7 @@ impl<T: IoBuf> Op<SendZc<T>> {
 }
 
 impl<T: IoBuf> OpAble for SendZc<T> {
+    const KIND: super::OpKind = super::OpKind::ZeroCopy;
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
         #[allow(deprecated)]
         const FLAGS: i32 = libc::MSG_NOSIGNAL;

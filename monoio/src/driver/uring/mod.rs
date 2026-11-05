@@ -10,11 +10,12 @@ use std::{
     time::Duration,
 };
 
-use io_uring::{cqueue, opcode, squeue, types::Timespec, EnterFlags, IoUring};
+use io_uring::{opcode, squeue, types::Timespec, EnterFlags, IoUring};
 use lifecycle::MaybeFdLifecycle;
 
 use super::{
-    op::{CompletionMeta, Op, OpAble},
+    op::{CompletionMeta, Op, OpAble, OpKind},
+    raw::Cqe,
     util::timespec,
     Driver, Inner, CURRENT,
 };
@@ -91,6 +92,11 @@ pub struct DriverStats {
     /// (`opcode::Nop::CODE`, ...). Opcodes from 63 up share the last slot. SQEs pushed through
     /// `uring::with_ring` and the driver's own cancel, timeout and eventfd SQEs are not counted.
     pub ops_by_opcode: [u64; 64],
+    /// CQEs of multishot operations (`uring::submit_multishot`, `accept_multi`, `recv_multi`),
+    /// including those discarded after their handle was dropped.
+    pub multishot_cqes: u64,
+    /// Longest per-op CQE queue of a multishot operation seen: how far a consumer fell behind.
+    pub multishot_queue_high_water: u64,
 }
 
 impl Default for DriverStats {
@@ -108,6 +114,8 @@ impl Default for DriverStats {
             cancels_lost: 0,
             cq_overflow: 0,
             ops_by_opcode: [0; 64],
+            multishot_cqes: 0,
+            multishot_queue_high_water: 0,
         }
     }
 }
@@ -256,6 +264,10 @@ pub(crate) struct UringInner {
 
     /// Counters, see [`IoUringDriver::stats`].
     stats: DriverStats,
+
+    /// Finished slots of dropped ops, dropped by [`drop_deferred`] once the driver holds no
+    /// state: dropping op data may call back into the driver.
+    deferred: Vec<MaybeFdLifecycle>,
 }
 
 // When dropping the driver, all in-flight operations must have completed. This
@@ -283,6 +295,7 @@ impl IoUringDriver {
             uring,
             external: Default::default(),
             stats: DriverStats::default(),
+            deferred: Vec::new(),
         }));
 
         Ok(IoUringDriver { inner })
@@ -319,6 +332,7 @@ impl IoUringDriver {
             waker_receiver,
             external: Default::default(),
             stats: DriverStats::default(),
+            deferred: Vec::new(),
         }));
 
         let thread_id = crate::builder::BUILD_THREAD_ID.with(|id| *id);
@@ -479,6 +493,7 @@ impl IoUringDriver {
 
         // Process CQ
         inner.tick()?;
+        drop_deferred(&self.inner);
         super::raw::deliver(&self.inner);
 
         Ok(())
@@ -503,6 +518,7 @@ impl Driver for IoUringDriver {
             inner.submit()?;
         }
         inner.tick()?;
+        drop_deferred(&self.inner);
         super::raw::deliver(&self.inner);
         Ok(())
     }
@@ -548,11 +564,18 @@ impl UringInner {
                 #[cfg(feature = "sync")]
                 EVENTFD_USERDATA => self.eventfd_installed = false,
                 // Operations of this driver: `user_data` is a slab index.
-                // # Safety
-                // Here we can make sure the result is valid.
-                _ if index >> 62 == 0 => unsafe {
-                    self.ops.complete(index as _, resultify(&cqe), cqe.flags())
-                },
+                _ if index >> 62 == 0 => {
+                    // SAFETY: the CQE comes from the kernel for the op at `index`.
+                    let done = unsafe { self.ops.complete(index as _, cqe.result(), cqe.flags()) };
+                    if let Some(queued) = done.queued {
+                        self.stats.multishot_cqes += 1;
+                        let hw = &mut self.stats.multishot_queue_high_water;
+                        *hw = (*hw).max(queued as u64);
+                    }
+                    if let Some(slot) = done.deferred {
+                        self.deferred.push(slot);
+                    }
+                }
                 // Operations pushed by the user, see `uring::user_data`.
                 _ if index >> 62 == 0b10 => self.external.push(index, &cqe),
                 // Driver internal (cancel, timeout) or unknown: nothing waits for it.
@@ -732,14 +755,31 @@ impl UringInner {
         }
     }
 
-    fn new_op<T: OpAble>(data: T, inner: &mut UringInner, driver: Inner) -> Op<T> {
-        Op {
-            driver,
-            index: inner.ops.insert(T::RET_IS_FD),
-            data: Some(data),
+    /// Reserve SQ space, allocate a slab slot for `data` and push its SQE. Returns the slot
+    /// index. On failure nothing is left behind and `data` is untouched.
+    fn push_op<T: OpAble>(&mut self, data: &mut T) -> io::Result<usize> {
+        // If the submission queue is full, flush it to the kernel
+        self.reserve_sqe()?;
+
+        let index = self.ops.insert(T::RET_IS_FD, T::KIND);
+        let sqe: squeue::Entry = data.uring_op().user_data(index as _);
+
+        // Can't fail after `reserve_sqe`; if it does, free the slot again.
+        if unsafe { self.uring.submission().push(&sqe) }.is_err() {
+            if let Some(slot) = self.ops.slab.get(index) {
+                slot.remove();
+            }
+            return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
+        let opcode = (sqe.get_opcode() as usize).min(63);
+        self.stats.ops_by_opcode[opcode] += 1;
+
+        // The SQE is visible to the kernel once the tail is published. We don't enter now: the
+        // runtime submits on `park` (or `submit`) when it waits for IO.
+        Ok(index)
     }
 
+    /// Submit `data` as a new operation.
     pub(crate) fn submit_with_data<T>(
         this: &Rc<UnsafeCell<UringInner>>,
         data: T,
@@ -747,39 +787,37 @@ impl UringInner {
     where
         T: OpAble,
     {
-        let inner = unsafe { &mut *this.get() };
-        // If the submission queue is full, flush it to the kernel
-        inner.reserve_sqe()?;
+        Self::try_submit_with_data(this, data).map_err(|(e, _)| e)
+    }
 
-        // Create the operation
-        let mut op = Self::new_op(data, inner, Inner(this.clone()));
-
-        // Configure the SQE
-        let data_mut = unsafe { op.data.as_mut().unwrap_unchecked() };
-        let sqe: squeue::Entry = OpAble::uring_op(data_mut).user_data(op.index as _);
-
-        // Push the new operation. It can't fail after `reserve_sqe`; if it does, free the slot so
-        // dropping `op` neither cancels nor leaks it.
-        if unsafe { inner.uring.submission().push(&sqe) }.is_err() {
-            if let Some(slot) = inner.ops.slab.get(op.index) {
-                slot.remove();
-            }
-            op.index = usize::MAX;
-            return Err(io::Error::from_raw_os_error(libc::EBUSY));
+    /// Like [`submit_with_data`](Self::submit_with_data), but hands `data` back on failure (the
+    /// SQ stayed full).
+    pub(crate) fn try_submit_with_data<T>(
+        this: &Rc<UnsafeCell<UringInner>>,
+        mut data: T,
+    ) -> Result<Op<T>, (io::Error, T)>
+    where
+        T: OpAble,
+    {
+        // Multishot ops are driven by `MultishotOp`, which uses `submit_index`.
+        debug_assert!(T::KIND != OpKind::Multishot);
+        match Self::submit_index(this, &mut data) {
+            Ok(index) => Ok(Op {
+                driver: Inner(this.clone()),
+                index,
+                data: Some(data),
+            }),
+            Err(e) => Err((e, data)),
         }
-        let opcode = (sqe.get_opcode() as usize).min(63);
-        inner.stats.ops_by_opcode[opcode] += 1;
+    }
 
-        // Submit the new operation. At this point, the operation has been
-        // pushed onto the queue and the tail pointer has been updated, so
-        // the submission entry is visible to the kernel. If there is an
-        // error here (probably EAGAIN), we still return the operation. A
-        // future `io_uring_enter` will fully submit the event.
-
-        // CHIHAI: We are not going to do syscall now. If we are waiting
-        // for IO, we will submit on `park`.
-        // let _ = inner.submit();
-        Ok(op)
+    /// Push the SQE of `data` and return its slot index; the caller keeps `data`.
+    pub(crate) fn submit_index<T: OpAble>(
+        this: &Rc<UnsafeCell<UringInner>>,
+        data: &mut T,
+    ) -> io::Result<usize> {
+        let inner = unsafe { &mut *this.get() };
+        inner.push_op(data)
     }
 
     pub(crate) fn poll_op(
@@ -815,6 +853,60 @@ impl UringInner {
     pub(crate) unsafe fn cancel_op(this: &Rc<UnsafeCell<UringInner>>, index: usize) {
         let inner = &mut *this.get();
         inner.push_cancel(index);
+    }
+
+    /// Next CQE of the multishot op at `index`, see `Ref::poll_multi`.
+    pub(crate) fn poll_multi(
+        this: &Rc<UnsafeCell<UringInner>>,
+        index: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Cqe>> {
+        let inner = unsafe { &mut *this.get() };
+        match inner.ops.slab.get(index) {
+            Some(slot) => slot.poll_multi(cx),
+            None => Poll::Ready(None),
+        }
+    }
+
+    /// The handle of the multishot op at `index` is dropped. Discards its queued CQEs; if it is
+    /// still running, keeps `data` until the final CQE and asks the kernel to cancel it.
+    ///
+    /// Unlike single ops the cancel is pushed even without `async-cancel`: a multishot op
+    /// (accept, recv) may never end on its own.
+    pub(crate) fn drop_multi<T: OpAble + 'static>(
+        this: &Rc<UnsafeCell<UringInner>>,
+        index: usize,
+        data: &mut Option<T>,
+    ) {
+        let inner = unsafe { &mut *this.get() };
+        if let Some(slot) = inner.ops.slab.get(index) {
+            if !slot.drop_multi(data) {
+                inner.push_cancel(index);
+            }
+        }
+    }
+
+    /// If the kernel is done with the multishot op at `index`, free its slot (discarding the
+    /// CQEs not taken) and return true.
+    pub(crate) fn finish_multi<T: OpAble>(
+        this: &Rc<UnsafeCell<UringInner>>,
+        index: usize,
+        data: &mut T,
+    ) -> bool {
+        let inner = unsafe { &mut *this.get() };
+        match inner.ops.slab.get(index) {
+            Some(slot) => slot.finish_multi(data),
+            None => true,
+        }
+    }
+
+    /// Whether the kernel posted the final CQE of the multishot op at `index`.
+    pub(crate) fn multi_finished(this: &Rc<UnsafeCell<UringInner>>, index: usize) -> bool {
+        let inner = unsafe { &mut *this.get() };
+        match inner.ops.slab.get(index) {
+            Some(slot) => slot.multi_finished(),
+            None => true,
+        }
     }
 
     #[cfg(feature = "sync")]
@@ -878,27 +970,40 @@ impl Ops {
 
     // Insert a new operation
     #[inline]
-    pub(crate) fn insert(&mut self, is_fd: bool) -> usize {
-        self.slab.insert(MaybeFdLifecycle::new(is_fd))
+    pub(crate) fn insert(&mut self, is_fd: bool, kind: OpKind) -> usize {
+        self.slab.insert(MaybeFdLifecycle::new(is_fd, kind))
     }
 
-    // Complete an operation
+    // Complete an operation. A CQE for a free slot (which the kernel never posts) is ignored.
     // # Safety
     // Caller must make sure the result is valid.
     #[inline]
-    unsafe fn complete(&mut self, index: usize, result: io::Result<u32>, flags: u32) {
-        let lifecycle = unsafe { self.slab.get(index).unwrap_unchecked() };
-        lifecycle.complete(result, flags);
+    unsafe fn complete(&mut self, index: usize, res: i32, flags: u32) -> lifecycle::Completed {
+        match self.slab.get(index) {
+            Some(lifecycle) => lifecycle.complete(res, flags),
+            None => {
+                trace!("MONOIO DEBUG[IoUringDriver]: CQE for free slot {}", index);
+                lifecycle::Completed::default()
+            }
+        }
     }
 }
 
-#[inline]
-fn resultify(cqe: &cqueue::Entry) -> io::Result<u32> {
-    let res = cqe.result();
-
-    if res >= 0 {
-        Ok(res as u32)
-    } else {
-        Err(io::Error::from_raw_os_error(-res))
+/// Drop the finished slots of dropped ops. Called by the driver once it holds no state, since
+/// the drops may call back into it (e.g. a `SharedFd` closing through the ring).
+fn drop_deferred(cell: &UnsafeCell<UringInner>) {
+    // No other reference to the driver state is alive here.
+    let mut slots = {
+        let inner = unsafe { &mut *cell.get() };
+        if inner.deferred.is_empty() {
+            return;
+        }
+        std::mem::take(&mut inner.deferred)
+    };
+    slots.clear();
+    // Keep the allocation, unless the drops deferred new slots meanwhile.
+    let inner = unsafe { &mut *cell.get() };
+    if inner.deferred.is_empty() {
+        inner.deferred = slots;
     }
 }

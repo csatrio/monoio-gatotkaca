@@ -12,12 +12,16 @@ pub(crate) mod read;
 pub(crate) mod write;
 
 mod accept;
+pub(crate) mod accept_multi;
 mod connect;
+mod fadvise;
 mod fsync;
+pub(crate) mod multishot;
 mod open;
 mod poll;
-mod recv;
-mod send;
+pub(crate) mod recv;
+pub(crate) mod recv_multi;
+pub(crate) mod send;
 mod statx;
 mod submit;
 
@@ -104,10 +108,31 @@ impl Drop for MaybeFd {
     }
 }
 
+/// How many CQEs an operation posts, which decides how the driver tracks it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpKind {
+    /// One CQE. If it unexpectedly carries `IORING_CQE_F_MORE`, the result is kept and the op
+    /// completes with the last CQE (the follow-ups are dropped).
+    Single,
+    /// A zero-copy send: a result CQE with `F_MORE`, then a notification CQE (`F_NOTIF`) once the
+    /// kernel released the buffer. Completes with the notification.
+    ZeroCopy,
+    /// Multishot: any number of CQEs, queued per op, the last one without `F_MORE`. Driven by
+    /// [`multishot::MultishotOp`], never by [`Op`].
+    Multishot,
+}
+
 pub(crate) trait OpAble {
     const RET_IS_FD: bool = false;
     const SKIP_CANCEL: bool = false;
+    const KIND: OpKind = OpKind::Single;
     fn uring_op(&mut self) -> io_uring::squeue::Entry;
+
+    /// Multishot ops only: release what a CQE carries (a file descriptor, a provided buffer)
+    /// when nobody will read it, i.e. CQEs still queued or arriving after the op was dropped.
+    /// Must not call into the driver.
+    #[inline]
+    fn discard_cqe(&mut self, _cqe: crate::driver::raw::Cqe) {}
 }
 
 impl<T: OpAble> Op<T> {

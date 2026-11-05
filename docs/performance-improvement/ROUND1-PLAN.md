@@ -35,6 +35,7 @@ Merge: apply the four diffs, wire the buffer-ring flush into the driver tick, ru
 | W3-chains | A4 (`submit_chain`, link timeouts, `read_with_deadline`) | `driver/raw.rs`, `driver/uring/mod.rs`, new `driver/chain.rs` |
 | W3-fixedbuf | A5 (`FixedBufPool`, `FixedBuf`, fixed read/write/send_zc) | new `driver/fixed_buf.rs`, new fixed ops |
 | W3-msgring | A11 (`msg_ring`, `RingHandle`, eventfd channel without `sync`) | new `driver/msg_ring.rs` |
+| W3-bundles | A6 recv bundles: `BufRing::take_bundle` and `recv_multi_bundle` (`IORING_RECVSEND_BUNDLE`, 6.10+) | `driver/buf_ring.rs`, `net/*/multishot.rs`, `driver/op/recv_multi.rs` |
 
 ## Wave 4
 
@@ -58,6 +59,6 @@ One commit per wave on `main`, made after the wave's diffs are merged and the fu
 | Wave | State |
 |---|---|
 | 1 | done: F1, F2, F4, F7, A2, A6, A7, A9, A10, A15 rows 1–4. Also fixed: `IoVecMeta` iovec length and `consume` offset bugs, `read_vectored_exact` not setting init. Not done: A6 recv bundles (moved to W2-multishot). |
-| 2 | next. W2-multishot must also: make `submit_with_data` return `data` on failure, so `driver/op/submit.rs` (`submit_or_return`) can drop its no-op flush trick. |
+| 2 | done: F3, A1, A8, A12; `submit_with_data` returns `data` on failure (no-op flush trick removed). Not done: recv bundles (need `BufRing::take_bundle`, moved to wave 3). |
 | 3 | not started |
 | 4 | not started |

@@ -3,7 +3,7 @@
 mod file;
 use std::{io, path::Path};
 
-pub use file::File;
+pub use file::{advise::Advice, File};
 
 #[cfg(feature = "mkdirat")]
 mod dir_builder;

@@ -22,6 +22,9 @@ pub struct RuntimeBuilder<D> {
     // tasks run per round, see `task_budget`
     task_budget: Option<usize>,
 
+    // [bounded, unbounded] io-wq worker caps, see `iowq_max_workers`
+    iowq_max_workers: Option<[u32; 2]>,
+
     // blocking handle
     #[cfg(feature = "sync")]
     blocking_handle: crate::blocking::BlockingHandle,
@@ -62,6 +65,7 @@ impl<T> RuntimeBuilder<T> {
             urb: io_uring::IoUring::builder(),
             opts: DriverOptions::default(),
             task_budget: None,
+            iowq_max_workers: None,
 
             #[cfg(feature = "sync")]
             blocking_handle: crate::blocking::BlockingStrategy::ExecuteLocal.into(),
@@ -102,6 +106,12 @@ impl Buildable for IoUringDriver {
 
         BUILD_THREAD_ID.set(&thread_id, || {
             let driver = IoUringDriver::new_with_entries(&this.urb, this.entries, this.opts)?;
+            if let Some(mut max) = this.iowq_max_workers {
+                // Safety: the runtime does not exist yet, nothing else touches the ring.
+                unsafe {
+                    driver.with_ring(|ring| ring.submitter().register_iowq_max_workers(&mut max))
+                }?;
+            }
             #[cfg(feature = "sync")]
             let mut context = crate::runtime::Context::new(blocking_handle);
             #[cfg(not(feature = "sync"))]
@@ -233,6 +243,29 @@ impl<D> RuntimeBuilder<D> {
         self
     }
 
+    /// Cap the kernel's io-wq worker threads (`iou-wrk-*`) for this ring
+    /// (`IORING_REGISTER_IOWQ_MAX_WORKERS`, 5.15+), registered right after the ring is built.
+    ///
+    /// io_uring punts work it can't finish inline to these threads: `bounded` caps the workers
+    /// for regular file and block device IO, `unbounded` those for everything else that can
+    /// wait forever (sockets, pipes; a splice into a pipe counts here). `0` keeps the kernel's
+    /// current limit for that class (by default `bounded` is at most the SQ size and about four
+    /// per CPU, `unbounded` follows `RLIMIT_NPROC`). Fewer workers mean fewer threads and less
+    /// context switching, but punted ops wait in a queue for a free worker.
+    ///
+    /// The workers belong to the io-wq of the thread that submits. Rings that share one io-wq
+    /// via [`attach_wq`](Self::attach_wq) share the workers, so the last cap registered on any
+    /// of them applies to all; set it on the primary. Older kernels (before 6.3) apply the
+    /// limits per NUMA node.
+    ///
+    /// Off by default. [`build`](RuntimeBuilder::build) returns the kernel's error if the
+    /// registration fails (`EINVAL` on kernels without it).
+    #[must_use]
+    pub fn iowq_max_workers(mut self, bounded: u32, unbounded: u32) -> Self {
+        self.iowq_max_workers = Some([bounded, unbounded]);
+        self
+    }
+
     /// Run at most `n` ready tasks (at least 1) before checking the driver for completions. The
     /// default is about twice the number of tasks queued at the start of the round.
     #[must_use]
@@ -263,6 +296,7 @@ where
             urb: this.urb,
             opts: this.opts,
             task_budget: this.task_budget,
+            iowq_max_workers: this.iowq_max_workers,
             #[cfg(feature = "sync")]
             blocking_handle: this.blocking_handle,
             _mark: PhantomData,
@@ -292,6 +326,7 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
             urb,
             opts,
             task_budget,
+            iowq_max_workers,
             #[cfg(feature = "sync")]
             blocking_handle,
             ..
@@ -301,6 +336,7 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
             urb,
             opts,
             task_budget,
+            iowq_max_workers,
             #[cfg(feature = "sync")]
             blocking_handle,
             _mark: PhantomData,

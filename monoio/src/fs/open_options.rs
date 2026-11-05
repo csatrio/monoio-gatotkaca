@@ -358,6 +358,20 @@ impl OpenOptionsExt for OpenOptions {
         self
     }
 
+    /// Pass extra `open(2)` flags (`libc::O_*`, see `monoio::uring::libc`), OR-ed with the ones
+    /// the other options set. The access mode bits are ignored.
+    ///
+    /// Useful for the read path:
+    /// - `O_NOATIME`: reads don't update the file's access time, which saves an inode write per
+    ///   read on filesystems mounted without `noatime`/`relatime`. Only allowed on files the
+    ///   process owns (or with `CAP_FOWNER`); otherwise `open` fails with `EPERM`.
+    /// - `O_DIRECT`: bypass the page cache (the buffers and offsets must then be aligned).
+    ///
+    /// The open itself is an `IORING_OP_OPENAT`. The kernel runs it inline, in the submitting
+    /// thread, only when the path lookup hits the dentry cache (and no flag such as `O_CREAT` or
+    /// `O_TRUNC` needs to block); otherwise it is punted to an io-wq worker thread (`iou-wrk-*`,
+    /// see [`RuntimeBuilder::iowq_max_workers`](crate::RuntimeBuilder::iowq_max_workers)). Open
+    /// files once and keep them if latency matters.
     fn custom_flags(&mut self, flags: i32) -> &mut Self {
         self.custom_flags = flags as libc::c_int;
         self

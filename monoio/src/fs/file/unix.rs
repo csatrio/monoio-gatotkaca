@@ -67,10 +67,8 @@ mod iouring {
     use crate::uring_op;
 
     uring_op!(read<IoBufMut>(read, buf));
-    uring_op!(read_at<IoBufMut>(read_at, buf, pos: u64));
     uring_op!(read_vectored<IoVecBufMut>(readv, buf_vec));
 
     uring_op!(write<IoBuf>(write, buf));
-    uring_op!(write_at<IoBuf>(write_at, buf, pos: u64));
     uring_op!(write_vectored<IoVecBuf>(writev, buf_vec));
 }

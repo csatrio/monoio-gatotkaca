@@ -6,10 +6,13 @@ use io_uring::{opcode, types};
 
 use super::{super::shared_fd::SharedFd, Op, OpAble};
 
-// Currently our Splice does not support setting offset.
+/// A splice between two fds. An offset of `-1` means "use (and advance) the fd's own position";
+/// it must be `-1` for the pipe end.
 pub(crate) struct Splice {
     fd_in: SharedFd,
+    off_in: i64,
     fd_out: SharedFd,
+    off_out: i64,
     len: u32,
 }
 
@@ -19,11 +22,7 @@ impl Op<Splice> {
         fd_out: &SharedFd,
         len: u32,
     ) -> io::Result<Op<Splice>> {
-        Op::submit_with(Splice {
-            fd_in: fd_in.clone(),
-            fd_out: fd_out.clone(),
-            len,
-        })
+        Self::splice_at(fd_in, -1, fd_out, -1, len)
     }
 
     pub(crate) fn splice_from_pipe(
@@ -31,9 +30,22 @@ impl Op<Splice> {
         fd_out: &SharedFd,
         len: u32,
     ) -> io::Result<Op<Splice>> {
+        Self::splice_at(fd_in, -1, fd_out, -1, len)
+    }
+
+    /// Splice with explicit offsets (`-1` for none). Offsets above `i64::MAX` are rejected.
+    pub(crate) fn splice_at(
+        fd_in: &SharedFd,
+        off_in: i64,
+        fd_out: &SharedFd,
+        off_out: i64,
+        len: u32,
+    ) -> io::Result<Op<Splice>> {
         Op::submit_with(Splice {
             fd_in: fd_in.clone(),
+            off_in,
             fd_out: fd_out.clone(),
+            off_out,
             len,
         })
     }
@@ -49,9 +61,9 @@ impl OpAble for Splice {
         const FLAG: u32 = libc::SPLICE_F_MOVE;
         opcode::Splice::new(
             types::Fd(self.fd_in.raw_fd()),
-            -1,
+            self.off_in,
             types::Fd(self.fd_out.raw_fd()),
-            -1,
+            self.off_out,
             self.len,
         )
         .flags(FLAG)

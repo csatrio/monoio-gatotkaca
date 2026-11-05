@@ -2,9 +2,10 @@ use std::io;
 
 use super::{SocketAddr, UnixStream};
 use crate::{
-    buf::{IoBuf, IoBufMut, IoVecBuf},
+    buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut},
     io::{
         as_fd::{AsReadFd, AsWriteFd, SharedFdWrapper},
+        futures::{ReadvFuture, RecvFuture, SendFuture, WritevFuture},
         OwnedReadHalf, OwnedWriteHalf,
     },
     net::MsgFlags,
@@ -52,6 +53,31 @@ impl UnixOwnedReadHalf {
         let stream = unsafe { &*self.0.get() };
         stream.recv_poll_first(buf, flags).await
     }
+
+    /// See [`UnixStream::recv_op`]. The future does not borrow the half.
+    #[inline]
+    pub fn recv_op<T: IoBufMut>(&self, buf: T) -> RecvFuture<T> {
+        // Safety: halves of one stream share a thread; the op only clones the fd.
+        unsafe { &*self.0.get() }.recv_op(buf)
+    }
+
+    /// See [`UnixStream::recv_with_flags_op`].
+    #[inline]
+    pub fn recv_with_flags_op<T: IoBufMut>(&self, buf: T, flags: MsgFlags) -> RecvFuture<T> {
+        unsafe { &*self.0.get() }.recv_with_flags_op(buf, flags)
+    }
+
+    /// See [`UnixStream::recv_poll_first_op`].
+    #[inline]
+    pub fn recv_poll_first_op<T: IoBufMut>(&self, buf: T, flags: MsgFlags) -> RecvFuture<T> {
+        unsafe { &*self.0.get() }.recv_poll_first_op(buf, flags)
+    }
+
+    /// See [`UnixStream::readv_op`].
+    #[inline]
+    pub fn readv_op<T: IoVecBufMut>(&self, buf_vec: T) -> ReadvFuture<T> {
+        unsafe { &*self.0.get() }.readv_op(buf_vec)
+    }
 }
 
 impl UnixOwnedWriteHalf {
@@ -80,6 +106,25 @@ impl UnixOwnedWriteHalf {
     ) -> BufResult<usize, T> {
         let stream = unsafe { &*self.0.get() };
         stream.send_vectored_with_flags(buf_vec, flags).await
+    }
+
+    /// See [`UnixStream::send_op`]. The future does not borrow the half.
+    #[inline]
+    pub fn send_op<T: IoBuf>(&self, buf: T) -> SendFuture<T> {
+        // Safety: halves of one stream share a thread; the op only clones the fd.
+        unsafe { &*self.0.get() }.send_op(buf)
+    }
+
+    /// See [`UnixStream::send_with_flags_op`].
+    #[inline]
+    pub fn send_with_flags_op<T: IoBuf>(&self, buf: T, flags: MsgFlags) -> SendFuture<T> {
+        unsafe { &*self.0.get() }.send_with_flags_op(buf, flags)
+    }
+
+    /// See [`UnixStream::writev_op`].
+    #[inline]
+    pub fn writev_op<T: IoVecBuf>(&self, buf_vec: T) -> WritevFuture<T> {
+        unsafe { &*self.0.get() }.writev_op(buf_vec)
     }
 }
 

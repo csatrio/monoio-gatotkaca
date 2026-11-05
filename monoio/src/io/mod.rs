@@ -13,6 +13,7 @@ pub mod sink;
 pub mod stream;
 
 pub mod as_fd;
+pub mod futures;
 #[cfg(feature = "splice")]
 pub mod splice;
 

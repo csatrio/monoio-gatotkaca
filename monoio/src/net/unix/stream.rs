@@ -14,6 +14,7 @@ use crate::{
     driver::{op::Op, shared_fd::SharedFd},
     io::{
         as_fd::{AsReadFd, AsWriteFd, SharedFdWrapper},
+        futures::{ReadvFuture, RecvFuture, SendFuture, WritevFuture},
         operation_canceled, AsyncReadRent, AsyncWriteRent, CancelHandle, CancelableAsyncReadRent,
         CancelableAsyncWriteRent, Split,
     },
@@ -123,6 +124,62 @@ impl UnixStream {
         flags::send_vectored_with_flags(&self.fd, buf_vec, flags).await
     }
 
+    // Named op futures (see [`crate::io::futures`]). Each pushes its SQE now and returns an
+    // `Unpin`, `'static` future that a struct can store without boxing.
+
+    /// Starts a receive into `buf` and returns it as a named [`RecvFuture`].
+    ///
+    /// Same SQE and result as [`AsyncReadRent::read`]; the future does not borrow `self`.
+    /// Also usable as an op token: drive it with [`RecvFuture::poll_result`].
+    #[inline]
+    pub fn recv_op<T: IoBufMut>(&self, buf: T) -> RecvFuture<T> {
+        RecvFuture::new(Op::recv(self.fd.clone(), buf))
+    }
+
+    /// [`recv_with_flags`](Self::recv_with_flags) as a named [`RecvFuture`].
+    #[inline]
+    pub fn recv_with_flags_op<T: IoBufMut>(&self, buf: T, flags: MsgFlags) -> RecvFuture<T> {
+        RecvFuture::new(Op::recv_with(self.fd.clone(), buf, flags.bits(), false))
+    }
+
+    /// [`recv_poll_first`](Self::recv_poll_first) as a named [`RecvFuture`].
+    #[inline]
+    pub fn recv_poll_first_op<T: IoBufMut>(&self, buf: T, flags: MsgFlags) -> RecvFuture<T> {
+        RecvFuture::new(Op::recv_with(self.fd.clone(), buf, flags.bits(), true))
+    }
+
+    /// Starts a send of `buf` (`MSG_NOSIGNAL`) and returns it as a named [`SendFuture`].
+    ///
+    /// Same SQE and result as [`AsyncWriteRent::write`]; it may send fewer bytes than `buf`
+    /// holds.
+    #[inline]
+    pub fn send_op<T: IoBuf>(&self, buf: T) -> SendFuture<T> {
+        SendFuture::new(Op::send(self.fd.clone(), buf))
+    }
+
+    /// [`send_with_flags`](Self::send_with_flags) as a named [`SendFuture`].
+    #[inline]
+    pub fn send_with_flags_op<T: IoBuf>(&self, buf: T, flags: MsgFlags) -> SendFuture<T> {
+        SendFuture::new(Op::send_with_flags(self.fd.clone(), buf, flags.bits()))
+    }
+
+    /// Starts a vectored read (`IORING_OP_READV`) and returns it as a named [`ReadvFuture`].
+    ///
+    /// Same SQE and result as [`AsyncReadRent::readv`].
+    #[inline]
+    pub fn readv_op<T: IoVecBufMut>(&self, buf_vec: T) -> ReadvFuture<T> {
+        ReadvFuture::new(Op::readv(self.fd.clone(), buf_vec))
+    }
+
+    /// Starts a vectored write (`IORING_OP_WRITEV`) and returns it as a named
+    /// [`WritevFuture`].
+    ///
+    /// Same SQE and result as [`AsyncWriteRent::writev`].
+    #[inline]
+    pub fn writev_op<T: IoVecBuf>(&self, buf_vec: T) -> WritevFuture<T> {
+        WritevFuture::new(Op::writev(self.fd.clone(), buf_vec))
+    }
+
     /// Returns effective credentials of the process which called `connect` or
     /// `pair`.
     pub fn peer_cred(&self) -> io::Result<UCred> {
@@ -211,24 +268,12 @@ impl AsyncWriteRent for UnixStream {
     #[inline]
     fn write<T: IoBuf>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
         // Submit the write operation
-        let op = Op::send(self.fd.clone(), buf);
-        async move {
-            match op {
-                Ok(op) => op.result().await,
-                Err((e, buf)) => (Err(e), buf),
-            }
-        }
+        self.send_op(buf)
     }
 
     #[inline]
     fn writev<T: IoVecBuf>(&mut self, buf_vec: T) -> impl Future<Output = BufResult<usize, T>> {
-        let op = Op::writev(self.fd.clone(), buf_vec);
-        async move {
-            match op {
-                Ok(op) => op.result().await,
-                Err((e, buf)) => (Err(e), buf),
-            }
-        }
+        self.writev_op(buf_vec)
     }
 
     #[inline]
@@ -312,25 +357,13 @@ impl AsyncReadRent for UnixStream {
     #[inline]
     fn read<T: IoBufMut>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
         // Submit the read operation
-        let op = Op::recv(self.fd.clone(), buf);
-        async move {
-            match op {
-                Ok(op) => op.result().await,
-                Err((e, buf)) => (Err(e), buf),
-            }
-        }
+        self.recv_op(buf)
     }
 
     #[inline]
     fn readv<T: IoVecBufMut>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
         // Submit the read operation
-        let op = Op::readv(self.fd.clone(), buf);
-        async move {
-            match op {
-                Ok(op) => op.result().await,
-                Err((e, buf)) => (Err(e), buf),
-            }
-        }
+        self.readv_op(buf)
     }
 }
 

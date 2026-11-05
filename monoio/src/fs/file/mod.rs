@@ -4,10 +4,14 @@ use crate::{
     buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut},
     driver::{op::Op, shared_fd::SharedFd},
     fs::OpenOptions,
-    io::{AsyncReadRent, AsyncWriteRent},
+    io::{
+        futures::{ReadAtFuture, WriteAtFuture},
+        AsyncReadRent, AsyncWriteRent,
+    },
     BufResult,
 };
 
+pub(crate) mod advise;
 mod unix;
 use unix as file_impl;
 
@@ -180,7 +184,18 @@ impl File {
     /// }
     /// ```
     pub async fn read_at<T: IoBufMut>(&self, buf: T, pos: u64) -> crate::BufResult<usize, T> {
-        file_impl::read_at(self.fd.clone(), buf, pos).await
+        self.read_at_op(buf, pos).await
+    }
+
+    /// Starts a positional read and returns it as a named, `Unpin`, `'static`
+    /// [`ReadAtFuture`], which a struct can store without boxing (see [`crate::io::futures`]).
+    ///
+    /// Same SQE and result as [`read_at`](Self::read_at), with one difference: the SQE is
+    /// pushed when this method is called, not on first poll. The future does not borrow `self`.
+    /// Dropping it before it finishes cancels the read, like dropping `read_at`'s future.
+    #[inline]
+    pub fn read_at_op<T: IoBufMut>(&self, buf: T, pos: u64) -> ReadAtFuture<T> {
+        ReadAtFuture::new(Op::read_at(self.fd.clone(), buf, pos))
     }
 
     /// Read the exact number of bytes required to fill `buf` at the specified
@@ -321,7 +336,18 @@ impl File {
     ///
     /// [`Ok(n)`]: Ok
     pub async fn write_at<T: IoBuf>(&self, buf: T, pos: u64) -> crate::BufResult<usize, T> {
-        file_impl::write_at(self.fd.clone(), buf, pos).await
+        self.write_at_op(buf, pos).await
+    }
+
+    /// Starts a positional write and returns it as a named, `Unpin`, `'static`
+    /// [`WriteAtFuture`], which a struct can store without boxing (see [`crate::io::futures`]).
+    ///
+    /// Same SQE and result as [`write_at`](Self::write_at), with one difference: the SQE is
+    /// pushed when this method is called, not on first poll. The future does not borrow `self`.
+    /// Dropping it before it finishes cancels the write, like dropping `write_at`'s future.
+    #[inline]
+    pub fn write_at_op<T: IoBuf>(&self, buf: T, pos: u64) -> WriteAtFuture<T> {
+        WriteAtFuture::new(Op::write_at(self.fd.clone(), buf, pos))
     }
 
     /// Attempts to write an entire buffer into this file at the specified

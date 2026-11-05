@@ -14,7 +14,7 @@ use crate::{
 
 /// UnixListener
 pub struct UnixListener {
-    fd: SharedFd,
+    pub(super) fd: SharedFd,
     sys_listener: Option<std::os::unix::net::UnixListener>,
 }
 

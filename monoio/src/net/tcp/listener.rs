@@ -18,7 +18,7 @@ use crate::{
 
 /// TcpListener
 pub struct TcpListener {
-    fd: SharedFd,
+    pub(super) fd: SharedFd,
     sys_listener: Option<std::net::TcpListener>,
     meta: UnsafeCell<ListenerMeta>,
 }
