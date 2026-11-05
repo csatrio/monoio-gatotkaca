@@ -1,8 +1,9 @@
 use std::io;
 
-use io_uring::{opcode, types};
+use io_uring::opcode;
 
 use super::{super::shared_fd::SharedFd, Op, OpAble};
+use crate::driver::shared_fd::sqe_fd;
 
 /// `IORING_OP_FADVISE` (5.6+).
 pub(crate) struct Fadvise {
@@ -30,8 +31,12 @@ impl Op<Fadvise> {
 
 impl OpAble for Fadvise {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        opcode::Fadvise::new(types::Fd(self.fd.raw_fd()), self.len as _, self.advice)
-            .offset(self.offset)
-            .build()
+        sqe_fd!(self.fd, |fd| opcode::Fadvise::new(
+            fd,
+            self.len as _,
+            self.advice
+        )
+        .offset(self.offset)
+        .build())
     }
 }

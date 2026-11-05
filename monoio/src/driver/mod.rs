@@ -7,6 +7,7 @@ pub(crate) mod thread;
 mod buf_ring;
 mod chain;
 mod fixed_buf;
+pub(crate) mod fixed_files;
 mod msg_ring;
 pub mod raw;
 mod uring;
@@ -18,6 +19,7 @@ use std::{
     time::Duration,
 };
 
+pub(crate) use self::fixed_files::register_fixed_files;
 use self::op::{CompletionMeta, Op, OpAble};
 pub(crate) use self::uring::DriverOptions;
 use self::uring::UringInner;

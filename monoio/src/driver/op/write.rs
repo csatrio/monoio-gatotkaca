@@ -1,10 +1,9 @@
-use std::os::unix::prelude::AsRawFd;
-
-use io_uring::{opcode, types};
+use io_uring::opcode;
 
 use super::{super::shared_fd::SharedFd, submit::SubmitResult, Completion, Op, OpAble};
 use crate::{
     buf::{IoBuf, IoVecBuf},
+    driver::shared_fd::sqe_fd,
     io::futures::BufOp,
     BufResult,
 };
@@ -54,13 +53,13 @@ impl<T: IoBuf> OpAble for Write<T> {
         //
         // If `offset` is set to `-1`, the offset will use (and advance) the file position, like
         // the write(2) system calls
-        opcode::Write::new(
-            types::Fd(self.fd.as_raw_fd()),
+        sqe_fd!(self.fd, |fd| opcode::Write::new(
+            fd,
             self.buf.read_ptr(),
             self.buf.bytes_init() as _,
         )
         .offset(-1i64 as _)
-        .build()
+        .build())
     }
 }
 
@@ -84,13 +83,13 @@ impl<T: IoBuf> Op<WriteAt<T>> {
 
 impl<T: IoBuf> OpAble for WriteAt<T> {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        opcode::Write::new(
-            types::Fd(self.fd.raw_fd()),
+        sqe_fd!(self.fd, |fd| opcode::Write::new(
+            fd,
             self.buf.read_ptr(),
             self.buf.bytes_init() as _,
         )
         .offset(self.offset)
-        .build()
+        .build())
     }
 }
 
@@ -115,8 +114,8 @@ impl<T: IoVecBuf> OpAble for WriteVec<T> {
         //
         // If `offset` is set to `-1`, the offset will use (and advance) the file position, like
         // the writev(2) system calls
-        opcode::Writev::new(types::Fd(self.fd.raw_fd()), ptr, len)
+        sqe_fd!(self.fd, |fd| opcode::Writev::new(fd, ptr, len)
             .offset(-1i64 as u64)
-            .build()
+            .build())
     }
 }

@@ -1,6 +1,7 @@
 #![allow(unreachable_pub)]
 //! Unix related.
 
+mod cancel;
 mod datagram;
 mod listener;
 mod multishot;

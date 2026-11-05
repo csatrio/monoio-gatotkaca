@@ -1,9 +1,10 @@
 use std::net::SocketAddr;
 
-use io_uring::{opcode, types};
+use io_uring::opcode;
 use socket2::SockAddr;
 
 use super::{super::shared_fd::SharedFd, submit::SubmitResult, Completion, Op, OpAble};
+use crate::driver::shared_fd::sqe_fd;
 use crate::net::unix::SocketAddr as UnixSocketAddr;
 use crate::{
     buf::{IoBuf, IoVecBuf, IoVecBufMut, IoVecMeta, MsgMeta},
@@ -61,6 +62,10 @@ impl<T: IoBuf> OpAble for Send<T> {
             // According to Linux's documentation, zero copy introduces extra overhead and
             // is only considered effective for at writes over around 10 KB.
             // see also: https://www.kernel.org/doc/html/v4.16/networking/msg_zerocopy.html
+            // The threshold is deliberately far above that (10 MiB): `MSG_ZEROCOPY` on a plain
+            // send has no completion notification here (nobody reads the error queue), so it
+            // stays rare. `SEND_ZC` (`write_zc`, `send_zc_*`) has its own notification and uses
+            // `net::ZC_MIN_LEN` (16 KiB) in `send_auto`.
             const MSG_ZEROCOPY_THRESHOLD: usize = 10 * 1024 * 1024;
             if buf.bytes_init() >= MSG_ZEROCOPY_THRESHOLD {
                 libc::MSG_NOSIGNAL as libc::c_int | MSG_ZEROCOPY
@@ -75,13 +80,13 @@ impl<T: IoBuf> OpAble for Send<T> {
         #[allow(deprecated)]
         let flags = libc::MSG_NOSIGNAL as libc::c_int;
 
-        opcode::Send::new(
-            types::Fd(self.fd.raw_fd()),
+        sqe_fd!(self.fd, |fd| opcode::Send::new(
+            fd,
             self.buf.read_ptr(),
             self.buf.bytes_init() as _,
         )
         .flags(flags | self.flags)
-        .build()
+        .build())
     }
 }
 
@@ -138,9 +143,9 @@ impl<T: IoBuf> OpAble for SendMsg<T> {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
         #[allow(deprecated)]
         const FLAGS: u32 = libc::MSG_NOSIGNAL as u32;
-        opcode::SendMsg::new(types::Fd(self.fd.raw_fd()), &*self.info.2)
+        sqe_fd!(self.fd, |fd| opcode::SendMsg::new(fd, &*self.info.2)
             .flags(FLAGS)
-            .build()
+            .build())
     }
 }
 
@@ -195,9 +200,12 @@ impl<T: IoBuf> OpAble for SendMsgUnix<T> {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
         #[allow(deprecated)]
         const FLAGS: u32 = libc::MSG_NOSIGNAL as u32;
-        opcode::SendMsg::new(types::Fd(self.fd.raw_fd()), &mut self.info.2 as *mut _)
-            .flags(FLAGS)
-            .build()
+        sqe_fd!(self.fd, |fd| opcode::SendMsg::new(
+            fd,
+            &mut self.info.2 as *mut _
+        )
+        .flags(FLAGS)
+        .build())
     }
 }
 
@@ -234,13 +242,10 @@ impl<T: IoBuf> OpAble for SendZc<T> {
         #[allow(deprecated)]
         const FLAGS: i32 = libc::MSG_NOSIGNAL;
 
-        opcode::SendZc::new(
-            types::Fd(self.fd.raw_fd()),
-            self.buf.read_ptr(),
-            self.buf.bytes_init() as _,
-        )
-        .flags(FLAGS)
-        .build()
+        let (ptr, len) = (self.buf.read_ptr(), self.buf.bytes_init() as _);
+        sqe_fd!(self.fd, |fd| opcode::SendZc::new(fd, ptr, len)
+            .flags(FLAGS)
+            .build())
     }
 }
 
@@ -294,8 +299,8 @@ impl<T: IoVecBuf> OpAble for SendMsgVec<T> {
         const NOSIGNAL: u32 = libc::MSG_NOSIGNAL as u32;
         self.msg.msg_iov = self.buf_vec.read_iovec_ptr() as *mut _;
         self.msg.msg_iovlen = self.buf_vec.read_iovec_len() as _;
-        opcode::SendMsg::new(types::Fd(self.fd.raw_fd()), &*self.msg)
+        sqe_fd!(self.fd, |fd| opcode::SendMsg::new(fd, &*self.msg)
             .flags(NOSIGNAL | self.flags)
-            .build()
+            .build())
     }
 }

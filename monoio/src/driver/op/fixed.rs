@@ -13,12 +13,13 @@ use std::{
     task::{Context, Poll},
 };
 
-use io_uring::{opcode, types};
+use io_uring::opcode;
 
 use super::{super::shared_fd::SharedFd, submit::SubmitResult, Completion, Op, OpAble};
 use crate::{
     buf::IoBufMut,
     driver::fixed_buf::{on_current_ring, FixedBuf, FixedIoBuf},
+    driver::shared_fd::sqe_fd,
     io::futures::BufOp,
     BufResult,
 };
@@ -54,16 +55,15 @@ impl Op<ReadFixed> {
 
 impl OpAble for ReadFixed {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        let fd = types::Fd(self.fd.raw_fd());
         let ptr = self.buf.write_ptr();
         let len = self.buf.bytes_total() as u32;
-        if self.fixed {
+        sqe_fd!(self.fd, |fd| if self.fixed {
             opcode::ReadFixed::new(fd, ptr, len, self.buf.buf_index())
                 .offset(self.offset)
                 .build()
         } else {
             opcode::Read::new(fd, ptr, len).offset(self.offset).build()
-        }
+        })
     }
 }
 
@@ -105,16 +105,15 @@ impl<B: FixedIoBuf> Op<WriteFixed<B>> {
 
 impl<B: FixedIoBuf> OpAble for WriteFixed<B> {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        let fd = types::Fd(self.fd.raw_fd());
         let ptr = self.buf.read_ptr();
         let len = self.buf.bytes_init() as u32;
-        if self.fixed {
+        sqe_fd!(self.fd, |fd| if self.fixed {
             opcode::WriteFixed::new(fd, ptr, len, self.buf.buf_index())
                 .offset(self.offset)
                 .build()
         } else {
             opcode::Write::new(fd, ptr, len).offset(self.offset).build()
-        }
+        })
     }
 }
 

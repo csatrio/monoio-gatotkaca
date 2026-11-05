@@ -131,32 +131,56 @@ impl TcpListener {
         let stream = TcpStream::from_shared_fd(SharedFd::new(fd.into_inner() as _)?);
 
         // Construct SocketAddr
-        let storage = completion.data.addr.0.as_ptr();
-        let addr = unsafe {
-            match (*storage).ss_family as _ {
-                AF_INET => {
-                    // Safety: if the ss_family field is AF_INET then storage must be a sockaddr_in.
-                    let addr: &sockaddr_in = &*(storage as *const sockaddr_in);
-                    let ip = Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes());
-                    let port = u16::from_be(addr.sin_port);
-                    SocketAddr::V4(SocketAddrV4::new(ip, port))
-                }
-                AF_INET6 => {
-                    // Safety: if the ss_family field is AF_INET6 then storage must be a
-                    // sockaddr_in6.
-                    let addr: &sockaddr_in6 = &*(storage as *const sockaddr_in6);
-                    let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
-                    let port = u16::from_be(addr.sin6_port);
-                    let scope_id = addr.sin6_scope_id;
-                    SocketAddr::V6(SocketAddrV6::new(ip, port, addr.sin6_flowinfo, scope_id))
-                }
-                _ => {
-                    return Err(io::ErrorKind::InvalidInput.into());
-                }
-            }
-        };
+        let addr = sockaddr_to_std(&completion.data.addr.0)?;
 
         Ok((stream, addr))
+    }
+
+    /// Accept a connection straight into the runtime's fixed file table
+    /// ([`RuntimeBuilder::with_fixed_files`](crate::RuntimeBuilder::with_fixed_files)), as a
+    /// direct descriptor (Linux 5.19+): the kernel never creates an fd for it, and every op on
+    /// the stream names its table slot, which saves a file lookup and an atomic refcount pair
+    /// per op. The slot is picked by the runtime before the accept is submitted.
+    ///
+    /// The stream is direct-only, see [`TcpStream::is_direct`] for what that excludes (socket
+    /// options: set them on the listener, accepted sockets inherit them). The peer address
+    /// comes from the accept itself and is cached, so [`TcpStream::peer_addr`] works.
+    ///
+    /// Fails with `Unsupported` without a fixed file table and with
+    /// `ENFILE` if it is full (the connection then stays in the backlog). Dropping the future
+    /// before it completes is safe: a connection accepted anyway is closed.
+    pub async fn accept_direct(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        self.accept_direct_with(AcceptFlags::EMPTY).await
+    }
+
+    /// [`accept_direct`](Self::accept_direct) with `SOCK_*` flags for the new socket, as in
+    /// [`accept_with`](Self::accept_with) (`CLOEXEC` is ignored).
+    pub async fn accept_direct_with(
+        &self,
+        flags: AcceptFlags,
+    ) -> io::Result<(TcpStream, SocketAddr)> {
+        let completion = Op::accept_direct(&self.fd, flags.bits())?.await;
+        let mut data = completion.data;
+        // On error the slot is released (and cleared) with `data`.
+        completion.meta.result?;
+        let addr = sockaddr_to_std(&data.addr.0);
+        let Some(slot) = data.slot.take() else {
+            return Err(io::Error::other("direct accept without a slot"));
+        };
+        let fd = SharedFd::new_direct(slot.claim());
+        let stream = TcpStream::from_direct(fd, addr.as_ref().ok().copied());
+        Ok((stream, addr?))
+    }
+
+    /// Put the listening socket into the runtime's fixed file table, so accepts name the slot
+    /// instead of the fd. See [`TcpStream::register_fixed`]; the fd stays open.
+    pub fn register_fixed(&self) -> io::Result<()> {
+        self.fd.register_fixed()
+    }
+
+    /// Whether the listening socket is in the fixed file table.
+    pub fn is_fixed(&self) -> bool {
+        self.fd.fixed_slot().is_some()
     }
 
     /// Returns the local address that this listener is bound to.
@@ -230,4 +254,36 @@ impl Drop for TcpListener {
 #[derive(Debug, Default, Clone)]
 struct ListenerMeta {
     local_addr: Option<SocketAddr>,
+}
+
+/// The address an accept wrote (`AF_INET` or `AF_INET6`), else `InvalidInput`.
+fn sockaddr_to_std(
+    storage: &std::mem::MaybeUninit<libc::sockaddr_storage>,
+) -> io::Result<SocketAddr> {
+    let storage = storage.as_ptr();
+    // Safety: the kernel wrote a socket address of the family it reports; the storage is large
+    // and aligned enough for any of them.
+    unsafe {
+        match (*storage).ss_family as _ {
+            AF_INET => {
+                let addr: &sockaddr_in = &*(storage as *const sockaddr_in);
+                let ip = Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes());
+                let port = u16::from_be(addr.sin_port);
+                Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+            }
+            AF_INET6 => {
+                let addr: &sockaddr_in6 = &*(storage as *const sockaddr_in6);
+                let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
+                let port = u16::from_be(addr.sin6_port);
+                let scope_id = addr.sin6_scope_id;
+                Ok(SocketAddr::V6(SocketAddrV6::new(
+                    ip,
+                    port,
+                    addr.sin6_flowinfo,
+                    scope_id,
+                )))
+            }
+            _ => Err(io::ErrorKind::InvalidInput.into()),
+        }
+    }
 }

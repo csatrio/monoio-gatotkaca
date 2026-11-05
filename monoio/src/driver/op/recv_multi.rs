@@ -7,7 +7,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use io_uring::{opcode, types};
+use io_uring::opcode;
 
 use super::{multishot::MultishotOp, Op, OpAble, OpKind};
 // For the net modules, which cannot reach `driver::buf_ring`.
@@ -15,7 +15,7 @@ pub(crate) use crate::driver::buf_ring::Bundle;
 use crate::{
     driver::{
         raw::{BufRing, Cqe, SelectedBuf},
-        shared_fd::SharedFd,
+        shared_fd::{sqe_fd, SharedFd},
     },
     io::stream::Stream,
 };
@@ -32,12 +32,12 @@ impl OpAble for RecvMulti {
     const KIND: OpKind = OpKind::Multishot;
 
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        let fd = types::Fd(self.fd.raw_fd());
-        if self.bundle {
-            opcode::RecvMultiBundle::new(fd, self.ring.group()).build()
+        let group = self.ring.group();
+        sqe_fd!(self.fd, |fd| if self.bundle {
+            opcode::RecvMultiBundle::new(fd, group).build()
         } else {
-            opcode::RecvMulti::new(fd, self.ring.group()).build()
-        }
+            opcode::RecvMulti::new(fd, group).build()
+        })
     }
 
     fn discard_cqe(&mut self, cqe: Cqe) {
@@ -227,7 +227,8 @@ pub(crate) struct RecvBundle {
 
 impl OpAble for RecvBundle {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        opcode::RecvBundle::new(types::Fd(self.fd.raw_fd()), self.ring.group()).build()
+        sqe_fd!(self.fd, |fd| opcode::RecvBundle::new(fd, self.ring.group())
+            .build())
     }
 }
 

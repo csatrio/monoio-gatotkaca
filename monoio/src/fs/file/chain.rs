@@ -1,11 +1,11 @@
 //! File → socket through one linked chain (read with `IO_LINK`, then send).
 
-use io_uring::{opcode, types};
+use io_uring::opcode;
 
 use super::File;
 use crate::{
     buf::IoBufMut,
-    driver::{raw::ChainOp, CURRENT},
+    driver::{raw::ChainOp, shared_fd::sqe_fd, CURRENT},
     net::TcpStream,
     BufResult,
 };
@@ -46,12 +46,12 @@ impl File {
             );
         };
         let ptr = buf.write_ptr();
-        let read = opcode::Read::new(types::Fd(self.fd.raw_fd()), ptr, len32)
+        let read = sqe_fd!(self.fd, |fd| opcode::Read::new(fd, ptr, len32)
             .offset(pos)
-            .build();
-        let send = opcode::Send::new(types::Fd(stream.shared_fd().raw_fd()), ptr, len32)
+            .build());
+        let send = sqe_fd!(stream.shared_fd(), |fd| opcode::Send::new(fd, ptr, len32)
             .flags(libc::MSG_NOSIGNAL | libc::MSG_WAITALL)
-            .build();
+            .build());
         // The chain owns both fds (kept open until it finished) and the buffer, whose memory
         // does not move with it (`IoBufMut` contract).
         let data = (self.fd.clone(), stream.shared_fd().clone(), buf);

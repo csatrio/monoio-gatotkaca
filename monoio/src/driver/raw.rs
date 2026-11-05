@@ -33,6 +33,7 @@ pub use super::fixed_buf::{
     FixedBuf, FixedBufPool, FixedBufStats, FixedIoBuf, FrozenFixedBuf, ReadFixedFuture,
     WriteFixedFuture,
 };
+pub use super::fixed_files::{fixed_file_stats, FixedFileStats};
 pub use super::msg_ring::{
     event_channel, msg_receiver, msg_ring, msg_ring_nowait, ring_handle, EventReceiver,
     EventSender, Mailbox, RingHandle,

@@ -36,6 +36,75 @@ impl TcpListener {
     }
 }
 
+impl TcpListener {
+    /// Start a multishot direct accept (Linux 5.19+): like [`accept_multi`](Self::accept_multi),
+    /// but every accepted socket goes straight into a slot of the fixed file table that the
+    /// kernel allocates (`IORING_FILE_INDEX_ALLOC`), and comes out as a direct-only
+    /// [`TcpStream`] (no fd, see [`TcpStream::is_direct`]).
+    ///
+    /// The kernel allocates from the slots reserved with
+    /// [`RuntimeBuilder::with_fixed_files_kernel_alloc`](crate::RuntimeBuilder::with_fixed_files_kernel_alloc);
+    /// without them this fails with `Unsupported`. When they are all taken the accept ends with
+    /// `ENFILE` (re-arm once streams were closed). The kernel reports no peer address, and a
+    /// direct-only stream can't ask for it: [`TcpStream::peer_addr`] fails on these streams.
+    ///
+    /// `flags` as in [`accept_with`](Self::accept_with), `CLOEXEC` is ignored.
+    pub fn accept_multi_direct(&self, flags: AcceptFlags) -> io::Result<DirectAcceptStream> {
+        AcceptMultiOp::new_direct(&self.fd, flags.bits()).map(|op| DirectAcceptStream { op })
+    }
+}
+
+/// Direct-only connections accepted by a multishot direct accept, see
+/// [`TcpListener::accept_multi_direct`].
+///
+/// Behaves like [`AcceptStream`] (queueing, cancel, drop closes the connections not taken, an
+/// error ends it), without peer addresses.
+#[must_use = "streams do nothing unless polled"]
+pub struct DirectAcceptStream {
+    op: AcceptMultiOp,
+}
+
+impl DirectAcceptStream {
+    /// Poll for the next connection.
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<TcpStream>>> {
+        let next = ready!(self.op.poll_next_fd(cx));
+        Poll::Ready(next.map(|fd| fd.map(TcpStream::from_shared_fd)))
+    }
+
+    /// The next connection. `None` once the accept ended (cancelled, or after an error that
+    /// ended it).
+    pub async fn next(&mut self) -> Option<io::Result<TcpStream>> {
+        std::future::poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// Stop accepting (AsyncCancel). Connections already accepted are still returned, then
+    /// `next` returns `None`.
+    pub fn cancel(&self) {
+        self.op.cancel()
+    }
+
+    /// Whether the accept ended (`next` returns `None` from now on).
+    pub fn is_finished(&self) -> bool {
+        self.op.is_finished()
+    }
+}
+
+impl Stream for DirectAcceptStream {
+    type Item = io::Result<TcpStream>;
+
+    async fn next(&mut self) -> Option<Self::Item> {
+        DirectAcceptStream::next(self).await
+    }
+}
+
+impl std::fmt::Debug for DirectAcceptStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectAcceptStream")
+            .field("finished", &self.is_finished())
+            .finish()
+    }
+}
+
 /// Connections accepted by a multishot accept, see [`TcpListener::accept_multi`].
 ///
 /// Connections the kernel accepted while nobody polls are queued (without bound). Dropping the

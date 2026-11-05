@@ -1,8 +1,9 @@
-use io_uring::{opcode, types};
+use io_uring::opcode;
 
 use super::{super::shared_fd::SharedFd, submit::SubmitResult, Completion, Op, OpAble};
 use crate::{
     buf::{IoBufMut, IoVecBufMut},
+    driver::shared_fd::sqe_fd,
     io::futures::BufOp,
     BufResult,
 };
@@ -64,13 +65,13 @@ impl<T: IoBufMut> OpAble for Read<T> {
         // Refers to https://docs.rs/io-uring/latest/io_uring/opcode/struct.Read.html.
         // If `offset` is set to `-1`, the offset will use (and advance) the file position, like
         // the read(2) syscall.
-        opcode::Read::new(
-            types::Fd(self.fd.raw_fd()),
+        sqe_fd!(self.fd, |fd| opcode::Read::new(
+            fd,
             self.buf.write_ptr(),
             self.buf.bytes_total() as _,
         )
         .offset(-1i64 as u64)
-        .build()
+        .build())
     }
 }
 
@@ -91,13 +92,13 @@ impl<T: IoBufMut> Op<ReadAt<T>> {
 
 impl<T: IoBufMut> OpAble for ReadAt<T> {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        opcode::Read::new(
-            types::Fd(self.fd.raw_fd()),
+        sqe_fd!(self.fd, |fd| opcode::Read::new(
+            fd,
             self.buf.write_ptr(),
             self.buf.bytes_total() as _,
         )
         .offset(self.offset)
-        .build()
+        .build())
     }
 }
 
@@ -123,8 +124,8 @@ impl<T: IoVecBufMut> OpAble for ReadVec<T> {
         // Refersto https://docs.rs/io-uring/latest/io_uring/opcode/struct.Readv.html.
         // If `offset` is set to `-1`, the offset will use (and advance) the file position, like
         // the readv(2) syscall.
-        opcode::Readv::new(types::Fd(self.fd.raw_fd()), ptr, len)
+        sqe_fd!(self.fd, |fd| opcode::Readv::new(fd, ptr, len)
             .offset(-1i64 as u64)
-            .build()
+            .build())
     }
 }

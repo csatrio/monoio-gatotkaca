@@ -5,6 +5,13 @@
 //! ([`Lifecycle::Completed`]); multishot ops queue their CQEs ([`MultiState`]). No CQE the kernel
 //! posts can make these state machines panic: unexpected ones are dropped (closing an fd they
 //! carry) and logged under the `debug` feature.
+//!
+//! Zero-copy sends can also be driven in two steps (`SendZcFuture`, then `ZcPending`): the send
+//! result is handed out with the first CQE ([`Ref::poll_zc_first`]) while the slot (and the op
+//! data with the buffer) stays until the notification CQE ([`Ref::poll_zc_notif`]).
+//!
+//! The data of a dropped op is kept in the slot ([`IgnoredData`]): inline when it fits, so
+//! dropping an in-flight op usually does not allocate.
 
 use std::{
     collections::VecDeque,
@@ -12,6 +19,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+use super::ignored::IgnoredData;
 use crate::{
     driver::{
         op::{CompletionMeta, MaybeFd, OpAble, OpKind},
@@ -32,7 +40,9 @@ enum Lifecycle {
 
     /// The submitter no longer has interest in the operation result. The state
     /// must be passed to the driver and held until the operation completes.
-    Ignored(Box<dyn std::any::Any>),
+    // Holds the op data alive; never read, only dropped.
+    #[allow(dead_code)]
+    Ignored(IgnoredData),
 
     /// The operation has completed.
     Completed(io::Result<MaybeFd>, u32),
@@ -48,7 +58,19 @@ enum Lifecycle {
     /// The future was dropped but the final CQE is still pending.
     // Holds the buffer alive; never read, only dropped.
     #[allow(dead_code)]
-    IgnoredMore(Box<dyn std::any::Any>),
+    IgnoredMore(IgnoredData),
+
+    /// Zero-copy, two-step: the submitter waits for the first CQE (the send result), not for
+    /// the notification.
+    WaitingFirst(Waker),
+
+    /// Zero-copy, two-step: the send result was handed out; waiting for the notification CQE
+    /// (the kernel releasing the buffer), with the waker of the `ZcPending` that polled.
+    AwaitNotif(Option<Waker>),
+
+    /// Zero-copy, two-step: the notification arrived after the result was handed out; the
+    /// `ZcPending` has not seen it yet.
+    Notified,
 
     /// A multishot operation.
     Multi(Box<MultiState>),
@@ -86,6 +108,22 @@ pub(crate) struct MaybeFdLifecycle {
     is_fd: bool,
     kind: OpKind,
     lifecycle: Lifecycle,
+}
+
+/// The first CQE of a zero-copy send, see [`Ref::poll_zc_first`].
+pub(crate) struct ZcFirst {
+    pub(crate) meta: CompletionMeta,
+    /// The slot is free: no notification follows (the send failed, or both CQEs were in).
+    pub(crate) done: bool,
+}
+
+/// What [`Ref::drop_op`] did with a dropped op.
+pub(crate) struct Dropped {
+    /// The kernel may still be running the op: an `AsyncCancel` may end it sooner.
+    #[cfg_attr(not(feature = "async-cancel"), allow(dead_code))]
+    pub(crate) cancel: bool,
+    /// The op data was kept in the slot: `Some(true)` inline, `Some(false)` boxed.
+    pub(crate) kept_inline: Option<bool>,
 }
 
 /// What [`Ref::complete`] leaves to the driver.
@@ -165,6 +203,19 @@ impl Ref<'_, MaybeFdLifecycle> {
         let lifecycle = &mut self.lifecycle;
         let mut wake = None;
         let next = match std::mem::replace(lifecycle, Lifecycle::Submitted) {
+            Lifecycle::WaitingFirst(waker) => {
+                // Two-step zero-copy: the result is what the submitter waits for.
+                wake = Some(waker);
+                Some(if more {
+                    Lifecycle::CompletedMore(result, flags)
+                } else {
+                    Lifecycle::Completed(result, flags)
+                })
+            }
+            Lifecycle::AwaitNotif(waker) if !more => {
+                wake = waker;
+                Some(Lifecycle::Notified)
+            }
             Lifecycle::Submitted if more => Some(Lifecycle::CompletedMore(result, flags)),
             Lifecycle::Submitted => Some(Lifecycle::Completed(result, flags)),
             Lifecycle::Waiting(waker) if more => {
@@ -243,10 +294,13 @@ impl Ref<'_, MaybeFdLifecycle> {
             }
             Lifecycle::Completed(..) => {}
             // Not reachable through `Op` (dropped ops are not polled, multishot ops are not
-            // `Op`s).
-            Lifecycle::Ignored(_) | Lifecycle::IgnoredMore(_) | Lifecycle::Multi(_) => {
-                return Poll::Pending
-            }
+            // `Op`s, two-step zero-copy sends use `poll_zc_*`).
+            Lifecycle::Ignored(_)
+            | Lifecycle::IgnoredMore(_)
+            | Lifecycle::Multi(_)
+            | Lifecycle::WaitingFirst(_)
+            | Lifecycle::AwaitNotif(_)
+            | Lifecycle::Notified => return Poll::Pending,
         }
 
         match self.remove().lifecycle {
@@ -255,34 +309,125 @@ impl Ref<'_, MaybeFdLifecycle> {
         }
     }
 
-    // return if the op must has been finished
-    pub(crate) fn drop_op<T: 'static>(mut self, data: &mut Option<T>) -> bool {
-        let boxed = |data: &mut Option<T>| -> Box<dyn std::any::Any> {
+    /// The `Op` of this slot is dropped. Frees the slot if the op is finished, else keeps
+    /// `data` in it until the final CQE.
+    pub(crate) fn drop_op<T: 'static>(mut self, data: &mut Option<T>) -> Dropped {
+        let mut kept_inline = None;
+        let mut keep = |data: &mut Option<T>| -> IgnoredData {
             match data.take() {
-                Some(data) => Box::new(data),
-                // () is a ZST, so it does not allocate
-                None => Box::new(()),
+                Some(data) => {
+                    kept_inline = Some(IgnoredData::fits::<T>());
+                    IgnoredData::new(data)
+                }
+                None => {
+                    kept_inline = Some(true);
+                    IgnoredData::empty()
+                }
             }
         };
         let ref_mut = &mut self.lifecycle;
-        match ref_mut {
-            Lifecycle::Submitted | Lifecycle::Waiting(_) => {
-                *ref_mut = Lifecycle::Ignored(boxed(data));
-                false
-            }
-            // Multi-CQE: still waiting for the final CQE, must keep the slot alive. Dropping the
-            // stored result closes a fd it carries.
-            Lifecycle::CompletedMore(_, _) | Lifecycle::WaitingMore(_, _, _) => {
-                *ref_mut = Lifecycle::IgnoredMore(boxed(data));
-                false
-            }
-            Lifecycle::Completed(..) => {
-                self.remove();
+        let cancel = match ref_mut {
+            Lifecycle::Submitted | Lifecycle::Waiting(_) | Lifecycle::WaitingFirst(_) => {
+                *ref_mut = Lifecycle::Ignored(keep(data));
                 true
             }
+            // Zero-copy: the send is done, only the notification (the kernel releasing the
+            // buffer) is still to come, so keep the slot and the buffer alive; a cancel could not
+            // speed that up. Dropping the stored result closes a fd it carries.
+            Lifecycle::CompletedMore(_, _)
+            | Lifecycle::WaitingMore(_, _, _)
+            | Lifecycle::AwaitNotif(_) => {
+                *ref_mut = Lifecycle::IgnoredMore(keep(data));
+                false
+            }
+            Lifecycle::Completed(..) | Lifecycle::Notified => {
+                self.remove();
+                false
+            }
             // Already dropped, or not an `Op`: nothing to do.
-            Lifecycle::Ignored(..) | Lifecycle::IgnoredMore(..) | Lifecycle::Multi(_) => true,
+            Lifecycle::Ignored(..) | Lifecycle::IgnoredMore(..) | Lifecycle::Multi(_) => false,
+        };
+        Dropped {
+            cancel,
+            kept_inline,
         }
+    }
+
+    /// Two-step zero-copy send: the result of the first CQE. When the notification is still to
+    /// come, the slot stays (owning nothing: the caller keeps the data) until
+    /// [`poll_zc_notif`](Self::poll_zc_notif) saw it; when it is not (`done`), the slot is freed.
+    pub(crate) fn poll_zc_first(mut self, cx: &mut Context<'_>) -> Poll<ZcFirst> {
+        let ref_mut = &mut self.lifecycle;
+        match ref_mut {
+            Lifecycle::WaitingFirst(waker) => {
+                if !waker.will_wake(cx.waker()) {
+                    *waker = cx.waker().clone();
+                }
+                return Poll::Pending;
+            }
+            Lifecycle::Submitted | Lifecycle::Waiting(_) => {
+                *ref_mut = Lifecycle::WaitingFirst(cx.waker().clone());
+                return Poll::Pending;
+            }
+            Lifecycle::CompletedMore(..) | Lifecycle::WaitingMore(..) => {
+                let (result, flags) = match std::mem::replace(ref_mut, Lifecycle::AwaitNotif(None))
+                {
+                    Lifecycle::CompletedMore(result, flags)
+                    | Lifecycle::WaitingMore(_, result, flags) => (result, flags),
+                    _ => unreachable!(),
+                };
+                return Poll::Ready(ZcFirst {
+                    meta: CompletionMeta { result, flags },
+                    done: false,
+                });
+            }
+            Lifecycle::Completed(..) => {}
+            // The result was taken already, or not a zero-copy `Op`: the futures never ask.
+            _ => {
+                return Poll::Ready(ZcFirst {
+                    meta: CompletionMeta {
+                        result: Err(io::Error::other("zero-copy result already taken")),
+                        flags: 0,
+                    },
+                    done: false,
+                })
+            }
+        }
+        match self.remove().lifecycle {
+            Lifecycle::Completed(result, flags) => Poll::Ready(ZcFirst {
+                meta: CompletionMeta { result, flags },
+                done: true,
+            }),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Two-step zero-copy send, after [`poll_zc_first`](Self::poll_zc_first): ready (and the
+    /// slot freed) once the notification CQE arrived.
+    pub(crate) fn poll_zc_notif(mut self, cx: &mut Context<'_>) -> Poll<()> {
+        match &mut self.lifecycle {
+            Lifecycle::AwaitNotif(waker) => {
+                match waker {
+                    Some(w) if w.will_wake(cx.waker()) => {}
+                    _ => *waker = Some(cx.waker().clone()),
+                }
+                Poll::Pending
+            }
+            Lifecycle::Notified | Lifecycle::Completed(..) => {
+                self.remove();
+                Poll::Ready(())
+            }
+            // Not reachable through the futures.
+            _ => Poll::Pending,
+        }
+    }
+
+    /// Two-step zero-copy send: whether the notification CQE arrived (without consuming it).
+    pub(crate) fn zc_released(&self) -> bool {
+        matches!(
+            self.lifecycle,
+            Lifecycle::Notified | Lifecycle::Completed(..)
+        )
     }
 
     /// Next CQE of a multishot op. `Ready(None)` once the final CQE was taken. Taking the final
@@ -496,8 +641,10 @@ mod tests {
         // Drop the op (future dropped before notification)
         let r = slab.get(key).unwrap();
         let mut data: Option<()> = Some(());
-        let finished = r.drop_op(&mut data);
-        assert!(!finished, "op not finished yet, notification pending");
+        let dropped = r.drop_op(&mut data);
+        assert!(dropped.kept_inline.is_some(), "notification pending");
+        // The send is done: nothing left to cancel.
+        assert!(!dropped.cancel);
 
         // Notification CQE arrives — should clean up the slot
         let r = slab.get(key).unwrap();
@@ -528,8 +675,10 @@ mod tests {
         // Drop the op
         let r = slab.get(key).unwrap();
         let mut data: Option<()> = Some(());
-        let finished = r.drop_op(&mut data);
-        assert!(!finished, "op not finished yet, notification pending");
+        let dropped = r.drop_op(&mut data);
+        assert!(dropped.kept_inline.is_some(), "notification pending");
+        // The send is done: nothing left to cancel.
+        assert!(!dropped.cancel);
 
         // Notification CQE arrives — should clean up the slot
         let r = slab.get(key).unwrap();
@@ -631,11 +780,152 @@ mod tests {
         let mut slab = Slab::new();
         let key = insert_lifecycle(&mut slab);
         let mut data = Some(vec![1u8]);
-        assert!(!slab.get(key).unwrap().drop_op(&mut data));
+        let dropped = slab.get(key).unwrap().drop_op(&mut data);
+        assert!(dropped.cancel);
+        assert_eq!(dropped.kept_inline, Some(true));
         assert!(data.is_none());
         let done = unsafe { slab.get(key).unwrap().complete(0, 0) };
         assert!(done.deferred.is_some());
         assert!(slab.get(key).is_none());
+    }
+
+    fn insert_zc(slab: &mut Slab<MaybeFdLifecycle>) -> usize {
+        slab.insert(MaybeFdLifecycle::new(false, OpKind::ZeroCopy))
+    }
+
+    /// Two-step zero-copy: the first CQE wakes and is handed out, then the notification wakes
+    /// the pending side and frees the slot.
+    #[test]
+    fn zc_two_step_result_then_release() {
+        let mut slab = Slab::new();
+        let key = insert_zc(&mut slab);
+        let (waker, woken) = flag_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(slab.get(key).unwrap().poll_zc_first(&mut cx).is_pending());
+        unsafe { slab.get(key).unwrap().complete(42, IORING_CQE_F_MORE) };
+        assert!(woken.swap(false, Ordering::SeqCst), "the result wakes");
+        match slab.get(key).unwrap().poll_zc_first(&mut cx) {
+            Poll::Ready(first) => {
+                assert_eq!(first.meta.result.unwrap().into_inner(), 42);
+                assert!(!first.done);
+            }
+            Poll::Pending => panic!("expected the result"),
+        }
+        assert!(!slab.get(key).unwrap().zc_released());
+        assert!(slab.get(key).unwrap().poll_zc_notif(&mut cx).is_pending());
+        // A stray F_MORE CQE changes nothing.
+        unsafe { slab.get(key).unwrap().complete(0, IORING_CQE_F_MORE) };
+        assert!(!woken.load(Ordering::SeqCst));
+        unsafe { slab.get(key).unwrap().complete(0, IORING_CQE_F_NOTIF) };
+        assert!(woken.load(Ordering::SeqCst), "the notification wakes");
+        assert!(slab.get(key).unwrap().zc_released());
+        assert!(slab.get(key).unwrap().poll_zc_notif(&mut cx).is_ready());
+        assert!(slab.get(key).is_none());
+    }
+
+    /// Both CQEs before the first poll, and a failed send without notification: the result
+    /// comes with `done`, and the slot is freed at once.
+    #[test]
+    fn zc_two_step_done_at_once() {
+        let mut slab = Slab::new();
+        let (waker, _woken) = flag_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let key = insert_zc(&mut slab);
+        unsafe { slab.get(key).unwrap().complete(7, IORING_CQE_F_MORE) };
+        unsafe { slab.get(key).unwrap().complete(0, IORING_CQE_F_NOTIF) };
+        match slab.get(key).unwrap().poll_zc_first(&mut cx) {
+            Poll::Ready(first) => {
+                assert_eq!(first.meta.result.unwrap().into_inner(), 7);
+                assert!(first.done);
+            }
+            Poll::Pending => panic!("expected the result"),
+        }
+        assert!(slab.get(key).is_none());
+
+        let key = insert_zc(&mut slab);
+        assert!(slab.get(key).unwrap().poll_zc_first(&mut cx).is_pending());
+        unsafe { slab.get(key).unwrap().complete(-libc::EPIPE, 0) };
+        match slab.get(key).unwrap().poll_zc_first(&mut cx) {
+            Poll::Ready(first) => {
+                assert_eq!(
+                    first.meta.result.unwrap_err().raw_os_error(),
+                    Some(libc::EPIPE)
+                );
+                assert!(first.done);
+            }
+            Poll::Pending => panic!("expected the result"),
+        }
+        assert!(slab.get(key).is_none());
+    }
+
+    /// Dropping the pending side keeps the data until the notification, without a cancel;
+    /// dropping it after the notification frees the slot at once; dropping before the result
+    /// asks for a cancel.
+    #[test]
+    fn zc_two_step_drops() {
+        let mut slab = Slab::new();
+        let (waker, _woken) = flag_waker();
+        let mut cx = Context::from_waker(&waker);
+        let count = std::rc::Rc::new(());
+
+        // Dropped while waiting for the notification.
+        let key = insert_zc(&mut slab);
+        unsafe { slab.get(key).unwrap().complete(1, IORING_CQE_F_MORE) };
+        assert!(slab.get(key).unwrap().poll_zc_first(&mut cx).is_ready());
+        let mut data = Some(count.clone());
+        let dropped = slab.get(key).unwrap().drop_op(&mut data);
+        assert!(!dropped.cancel);
+        assert_eq!(dropped.kept_inline, Some(true));
+        assert_eq!(std::rc::Rc::strong_count(&count), 2);
+        let done = unsafe { slab.get(key).unwrap().complete(0, IORING_CQE_F_NOTIF) };
+        assert!(slab.get(key).is_none());
+        drop(done);
+        assert_eq!(std::rc::Rc::strong_count(&count), 1);
+
+        // Dropped after the notification.
+        let key = insert_zc(&mut slab);
+        unsafe { slab.get(key).unwrap().complete(1, IORING_CQE_F_MORE) };
+        assert!(slab.get(key).unwrap().poll_zc_first(&mut cx).is_ready());
+        unsafe { slab.get(key).unwrap().complete(0, IORING_CQE_F_NOTIF) };
+        let mut data = Some(count.clone());
+        let dropped = slab.get(key).unwrap().drop_op(&mut data);
+        assert!(!dropped.cancel);
+        assert_eq!(dropped.kept_inline, None);
+        assert!(slab.get(key).is_none());
+
+        // Dropped before the result.
+        let key = insert_zc(&mut slab);
+        assert!(slab.get(key).unwrap().poll_zc_first(&mut cx).is_pending());
+        let dropped = slab.get(key).unwrap().drop_op(&mut data);
+        assert!(dropped.cancel);
+        unsafe { slab.get(key).unwrap().complete(-libc::ECANCELED, 0) };
+        assert!(slab.get(key).is_none());
+    }
+
+    /// Large op data is boxed, small data stays inline.
+    #[test]
+    fn ignored_inline_or_boxed() {
+        let mut slab = Slab::new();
+        let key = insert_lifecycle(&mut slab);
+        let mut data = Some([0u64; 32]);
+        let dropped = slab.get(key).unwrap().drop_op(&mut data);
+        assert_eq!(dropped.kept_inline, Some(false));
+        unsafe { slab.get(key).unwrap().complete(0, 0) };
+
+        let key = insert_lifecycle(&mut slab);
+        let mut none: Option<Vec<u8>> = None;
+        let dropped = slab.get(key).unwrap().drop_op(&mut none);
+        assert_eq!(dropped.kept_inline, Some(true));
+        unsafe { slab.get(key).unwrap().complete(0, 0) };
+        assert!(slab.get(key).is_none());
+    }
+
+    /// The slot size the inline data costs.
+    #[test]
+    fn lifecycle_size() {
+        assert!(std::mem::size_of::<MaybeFdLifecycle>() <= 72);
     }
 
     struct Counting(std::rc::Rc<std::cell::Cell<usize>>);

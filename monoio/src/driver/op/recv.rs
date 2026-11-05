@@ -4,7 +4,7 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
 };
 
-use io_uring::{opcode, types};
+use io_uring::opcode;
 use {
     crate::net::unix::SocketAddr as UnixSocketAddr,
     libc::{sockaddr_in, sockaddr_in6, sockaddr_storage, socklen_t, AF_INET, AF_INET6},
@@ -13,6 +13,7 @@ use {
 use super::{super::shared_fd::SharedFd, submit::SubmitResult, Completion, Op, OpAble};
 use crate::{
     buf::{IoBufMut, IoVecBufMut, IoVecMeta, MsgMeta},
+    driver::shared_fd::sqe_fd,
     io::futures::BufOp,
     BufResult,
 };
@@ -81,14 +82,14 @@ impl<T: IoBufMut> BufOp for Recv<T> {
 
 impl<T: IoBufMut> OpAble for Recv<T> {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        opcode::Recv::new(
-            types::Fd(self.fd.raw_fd()),
+        sqe_fd!(self.fd, |fd| opcode::Recv::new(
+            fd,
             self.buf.write_ptr(),
             self.buf.bytes_total() as _,
         )
         .flags(self.flags)
         .ioprio(self.ioprio)
-        .build()
+        .build())
     }
 }
 
@@ -166,7 +167,8 @@ impl<T: IoBufMut> Op<RecvMsg<T>> {
 
 impl<T: IoBufMut> OpAble for RecvMsg<T> {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        opcode::RecvMsg::new(types::Fd(self.fd.raw_fd()), &mut *self.info.2).build()
+        sqe_fd!(self.fd, |fd| opcode::RecvMsg::new(fd, &mut *self.info.2)
+            .build())
     }
 }
 
@@ -223,6 +225,10 @@ impl<T: IoBufMut> Op<RecvMsgUnix<T>> {
 
 impl<T: IoBufMut> OpAble for RecvMsgUnix<T> {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        opcode::RecvMsg::new(types::Fd(self.fd.raw_fd()), &mut self.info.2 as *mut _).build()
+        sqe_fd!(self.fd, |fd| opcode::RecvMsg::new(
+            fd,
+            &mut self.info.2 as *mut _
+        )
+        .build())
     }
 }

@@ -47,6 +47,24 @@ impl File {
     pub async fn metadata(&self) -> io::Result<Metadata> {
         metadata(self.fd.clone()).await
     }
+
+    /// Put the file into the runtime's fixed file table
+    /// ([`RuntimeBuilder::with_fixed_files`](crate::RuntimeBuilder::with_fixed_files)): every
+    /// op submitted from now on names the table slot (`IOSQE_FIXED_FILE`) instead of the fd,
+    /// which saves the kernel a file lookup and an atomic refcount pair per op.
+    ///
+    /// The fd stays open, so [`as_raw_fd`](AsRawFd::as_raw_fd) and
+    /// [`metadata`](Self::metadata) keep working. Closing or dropping the file closes the slot
+    /// and the fd. A no-op if the file already has a slot. Fails with `Unsupported` if the ring
+    /// has no fixed file table and with `ENFILE` if it is full.
+    pub fn register_fixed(&self) -> io::Result<()> {
+        self.fd.register_fixed()
+    }
+
+    /// Whether the file is in the fixed file table.
+    pub fn is_fixed(&self) -> bool {
+        self.fd.fixed_slot().is_some()
+    }
 }
 
 impl AsRawFd for File {

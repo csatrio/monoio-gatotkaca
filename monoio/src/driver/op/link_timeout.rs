@@ -7,11 +7,12 @@
 
 use std::{io, time::Duration};
 
-use io_uring::{opcode, types, types::Timespec};
+use io_uring::{opcode, types::Timespec};
 
 use super::{submit::SubmitResult, Completion, Op, OpAble, OpKind};
 use crate::{
     buf::{IoBuf, IoBufMut},
+    driver::shared_fd::sqe_fd,
     driver::{self, shared_fd::SharedFd, uring::UringInner, util::timespec},
     BufResult,
 };
@@ -71,12 +72,12 @@ pub(crate) struct Recv<T> {
 
 impl<T: IoBufMut> OpAble for Recv<T> {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        opcode::Recv::new(
-            types::Fd(self.fd.raw_fd()),
+        sqe_fd!(self.fd, |fd| opcode::Recv::new(
+            fd,
             self.buf.write_ptr(),
             self.buf.bytes_total() as _,
         )
-        .build()
+        .build())
     }
 }
 
@@ -89,13 +90,13 @@ pub(crate) struct Send<T> {
 
 impl<T: IoBuf> OpAble for Send<T> {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        opcode::Send::new(
-            types::Fd(self.fd.raw_fd()),
+        sqe_fd!(self.fd, |fd| opcode::Send::new(
+            fd,
             self.buf.read_ptr(),
             self.buf.bytes_init() as _,
         )
         .flags(libc::MSG_NOSIGNAL as _)
-        .build()
+        .build())
     }
 }
 

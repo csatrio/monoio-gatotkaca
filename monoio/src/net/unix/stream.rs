@@ -68,6 +68,18 @@ impl UnixStream {
         Ok(stream)
     }
 
+    /// Put the socket into the runtime's fixed file table, so every op submitted from now on
+    /// names the table slot instead of the fd. The fd stays open. See
+    /// [`TcpStream::register_fixed`](crate::net::TcpStream::register_fixed).
+    pub fn register_fixed(&self) -> io::Result<()> {
+        self.fd.register_fixed()
+    }
+
+    /// Whether the socket is in the fixed file table.
+    pub fn is_fixed(&self) -> bool {
+        self.fd.fixed_slot().is_some()
+    }
+
     /// Creates an unnamed pair of connected sockets.
     ///
     /// Returns two `UnixStream`s which are connected to each other.

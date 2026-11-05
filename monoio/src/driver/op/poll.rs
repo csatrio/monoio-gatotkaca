@@ -1,6 +1,7 @@
 use std::io;
 
 use super::{super::shared_fd::SharedFd, Op, OpAble};
+use crate::driver::shared_fd::sqe_fd;
 
 pub(crate) struct PollAdd {
     /// Holds a strong ref to the FD, preventing the file from being closed
@@ -33,16 +34,16 @@ impl Op<PollAdd> {
 
 impl OpAble for PollAdd {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        use io_uring::{opcode, types};
+        use io_uring::opcode;
 
-        opcode::PollAdd::new(
-            types::Fd(self.fd.raw_fd()),
+        sqe_fd!(self.fd, |fd| opcode::PollAdd::new(
+            fd,
             if self.is_read {
                 libc::POLLIN as _
             } else {
                 libc::POLLOUT as _
             },
         )
-        .build()
+        .build())
     }
 }

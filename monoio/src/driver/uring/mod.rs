@@ -10,8 +10,9 @@ use std::{
     time::Duration,
 };
 
-use io_uring::{opcode, squeue, types::Timespec, EnterFlags, IoUring};
+use io_uring::{opcode, squeue, types, types::Timespec, EnterFlags, IoUring};
 use lifecycle::MaybeFdLifecycle;
+pub(crate) use lifecycle::ZcFirst;
 
 use super::{
     op::{CompletionMeta, Op, OpAble, OpKind},
@@ -21,6 +22,7 @@ use super::{
 };
 use crate::utils::slab::Slab;
 
+mod ignored;
 mod lifecycle;
 #[cfg(feature = "sync")]
 mod waker;
@@ -44,8 +46,21 @@ const SETUP_DEFER_TASKRUN: u32 = 1 << 13;
 const REGISTER_RING_FDS: libc::c_uint = 20;
 const UNREGISTER_RING_FDS: libc::c_uint = 21;
 
+/// `IORING_CQE_F_NOTIF`: the notification CQE of a zero-copy send.
+const CQE_F_NOTIF: u32 = 1 << 3;
+
 /// How often a full SQ is flushed before pushing an SQE gives up.
 const PUSH_RETRIES: usize = 8;
+
+/// The file a cancel-by-fd targets.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+pub(crate) enum CancelTarget {
+    /// A plain file descriptor.
+    Fd(RawFd),
+    /// A slot of the ring's registered file table.
+    Fixed(u32),
+}
 
 /// Extra driver settings from the runtime builder.
 #[derive(Clone, Copy, Debug, Default)]
@@ -105,6 +120,19 @@ pub struct DriverStats {
     /// Link timeouts (`read_with_deadline`, `uring::submit_with_timeout`, ...) that fired and
     /// cancelled their operation.
     pub link_timeouts: u64,
+    /// Zero-copy sends submitted (`IORING_OP_SEND_ZC`, `IORING_OP_SENDMSG_ZC`) by the
+    /// `write_zc`/`send_zc*`/`send_vectored_zc` methods.
+    pub zc_sends: u64,
+    /// Zero-copy notification CQEs (`IORING_CQE_F_NOTIF`: the kernel released a buffer) of
+    /// the driver's own ops.
+    pub zc_notifs: u64,
+    /// Cancel-by-fd SQEs (`IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_ALL`) pushed by
+    /// `cancel_all`. Not included in `cancels_pushed`.
+    pub cancel_fd_pushed: u64,
+    /// In-flight ops dropped whose data was kept inline in the op slot (no allocation).
+    pub ignored_inline: u64,
+    /// In-flight ops dropped whose data was too large for the slot and was boxed.
+    pub ignored_boxed: u64,
 }
 
 impl Default for DriverStats {
@@ -126,6 +154,11 @@ impl Default for DriverStats {
             multishot_queue_high_water: 0,
             chains_submitted: 0,
             link_timeouts: 0,
+            zc_sends: 0,
+            zc_notifs: 0,
+            cancel_fd_pushed: 0,
+            ignored_inline: 0,
+            ignored_boxed: 0,
         }
     }
 }
@@ -575,6 +608,9 @@ impl UringInner {
                 EVENTFD_USERDATA => self.eventfd_installed = false,
                 // Operations of this driver: `user_data` is a slab index.
                 _ if index >> 62 == 0 => {
+                    if cqe.flags() & CQE_F_NOTIF != 0 {
+                        self.stats.zc_notifs += 1;
+                    }
                     // SAFETY: the CQE comes from the kernel for the op at `index`.
                     let done = unsafe { self.ops.complete(index as _, cqe.result(), cqe.flags()) };
                     if let Some(queued) = done.queued {
@@ -805,6 +841,9 @@ impl UringInner {
         }
         let opcode = (sqe.get_opcode() as usize).min(63);
         self.stats.ops_by_opcode[opcode] += 1;
+        if T::KIND == OpKind::ZeroCopy {
+            self.stats.zc_sends += 1;
+        }
 
         // The SQE is visible to the kernel once the tail is published. We don't enter now: the
         // runtime submits on `park` (or `submit`) when it waits for IO.
@@ -966,12 +1005,83 @@ impl UringInner {
             return;
         }
         if let Some(lifecycle) = inner.ops.slab.get(index) {
-            let _must_finished = lifecycle.drop_op(data);
+            let dropped = lifecycle.drop_op(data);
+            match dropped.kept_inline {
+                Some(true) => inner.stats.ignored_inline += 1,
+                Some(false) => inner.stats.ignored_boxed += 1,
+                None => {}
+            }
             #[cfg(feature = "async-cancel")]
-            if !_must_finished && !_skip_cancel {
+            if dropped.cancel && !_skip_cancel {
                 inner.push_cancel(index);
             }
         }
+    }
+
+    /// Two-step zero-copy send: the result of the first CQE, see `Ref::poll_zc_first`.
+    pub(crate) fn poll_zc_first(
+        this: &Rc<UnsafeCell<UringInner>>,
+        index: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<ZcFirst> {
+        let inner = unsafe { &mut *this.get() };
+        match inner.ops.slab.get(index) {
+            Some(slot) => slot.poll_zc_first(cx),
+            // Not reachable: the slot lives until the notification was seen.
+            None => Poll::Ready(ZcFirst {
+                meta: CompletionMeta {
+                    result: Err(io::Error::other("zero-copy op slot gone")),
+                    flags: 0,
+                },
+                done: true,
+            }),
+        }
+    }
+
+    /// Two-step zero-copy send: ready once the notification CQE arrived, see
+    /// `Ref::poll_zc_notif`.
+    pub(crate) fn poll_zc_notif(
+        this: &Rc<UnsafeCell<UringInner>>,
+        index: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<()> {
+        let inner = unsafe { &mut *this.get() };
+        match inner.ops.slab.get(index) {
+            Some(slot) => slot.poll_zc_notif(cx),
+            None => Poll::Ready(()),
+        }
+    }
+
+    /// Two-step zero-copy send: whether the notification arrived, see `Ref::zc_released`.
+    pub(crate) fn zc_released(this: &Rc<UnsafeCell<UringInner>>, index: usize) -> bool {
+        let inner = unsafe { &mut *this.get() };
+        match inner.ops.slab.get(index) {
+            Some(slot) => slot.zc_released(),
+            None => true,
+        }
+    }
+
+    /// Push one `AsyncCancel` matching every in-flight request on `target`
+    /// (`IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_ALL`, kernel 5.19+; older kernels fail
+    /// the cancel with `EINVAL`, which nobody sees). Errors if the SQ stayed full.
+    pub(crate) fn cancel_fd(
+        this: &Rc<UnsafeCell<UringInner>>,
+        target: CancelTarget,
+    ) -> io::Result<()> {
+        let inner = unsafe { &mut *this.get() };
+        inner.reserve_sqe()?;
+        let builder = match target {
+            CancelTarget::Fd(fd) => types::CancelBuilder::fd(types::Fd(fd)),
+            CancelTarget::Fixed(slot) => types::CancelBuilder::fd(types::Fixed(slot)),
+        };
+        let cancel = opcode::AsyncCancel2::new(builder.all())
+            .build()
+            .user_data(u64::MAX);
+        // Can't fail: `reserve_sqe` made room.
+        unsafe { inner.uring.submission().push(&cancel) }
+            .map_err(|_| io::Error::from_raw_os_error(libc::EBUSY))?;
+        inner.stats.cancel_fd_pushed += 1;
+        Ok(())
     }
 
     pub(crate) unsafe fn cancel_op(this: &Rc<UnsafeCell<UringInner>>, index: usize) {

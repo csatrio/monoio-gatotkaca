@@ -2,9 +2,10 @@
 
 use std::io;
 
-use io_uring::{opcode, types};
+use io_uring::opcode;
 
 use super::{super::shared_fd::SharedFd, Op, OpAble};
+use crate::driver::shared_fd::sqe_fd;
 
 /// A splice between two fds. An offset of `-1` means "use (and advance) the fd's own position";
 /// it must be `-1` for the pipe end.
@@ -59,14 +60,11 @@ impl Op<Splice> {
 impl OpAble for Splice {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
         const FLAG: u32 = libc::SPLICE_F_MOVE;
-        opcode::Splice::new(
-            types::Fd(self.fd_in.raw_fd()),
-            self.off_in,
-            types::Fd(self.fd_out.raw_fd()),
-            self.off_out,
-            self.len,
-        )
-        .flags(FLAG)
-        .build()
+        // Both ends may be fixed: the crate sets `SPLICE_F_FD_IN_FIXED` for `fd_in`.
+        sqe_fd!(self.fd_in, |fd_in| sqe_fd!(self.fd_out, |fd_out| {
+            opcode::Splice::new(fd_in, self.off_in, fd_out, self.off_out, self.len)
+                .flags(FLAG)
+                .build()
+        }))
     }
 }

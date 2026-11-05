@@ -61,4 +61,4 @@ One commit per wave on `main`, made after the wave's diffs are merged and the fu
 | 1 | done: F1, F2, F4, F7, A2, A6, A7, A9, A10, A15 rows 1–4. Also fixed: `IoVecMeta` iovec length and `consume` offset bugs, `read_vectored_exact` not setting init. Not done: A6 recv bundles (moved to W2-multishot). |
 | 2 | done: F3, A1, A8, A12; `submit_with_data` returns `data` on failure (no-op flush trick removed). Not done: recv bundles (need `BufRing::take_bundle`, moved to wave 3). |
 | 3 | done: A4, F5, A5, A11, A6 recv bundles. Notes: `send_fixed` uses `WRITE_FIXED` (kernel rejects fixed buffers on `SEND`); a short read breaks an `IO_LINK`, so read→send chains never send stale bytes; bundles track per-buffer links, not a consumer head. |
-| 4 | not started |
+| 4 | done: A3 (+ A2 `accept_direct`), A13, A14. Not done: coalescing dropped ops into one cancel-by-fd (it would also cancel ops that are still wanted); direct-only mode for Unix sockets and files. |

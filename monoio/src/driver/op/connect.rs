@@ -1,8 +1,9 @@
 use std::{io, net::SocketAddr};
 
-use io_uring::{opcode, types};
+use io_uring::opcode;
 
 use super::{super::shared_fd::SharedFd, Op, OpAble};
+use crate::driver::shared_fd::sqe_fd;
 
 pub(crate) struct Connect {
     pub(crate) fd: SharedFd,
@@ -28,12 +29,12 @@ impl Op<Connect> {
 
 impl OpAble for Connect {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        opcode::Connect::new(
-            types::Fd(self.fd.raw_fd()),
+        sqe_fd!(self.fd, |fd| opcode::Connect::new(
+            fd,
             self.socket_addr.as_ptr(),
             self.socket_addr_len,
         )
-        .build()
+        .build())
     }
 }
 
@@ -60,12 +61,12 @@ impl Op<ConnectUnix> {
 
 impl OpAble for ConnectUnix {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        opcode::Connect::new(
-            types::Fd(self.fd.raw_fd()),
+        sqe_fd!(self.fd, |fd| opcode::Connect::new(
+            fd,
             &self.socket_addr.0 as *const _ as *const _,
             self.socket_addr.1,
         )
-        .build()
+        .build())
     }
 }
 

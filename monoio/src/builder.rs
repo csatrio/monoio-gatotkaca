@@ -25,6 +25,9 @@ pub struct RuntimeBuilder<D> {
     // [bounded, unbounded] io-wq worker caps, see `iowq_max_workers`
     iowq_max_workers: Option<[u32; 2]>,
 
+    // [runtime, kernel] fixed file slots, see `with_fixed_files`
+    fixed_files: [u32; 2],
+
     // blocking handle
     #[cfg(feature = "sync")]
     blocking_handle: crate::blocking::BlockingHandle,
@@ -66,6 +69,7 @@ impl<T> RuntimeBuilder<T> {
             opts: DriverOptions::default(),
             task_budget: None,
             iowq_max_workers: None,
+            fixed_files: [0, 0],
 
             #[cfg(feature = "sync")]
             blocking_handle: crate::blocking::BlockingStrategy::ExecuteLocal.into(),
@@ -111,6 +115,10 @@ impl Buildable for IoUringDriver {
                 unsafe {
                     driver.with_ring(|ring| ring.submitter().register_iowq_max_workers(&mut max))
                 }?;
+            }
+            let [user, kernel] = this.fixed_files;
+            if user > 0 || kernel > 0 {
+                crate::driver::register_fixed_files(&driver, user, kernel)?;
             }
             #[cfg(feature = "sync")]
             let mut context = crate::runtime::Context::new(blocking_handle);
@@ -266,6 +274,44 @@ impl<D> RuntimeBuilder<D> {
         self
     }
 
+    /// Register a fixed file table with `n` slots handed out by the runtime when the ring is
+    /// built (`IORING_REGISTER_FILES2`, sparse, Linux 5.19+).
+    ///
+    /// A file in the table is named by its slot in every SQE (`IOSQE_FIXED_FILE`) instead of
+    /// its fd, which saves the kernel a file lookup and an atomic refcount pair per op. Put
+    /// sockets and files in with `register_fixed` ([`TcpStream`](crate::net::TcpStream),
+    /// [`TcpListener`](crate::net::TcpListener), [`UnixStream`](crate::net::UnixStream),
+    /// [`File`](crate::fs::File); the fd stays open), or accept connections straight into it
+    /// with [`TcpListener::accept_direct`](crate::net::TcpListener::accept_direct) (no fd at
+    /// all). A slot is freed when its file is closed. A full table fails those calls with
+    /// `ENFILE`; [`fixed_file_stats`](crate::uring::fixed_file_stats) reports the use.
+    ///
+    /// Off by default: without it nothing changes, every SQE names its fd. Each slot costs the
+    /// kernel a few bytes; the table size counts against `RLIMIT_NOFILE` (`EMFILE`). The table
+    /// belongs to the runtime: do not register or update files through
+    /// [`with_ring`](crate::uring::with_ring) on such a ring (`register_files` then fails with
+    /// `EBUSY` anyway). [`build`](RuntimeBuilder::build) returns the kernel's error if the
+    /// registration fails.
+    #[must_use]
+    pub fn with_fixed_files(mut self, n: u32) -> Self {
+        self.fixed_files[0] = n;
+        self
+    }
+
+    /// Add `n` slots to the fixed file table that the kernel allocates itself
+    /// (`IORING_FILE_INDEX_ALLOC`), for
+    /// [`TcpListener::accept_multi_direct`](crate::net::TcpListener::accept_multi_direct).
+    ///
+    /// They follow the [`with_fixed_files`](Self::with_fixed_files) slots, and the kernel is
+    /// restricted to them (`IORING_REGISTER_FILE_ALLOC_RANGE`, Linux 6.0+; `build` fails on
+    /// older kernels), so its allocations never collide with the runtime's. Can be used with
+    /// or without `with_fixed_files`. Off by default.
+    #[must_use]
+    pub fn with_fixed_files_kernel_alloc(mut self, n: u32) -> Self {
+        self.fixed_files[1] = n;
+        self
+    }
+
     /// Run at most `n` ready tasks (at least 1) before checking the driver for completions. The
     /// default is about twice the number of tasks queued at the start of the round.
     #[must_use]
@@ -297,6 +343,7 @@ where
             opts: this.opts,
             task_budget: this.task_budget,
             iowq_max_workers: this.iowq_max_workers,
+            fixed_files: this.fixed_files,
             #[cfg(feature = "sync")]
             blocking_handle: this.blocking_handle,
             _mark: PhantomData,
@@ -327,6 +374,7 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
             opts,
             task_budget,
             iowq_max_workers,
+            fixed_files,
             #[cfg(feature = "sync")]
             blocking_handle,
             ..
@@ -337,6 +385,7 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
             opts,
             task_budget,
             iowq_max_workers,
+            fixed_files,
             #[cfg(feature = "sync")]
             blocking_handle,
             _mark: PhantomData,

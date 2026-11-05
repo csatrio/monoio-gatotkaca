@@ -13,7 +13,10 @@ use {
 
 use crate::{
     buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut},
-    driver::{op::Op, shared_fd::SharedFd},
+    driver::{
+        op::Op,
+        shared_fd::{direct_only_error, SharedFd},
+    },
     io::{
         as_fd::{AsReadFd, AsWriteFd, SharedFdWrapper},
         futures::{ReadvFuture, RecvFuture, SendFuture, WritevFuture},
@@ -71,7 +74,7 @@ unsafe impl Split for TcpStream {}
 
 impl TcpStream {
     pub(crate) fn from_shared_fd(fd: SharedFd) -> Self {
-        let meta = StreamMeta::new(fd.raw_fd());
+        let meta = StreamMeta::new(&fd);
         #[cfg(feature = "zero-copy")]
         // enable SOCK_ZEROCOPY
         meta.set_zero_copy();
@@ -169,6 +172,63 @@ impl TcpStream {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// A direct-only stream (from [`TcpListener::accept_direct`]) with its peer address.
+    pub(crate) fn from_direct(fd: SharedFd, peer: Option<SocketAddr>) -> Self {
+        let stream = Self::from_shared_fd(fd);
+        // SAFETY: nothing else borrows the meta of a stream that was just created.
+        unsafe { &mut *stream.meta.meta.get() }.peer_addr = peer;
+        stream
+    }
+
+    /// Put the socket into the runtime's fixed file table
+    /// ([`RuntimeBuilder::with_fixed_files`](crate::RuntimeBuilder::with_fixed_files)): every
+    /// op submitted from now on names the table slot (`IOSQE_FIXED_FILE`) instead of the fd,
+    /// which saves the kernel a file lookup and an atomic refcount pair per op.
+    ///
+    /// The fd stays open, so everything that needs it ([`as_raw_fd`](AsRawFd::as_raw_fd),
+    /// [`set_nodelay`](Self::set_nodelay), [`peer_addr`](Self::peer_addr), ...) keeps working.
+    /// Dropping the stream closes the slot and the fd; the slot is reused once that close
+    /// completed. A no-op if the stream already has a slot.
+    ///
+    /// Fails with `Unsupported` if the ring has no fixed file table and with `ENFILE` if the
+    /// table is full. The slot belongs to the current thread's ring: keep using the stream on
+    /// that runtime.
+    pub fn register_fixed(&self) -> io::Result<()> {
+        self.fd.register_fixed()
+    }
+
+    /// Whether the socket is in the fixed file table (registered with
+    /// [`register_fixed`](Self::register_fixed), or accepted with
+    /// [`TcpListener::accept_direct`]).
+    ///
+    /// [`TcpListener::accept_direct`]: crate::net::TcpListener::accept_direct
+    pub fn is_fixed(&self) -> bool {
+        self.fd.fixed_slot().is_some()
+    }
+
+    /// The socket's slot in the fixed file table, for SQEs built by hand with
+    /// [`types::Fixed`](crate::uring::types::Fixed). `None` if it has none.
+    pub fn fixed_slot(&self) -> Option<u32> {
+        self.fd.fixed_slot()
+    }
+
+    /// Whether the socket exists only in the fixed file table, with no fd (accepted with
+    /// [`TcpListener::accept_direct`] or
+    /// [`accept_multi_direct`](crate::net::TcpListener::accept_multi_direct)).
+    ///
+    /// Such a stream supports all the IO ops and [`shutdown`](AsyncWriteRent::shutdown) (as
+    /// `IORING_OP_SHUTDOWN`). Everything that needs an fd fails with `Unsupported` instead:
+    /// [`local_addr`](Self::local_addr), [`nodelay`](Self::nodelay) and the other socket
+    /// options (set them on the listener, accepted sockets inherit them), and
+    /// [`peer_addr`](Self::peer_addr) unless the accept reported it.
+    /// [`as_raw_fd`](AsRawFd::as_raw_fd) returns `-1`, and
+    /// [`into_raw_fd`](IntoRawFd::into_raw_fd) panics.
+    ///
+    /// [`TcpListener::accept_direct`]: crate::net::TcpListener::accept_direct
+    pub fn is_direct(&self) -> bool {
+        self.fd.is_direct()
     }
 
     /// Wait for read readiness.
@@ -332,14 +392,20 @@ impl AsWriteFd for TcpStream {
 }
 
 impl IntoRawFd for TcpStream {
+    /// Returns the fd without closing it. A registered stream leaves the fixed file table.
+    ///
+    /// # Panics
+    /// Panics if the stream is direct-only ([`is_direct`](TcpStream::is_direct)): it has no fd.
     #[inline]
     fn into_raw_fd(self) -> RawFd {
+        assert!(!self.fd.is_direct(), "a direct-only TcpStream has no fd");
         self.fd
             .try_unwrap()
             .expect("unexpected multiple reference to rawfd")
     }
 }
 impl AsRawFd for TcpStream {
+    /// The socket's fd; `-1` for a direct-only stream ([`is_direct`](TcpStream::is_direct)).
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
         self.fd.raw_fd()
@@ -371,14 +437,7 @@ impl AsyncWriteRent for TcpStream {
     }
 
     fn shutdown(&mut self) -> impl Future<Output = std::io::Result<()>> {
-        // We could use shutdown op here, which requires kernel 5.11+.
-        // However, for simplicity, we just close the socket using direct syscall.
-        let fd = self.as_raw_fd();
-        let res = match unsafe { shutdown(fd, SHUT_WR) } {
-            -1 => Err(io::Error::last_os_error()),
-            _ => Ok(()),
-        };
-        std::future::ready(res)
+        shutdown_write(&self.fd)
     }
 }
 
@@ -430,14 +489,7 @@ impl CancelableAsyncWriteRent for TcpStream {
     }
 
     fn cancelable_shutdown(&mut self, _c: CancelHandle) -> impl Future<Output = io::Result<()>> {
-        // We could use shutdown op here, which requires kernel 5.11+.
-        // However, for simplicity, we just close the socket using direct syscall.
-        let fd = self.as_raw_fd();
-        let res = match unsafe { shutdown(fd, SHUT_WR) } {
-            -1 => Err(io::Error::last_os_error()),
-            _ => Ok(()),
-        };
-        std::future::ready(res)
+        shutdown_write(&self.fd)
     }
 }
 
@@ -497,7 +549,29 @@ impl CancelableAsyncReadRent for TcpStream {
     }
 }
 
+/// `shutdown(SHUT_WR)`: a direct syscall (no op needed), or `IORING_OP_SHUTDOWN` (5.11+) for a
+/// direct-only socket, which has no fd.
+fn shutdown_write(fd: &SharedFd) -> impl Future<Output = io::Result<()>> {
+    let now = if fd.is_direct() {
+        None
+    } else {
+        Some(match unsafe { shutdown(fd.raw_fd(), SHUT_WR) } {
+            -1 => Err(io::Error::last_os_error()),
+            _ => Ok(()),
+        })
+    };
+    let op = now.is_none().then(|| Op::shutdown(fd, SHUT_WR));
+    async move {
+        match (now, op) {
+            (Some(res), _) => res,
+            (None, Some(op)) => op?.result().await,
+            (None, None) => Ok(()),
+        }
+    }
+}
+
 struct StreamMeta {
+    // `None` for a direct-only socket (no fd).
     socket: Option<socket2::Socket>,
     meta: UnsafeCell<Meta>,
 }
@@ -509,11 +583,16 @@ struct Meta {
 }
 
 impl StreamMeta {
-    fn new(fd: RawFd) -> Self {
+    fn new(fd: &SharedFd) -> Self {
         Self {
-            socket: unsafe { Some(socket2::Socket::from_raw_fd(fd)) },
+            // SAFETY: the socket only borrows the fd, `Drop` gives it back without closing it.
+            socket: (!fd.is_direct()).then(|| unsafe { socket2::Socket::from_raw_fd(fd.raw_fd()) }),
             meta: Default::default(),
         }
+    }
+
+    fn socket(&self) -> io::Result<&socket2::Socket> {
+        self.socket.as_ref().ok_or_else(direct_only_error)
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -523,9 +602,7 @@ impl StreamMeta {
         }
 
         let ret = self
-            .socket
-            .as_ref()
-            .unwrap()
+            .socket()?
             .local_addr()
             .map(|addr| addr.as_socket().expect("tcp socket is expected"));
         if let Ok(addr) = ret {
@@ -541,9 +618,7 @@ impl StreamMeta {
         }
 
         let ret = self
-            .socket
-            .as_ref()
-            .unwrap()
+            .socket()?
             .peer_addr()
             .map(|addr| addr.as_socket().expect("tcp socket is expected"));
         if let Ok(addr) = ret {
@@ -553,11 +628,11 @@ impl StreamMeta {
     }
 
     fn no_delay(&self) -> io::Result<bool> {
-        self.socket.as_ref().unwrap().tcp_nodelay()
+        self.socket()?.tcp_nodelay()
     }
 
     fn set_no_delay(&self, no_delay: bool) -> io::Result<()> {
-        self.socket.as_ref().unwrap().set_tcp_nodelay(no_delay)
+        self.socket()?.set_tcp_nodelay(no_delay)
     }
 
     #[allow(unused_variables)]
@@ -577,13 +652,16 @@ impl StreamMeta {
         if let Some(retries) = retries {
             t = t.with_retries(retries)
         }
-        self.socket.as_ref().unwrap().set_tcp_keepalive(&t)
+        self.socket()?.set_tcp_keepalive(&t)
     }
 
     #[cfg(feature = "zero-copy")]
     fn set_zero_copy(&self) {
+        let Some(socket) = self.socket.as_ref() else {
+            return;
+        };
         unsafe {
-            let fd = self.socket.as_ref().unwrap().as_raw_fd();
+            let fd = socket.as_raw_fd();
             let v: libc::c_int = 1;
             libc::setsockopt(
                 fd,
@@ -598,7 +676,8 @@ impl StreamMeta {
 
 impl Drop for StreamMeta {
     fn drop(&mut self) {
-        let socket = self.socket.take().unwrap();
-        let _ = socket.into_raw_fd();
+        if let Some(socket) = self.socket.take() {
+            let _ = socket.into_raw_fd();
+        }
     }
 }

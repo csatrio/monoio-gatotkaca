@@ -13,6 +13,7 @@ pub(crate) mod write;
 
 mod accept;
 pub(crate) mod accept_multi;
+pub(crate) mod cancel_fd;
 mod connect;
 mod fadvise;
 pub(crate) mod fixed;
@@ -24,6 +25,8 @@ mod poll;
 pub(crate) mod recv;
 pub(crate) mod recv_multi;
 pub(crate) mod send;
+pub(crate) mod send_zc;
+pub(crate) mod shutdown;
 mod statx;
 mod submit;
 

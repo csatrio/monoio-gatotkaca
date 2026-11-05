@@ -2,7 +2,7 @@
 
 Fork: `/home/csatrio/rust-dev/monoio-gatotkaca` (branch `main`, head `8791c83`, published as `adaptif-gatotkaca-monoio` 0.5.0).
 Companion to [PIP.md](PIP.md). Item ids such as U4 or C1 refer to that document.
-Status: review of the source only. Nothing has been built or measured. Paths below are relative to the fork's `monoio/src/`.
+Status: written as a source review against `8791c83`; see "Implementation status" for what was built. Paths below are relative to the fork's `monoio/src/`.
 
 ## Summary
 
@@ -23,6 +23,36 @@ That is enough to *prototype* every io_uring item in the PIP, but not to build a
 6. **The TLS layer wastes syscalls.** Its 16 KiB staging buffer is smaller than one full TLS record, and it writes one record per `write`, so bulk TLS sends alternate 16 KiB and ~22-byte writes (A15). This only matters for runs that use TLS.
 
 Everything below should be **off by default** (a cargo feature or runtime opt-in), so the benchmark baseline (`async-cancel`, `bytes`, `utils`) does not change. **SQPOLL stays out.**
+
+## Implementation status (0.6.0)
+
+All items are implemented on `main` (waves 1–4 of [ROUND1-PLAN.md](ROUND1-PLAN.md)), each opt-in except the bug fixes. The baseline path (default builder, default features) builds the same SQEs as before. Nothing has been benchmarked yet; the numbers below come from tests.
+
+| Item | Status | Notes |
+|---|---|---|
+| F1 | done | Rent calls return `(Err, buf)`; `submit_with_data` hands the data back on failure |
+| F2, F4 | done | Bounded flush-and-retry, then `EBUSY`; lost cancels counted |
+| F3 | done | `OpAble::KIND`; no panic on unexpected CQEs |
+| F5 | done | `submit_chain` reserves room for the whole chain |
+| F6 | done | Opt-in `send_vectored` (`SendMsg` + `MSG_NOSIGNAL`); `writev` unchanged |
+| F7 | done | `defer_taskrun()` adds `taskrun_flag`; GETEVENTS forced on DEFER rings without it. Re-run the `defer` variant |
+| A1 | done | `submit_multishot`, `accept_multi`, `recv_multi` |
+| A2 | done | `accept_with(AcceptFlags)`, `accept_direct`. Correction: monoio never called `fcntl` on accepted sockets |
+| A3 | done | `with_fixed_files`, `register_fixed`, direct-only streams. Measured ~5–7% on single file reads; TCP ping-pong within noise on loopback |
+| A4 | done | `submit_chain`, link timeouts, `read_with_deadline`, `File::read_at_then_send`. A short read breaks an `IO_LINK`, so nothing stale is sent |
+| A5 | done | `FixedBufPool`, `FrozenFixedBuf`. `send_fixed` is `WRITE_FIXED`: the kernel rejects fixed buffers on plain `SEND` |
+| A6 | done | Batched publish, lazy page-aligned pool, INC, kernel ring, `IoBuf`, stats, bundles |
+| A7 | done | `send/recv_with_flags`, `recv_poll_first`, `IoVecArray` |
+| A8 | done | `monoio::io::futures` + `_op` methods; 0 allocations per round trip in steady state |
+| A9 | done | `IoUringDriver::stats()` |
+| A10 | done | Builder ring flags, `register_ring_fd`, `min_wait`, `skip_empty_enter`, `task_budget`, `cq_size` |
+| A11 | done | `msg_ring`, `RingHandle`, `Mailbox`, `event_channel` |
+| A12 | done | `fadvise`, file/pipe splice, `iowq_max_workers` |
+| A13 | done | `send_zc_early`, `send_zc_fixed`, `send_vectored_zc`, `send_auto` |
+| A14 | partly | `cancel_all` and inline ignored data (64 dropped recvs: 64 → 0 allocations). Not done: coalescing dropped ops into one cancel-by-fd, which would also cancel ops still wanted |
+| A15 | rows 1–4 | 64 KiB TLS write: 8 → 1 socket writes (rustls), 5 → 1 (native). Row 5 (rustls unbuffered API) not done |
+
+Also fixed along the way: `IoVecMeta` iovec length and `consume` offset after partial vectored IO, and `read_vectored_exact` not setting the init length.
 
 ## 1. Current state (inventory)
 

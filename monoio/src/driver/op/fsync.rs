@@ -3,6 +3,7 @@ use std::io;
 use io_uring::{opcode, types};
 
 use super::{super::shared_fd::SharedFd, Op, OpAble};
+use crate::driver::shared_fd::sqe_fd;
 
 pub(crate) struct Fsync {
     fd: SharedFd,
@@ -27,10 +28,11 @@ impl Op<Fsync> {
 
 impl OpAble for Fsync {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        let mut opc = opcode::Fsync::new(types::Fd(self.fd.raw_fd()));
-        if self.data_sync {
-            opc = opc.flags(types::FsyncFlags::DATASYNC)
-        }
-        opc.build()
+        let flags = if self.data_sync {
+            types::FsyncFlags::DATASYNC
+        } else {
+            types::FsyncFlags::empty()
+        };
+        sqe_fd!(self.fd, |fd| opcode::Fsync::new(fd).flags(flags).build())
     }
 }
