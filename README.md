@@ -20,7 +20,7 @@ For the design, feature flags and configuration, see [AGENTS.md](AGENTS.md).
 ## Quick start
 ```toml
 [dependencies]
-adaptif-gatotkaca-monoio = "0.5"
+adaptif-gatotkaca-monoio = "0.6"
 ```
 The library is still named `monoio`, so code says `use monoio::...` and `#[monoio::main]`.
 
