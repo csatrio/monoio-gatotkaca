@@ -1,14 +1,10 @@
 //! A channel from any thread into a runtime thread, without locks on the message path.
 //!
-//! - Messages live in nodes of an mmap'd [`arena`]; a sender takes a free node with one CAS.
-//! - The inbox is a Treiber stack (`adaptif-gatotkaca-utils`): a sender pushes with one CAS,
-//!   the receiver takes the whole batch with one swap and reverses it into send order.
-//! - The receiver returns the nodes of a batch to the free list with one CAS.
+//! - Messages go through an `LfQueue` (`driver::lf_queue`): one CAS to take a node, one CAS to
+//!   push it; the receiver takes a whole batch with one swap and returns its nodes with one CAS.
 //! - Wakeups: the receiver sets `armed` before it sleeps. A sender that sees it clears it and
 //!   rings once: through `MSG_RING` from a ring thread (see `driver::doorbell`), with an
 //!   eventfd write otherwise. A burst of messages costs one wakeup.
-
-mod arena;
 
 use std::{
     fmt,
@@ -16,27 +12,20 @@ use std::{
     io,
     marker::PhantomData,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    ptr,
     sync::{
-        atomic::{fence, AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+        atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     task::Poll,
 };
 
-use adaptif_gatotkaca_utils::{GkTreiberPtr, GkTreiberStackIterator, TreiberStackIterator};
-use arena::{Arena, Node};
 use crossbeam_utils::CachePadded;
 
 use super::super::{
     doorbell::{self, BellAddr, Doorbell},
+    lf_queue::{Consumer, LfQueue},
     raw::{self, opcode, types, RawOp},
 };
-
-/// Largest `max_capacity`.
-const LIMIT: u32 = 1 << 31;
-/// Nodes the receiver collects before returning them to the free list.
-const FREE_BATCH: u32 = 64;
 
 /// Create a channel from any thread to a runtime thread, with the default capacity (1024
 /// slots, growing to 131,072). See [`EventChannelBuilder`].
@@ -93,25 +82,12 @@ impl EventChannelBuilder {
     /// Create the channel. Fails with `InvalidInput` for a zero, too large or inverted
     /// capacity, and with the OS error if the first segment or the eventfd can't be created.
     pub fn build<T: Send + 'static>(self) -> io::Result<(EventSender<T>, EventReceiver<T>)> {
-        let invalid = |msg| io::Error::new(io::ErrorKind::InvalidInput, msg);
-        if self.initial == 0 || self.max == 0 {
-            return Err(invalid("event_channel: capacity must not be 0"));
-        }
-        if self.max > LIMIT {
-            return Err(invalid("event_channel: max_capacity above 2^31"));
-        }
-        let initial = self.initial.checked_next_power_of_two().unwrap_or(LIMIT);
-        if initial > self.max.next_power_of_two() {
-            return Err(invalid(
-                "event_channel: initial_capacity above max_capacity",
-            ));
-        }
-        let arena = Arena::new(initial.min(LIMIT / 2), self.max)?;
+        let queue = LfQueue::new(self.initial, self.max)
+            .map_err(|e| io::Error::new(e.kind(), format!("event_channel: {e}")))?;
         let fd = crate::syscall!(eventfd@RAW(0, libc::EFD_CLOEXEC))?;
         let shared = Arc::new(Shared {
-            inbox: CachePadded::new(AtomicPtr::new(ptr::null_mut())),
+            queue,
             armed: CachePadded::new(AtomicBool::new(false)),
-            arena,
             senders: AtomicUsize::new(1),
             receiver_alive: AtomicBool::new(true),
             // SAFETY: `fd` is a fresh fd we own.
@@ -121,8 +97,7 @@ impl EventChannelBuilder {
         });
         let receiver = EventReceiver {
             shared: shared.clone(),
-            batch: None,
-            freed: None,
+            consumer: Consumer::fifo(),
             read: None,
             buf: Some(Box::new([0; 8])),
             bell: None,
@@ -140,11 +115,9 @@ struct Counters {
 }
 
 struct Shared<T> {
-    /// Treiber stack of sent messages, newest first.
-    inbox: CachePadded<AtomicPtr<Node<T>>>,
+    queue: LfQueue<T>,
     /// The receiver found the inbox empty and waits for a wakeup.
     armed: CachePadded<AtomicBool>,
-    arena: Arena<T>,
     senders: AtomicUsize,
     receiver_alive: AtomicBool,
     /// Blocking (no EFD_NONBLOCK): io_uring would answer EAGAIN on a non-blocking eventfd
@@ -184,14 +157,6 @@ impl<T> Shared<T> {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
-    }
-}
-
-impl<T> Drop for Shared<T> {
-    fn drop(&mut self) {
-        // Drop the messages nobody received; the arena unmaps the memory afterwards.
-        let chain = self.inbox.reap_all();
-        drop(chain.reversed_iterator());
     }
 }
 
@@ -249,15 +214,10 @@ impl<T: Send> EventSender<T> {
         if !shared.receiver_alive.load(Ordering::Acquire) {
             return Err(SendError::Disconnected(value));
         }
-        let Some(node) = shared.arena.alloc() else {
+        if let Err(value) = shared.queue.push(value) {
             shared.counters.full.fetch_add(1, Ordering::Relaxed);
             return Err(SendError::Full(value));
-        };
-        // SAFETY: `alloc` gave us the node; it holds no value.
-        unsafe { node.write(value) };
-        shared
-            .inbox
-            .push_to_stack(node as *const Node<T> as *mut Node<T>);
+        }
         shared.wake_if_armed();
         Ok(())
     }
@@ -310,10 +270,8 @@ pub struct EventChannelStats {
 /// The receiving half of an [`event_channel`]. `!Send`: it lives on a runtime thread.
 pub struct EventReceiver<T: Send + 'static> {
     shared: Arc<Shared<T>>,
-    /// The batch taken from the inbox, in send order.
-    batch: Option<TreiberStackIterator<Node<T>>>,
-    /// Nodes received but not yet returned to the free list.
-    freed: Freed,
+    /// The batch being handed out, in send order.
+    consumer: Consumer<T>,
     /// The armed eventfd read. Kept across dropped `recv` futures, so a wakeup is never lost.
     read: Option<EventRead>,
     buf: Option<Box<[u8; 8]>>,
@@ -350,28 +308,15 @@ impl<T: Send + 'static> EventReceiver<T> {
     fn take(&mut self, arm: bool) -> Result<Option<T>, ()> {
         let shared = &*self.shared;
         loop {
-            if let Some(node) = self.batch.as_mut().and_then(Iterator::next) {
-                // SAFETY: the node came from the inbox: it holds a value and is ours now.
-                let node = unsafe { &*node };
-                let value = unsafe { node.take() };
-                free_later(&shared.arena, &mut self.freed, node.index());
+            if let Some(value) = self.consumer.pop(&shared.queue) {
                 return Ok(Some(value));
-            }
-            self.batch = None;
-            flush_freed(&shared.arena, &mut self.freed);
-
-            // Load first: swapping an empty head would still take the cache line from the
-            // senders.
-            if !shared.inbox.is_empty() {
-                self.batch = Some(shared.inbox.reap_all().iterator());
-                continue;
             }
             if !arm {
                 if shared.senders.load(Ordering::Acquire) != 0 {
                     return Err(());
                 }
                 // The last sender may have pushed just before it left: look again.
-                if shared.inbox.is_empty() {
+                if shared.queue.is_empty() {
                     return Ok(None);
                 }
                 continue;
@@ -382,10 +327,10 @@ impl<T: Send + 'static> EventReceiver<T> {
             // see its message (or its drop) below.
             fence(Ordering::SeqCst);
             let closed = shared.senders.load(Ordering::Relaxed) == 0;
-            if !shared.inbox.is_empty() || closed {
+            if !shared.queue.is_empty() || closed {
                 // A sender may still claim `armed` and wake us: a spurious wakeup at most.
                 shared.armed.store(false, Ordering::Relaxed);
-                if closed && shared.inbox.is_empty() {
+                if closed && shared.queue.is_empty() {
                     return Ok(None);
                 }
                 continue;
@@ -462,7 +407,7 @@ impl<T: Send + 'static> EventReceiver<T> {
             eventfd_wakeups: c.eventfd_wakeups.load(Ordering::Relaxed),
             ring_wakeups: c.ring_wakeups.load(Ordering::Relaxed),
             full: c.full.load(Ordering::Relaxed),
-            capacity: self.shared.arena.capacity(),
+            capacity: self.shared.queue.capacity(),
         }
     }
 
@@ -472,39 +417,14 @@ impl<T: Send + 'static> EventReceiver<T> {
     }
 }
 
-/// Nodes received but not yet returned to the free list: `(first, last, count)` of a chain.
-type Freed = Option<(u32, u32, u32)>;
-
-/// Queue `index` for return to the free list; return the chain once it is long enough.
-fn free_later<T>(arena: &Arena<T>, freed: &mut Freed, index: u32) {
-    *freed = Some(match *freed {
-        None => (index, index, 1),
-        Some((first, last, count)) => {
-            arena.link_free(index, first);
-            (index, last, count + 1)
-        }
-    });
-    if matches!(*freed, Some((_, _, n)) if n >= FREE_BATCH) {
-        flush_freed(arena, freed);
-    }
-}
-
-/// Return the queued nodes with one CAS.
-fn flush_freed<T>(arena: &Arena<T>, freed: &mut Freed) {
-    if let Some((first, last, _)) = freed.take() {
-        arena.free_chain(first, last);
-    }
-}
-
 impl<T: Send + 'static> Drop for EventReceiver<T> {
     fn drop(&mut self) {
         self.shared.receiver_alive.store(false, Ordering::Release);
         self.shared.armed.store(false, Ordering::Relaxed);
         *self.shared.bell.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        // Messages of the current batch are dropped with it; nodes go back to the arena,
-        // which the channel frees once the senders are gone too.
-        self.batch = None;
-        flush_freed(&self.shared.arena, &mut self.freed);
+        // Messages of the current batch are dropped with it; the queue frees the rest once the
+        // senders are gone too.
+        self.consumer.clear(&self.shared.queue);
         // Complete the armed read now, rather than leaving it in the ring (or cancelling it).
         if self.read.is_some() {
             doorbell::write_eventfd(&self.shared.efd);

@@ -176,15 +176,13 @@ where
                 let waker = unsafe { Waker::from_raw(waker) };
                 crate::runtime::CURRENT.try_with(|maybe_ctx| match maybe_ctx {
                     Some(ctx) => {
-                        ctx.send_waker(owner_id, waker);
-                        ctx.unpark_thread(owner_id);
+                        ctx.remote_wake(owner_id, waker);
                     }
                     None => {
                         let _ = crate::runtime::DEFAULT_CTX.try_with(|default_ctx| {
                             crate::runtime::CURRENT.set(default_ctx, || {
                                 crate::runtime::CURRENT.with(|ctx| {
-                                    ctx.send_waker(owner_id, waker);
-                                    ctx.unpark_thread(owner_id);
+                                    ctx.remote_wake(owner_id, waker);
                                 });
                             });
                         });
@@ -233,15 +231,13 @@ where
                 self.header().state.ref_inc();
                 crate::runtime::CURRENT.try_with(|maybe_ctx| match maybe_ctx {
                     Some(ctx) => {
-                        ctx.send_waker(owner_id, waker);
-                        ctx.unpark_thread(owner_id);
+                        ctx.remote_wake(owner_id, waker);
                     }
                     None => {
                         let _ = crate::runtime::DEFAULT_CTX.try_with(|default_ctx| {
                             crate::runtime::CURRENT.set(default_ctx, || {
                                 crate::runtime::CURRENT.with(|ctx| {
-                                    ctx.send_waker(owner_id, waker);
-                                    ctx.unpark_thread(owner_id);
+                                    ctx.remote_wake(owner_id, waker);
                                 });
                             });
                         });

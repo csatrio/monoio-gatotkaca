@@ -1,4 +1,4 @@
-//! Message nodes for `event_channel`: mmap'd segments, a tagged-index free list and a bump
+//! Nodes of an `LfQueue`: mmap'd segments, a tagged-index free list and a bump
 //! index.
 //!
 //! Segment `k` holds `base << k` nodes (the last one capped at `max`), so node `i` lives in

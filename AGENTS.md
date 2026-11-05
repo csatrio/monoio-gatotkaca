@@ -85,7 +85,7 @@ Default: `async-cancel`, `bytes`, `macros`, `utils`.
 | `bytes` (default) | `IoBuf`/`IoBufMut` impls for the `bytes` crate types. |
 | `macros` (default) | `#[monoio::main]`, `#[monoio::test]`, `#[monoio::test_all]`. |
 | `utils` (default) | `utils::bind_to_cpu_set` (thread CPU affinity; pulls in `nix`). |
-| `sync` | Allow wakers to be used across threads (cross-thread `await`), and enable `spawn_blocking` and `RuntimeBuilder::attach_thread_pool`/`with_blocking_strategy`. Pulls in `flume`, `threadpool`, `once_cell`. Avoid on the hot path. |
+| `sync` | Allow wakers to be used across threads (cross-thread `await`), and enable `spawn_blocking` and `RuntimeBuilder::attach_thread_pool`/`with_blocking_strategy`. Pulls in `threadpool` and `once_cell`. A waker woken on another thread goes through a lock-free queue of its runtime (the same queue as `event_channel`), drained when the runtime parks. Avoid on the hot path. |
 | `signal` | Enable `utils::CtrlC` (Ctrl-C handler). Implies `sync`. |
 | `signal-termination` | `signal` plus SIGTERM/SIGHUP handling (`ctrlc/termination`). |
 | `zero-copy` | Set `SOCK_ZEROCOPY` on sockets and `MSG_ZEROCOPY` on sends. Fewer copies, but can degrade performance and was unstable in testing; stress test first. |

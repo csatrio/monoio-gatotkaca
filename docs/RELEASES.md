@@ -2,6 +2,12 @@
 
 Releases of `adaptif-gatotkaca-monoio` (library name `monoio`), newest first. The fork starts from upstream [Monoio](https://github.com/bytedance/monoio) 0.2.4 (`8675e94`). Open work is in [TODO.md](TODO.md).
 
+## Unreleased
+- Remote wakes (feature `sync`): a waker woken on another thread now goes through the lock-free queue behind `event_channel` (moved to `driver::lf_queue`) instead of a `flume` channel. `flume` and `rustc-hash` are no longer dependencies.
+- The remote-waker queue is drained without reversing each batch (wake order doesn't matter); `event_channel` keeps send order.
+- The per-thread cache of other runtimes' queues checks the last one used first; registries use `FastU64Map` from `adaptif-gatotkaca-utils` (0.11.2, whose iterators no longer use an atomic swap per node).
+- Measured (256 tasks woken from 1 or 4 threads, release, 12 cores): 4.5–6.9 M wakes/s with 1 producer and 4.2–4.9 with 4, against 4.6–6.5 and 4.0–4.8 with `flume`; ping-pong latency unchanged (~9.2 µs). The owner runtime spends 8.6% of its time draining wakers, against ~14% with `flume` and its lock.
+
 ## 0.7.0 (2026-11-06)
 Lock-free `uring::event_channel`. Breaking: the send error type and the minimum Rust version changed. Commit `3f8e7f0`.
 

@@ -294,7 +294,11 @@ pub(crate) struct UringInner {
 
     // Waker receiver
     #[cfg(feature = "sync")]
-    waker_receiver: flume::Receiver<std::task::Waker>,
+    waker_queue: super::thread::WakerQueue,
+
+    // Drains `waker_queue`
+    #[cfg(feature = "sync")]
+    waker_consumer: super::lf_queue::Consumer<std::task::Waker>,
 
     // Uring support ext_arg
     ext_arg: bool,
@@ -365,7 +369,9 @@ impl IoUringDriver {
             }
         };
 
-        let (waker_sender, waker_receiver) = flume::unbounded::<std::task::Waker>();
+        // Effectively unbounded: slots are mapped (and faulted in) only as needed.
+        let waker_queue =
+            std::sync::Arc::new(super::lf_queue::LfQueue::new(1024, super::lf_queue::LIMIT)?);
 
         let inner = Rc::new(UnsafeCell::new(UringInner {
             ops: Ops::new(),
@@ -376,7 +382,9 @@ impl IoUringDriver {
             shared_waker: std::sync::Arc::new(waker::EventWaker::new(waker)),
             eventfd_installed: false,
             eventfd_read_dst: [0_u8; 8],
-            waker_receiver,
+            waker_queue: waker_queue.clone(),
+            // Wake order does not matter: skip reversing each batch.
+            waker_consumer: super::lf_queue::Consumer::unordered(),
             external: Default::default(),
             stats: DriverStats::default(),
             deferred: Vec::new(),
@@ -388,7 +396,7 @@ impl IoUringDriver {
 
         // Register unpark handle
         super::thread::register_unpark_handle(thread_id, driver.unpark());
-        super::thread::register_waker_sender(thread_id, waker_sender);
+        super::thread::register_waker_sender(thread_id, waker_queue);
         Ok(driver)
     }
 
@@ -461,7 +469,7 @@ impl IoUringDriver {
         #[cfg(feature = "sync")]
         {
             // Process foreign wakers
-            while let Ok(w) = inner.waker_receiver.try_recv() {
+            while let Some(w) = inner.waker_consumer.pop(&inner.waker_queue) {
                 w.wake();
                 need_wait = false;
             }
@@ -472,10 +480,13 @@ impl IoUringDriver {
                     .shared_waker
                     .awake
                     .store(false, std::sync::atomic::Ordering::Release);
+                // Pairs with the fence in `Context::remote_wake`: either the waking thread sees
+                // `awake == false` and writes the eventfd, or the drain below sees its waker.
+                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
             }
 
             // Process foreign wakers left
-            while let Ok(w) = inner.waker_receiver.try_recv() {
+            while let Some(w) = inner.waker_consumer.pop(&inner.waker_queue) {
                 w.wake();
                 need_wait = false;
             }

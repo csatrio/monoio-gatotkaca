@@ -9,6 +9,7 @@ mod chain;
 pub(crate) mod doorbell;
 mod fixed_buf;
 pub(crate) mod fixed_files;
+pub(crate) mod lf_queue;
 mod msg_ring;
 pub mod raw;
 mod uring;

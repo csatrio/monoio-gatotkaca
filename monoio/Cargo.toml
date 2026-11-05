@@ -17,19 +17,17 @@ name = "monoio"
 # common dependencies
 [dependencies]
 # Lock-free Treiber stack, cache padding and CAS backoff for `uring::event_channel`.
-adaptif-gatotkaca-utils = "0.11.1"
+adaptif-gatotkaca-utils = "0.11.2"
 crossbeam-utils = "0.8"
 monoio-macros = { workspace = true, optional = true }
 
 auto-const-array = "0.2.2"
-rustc-hash = "2.1.3"
 libc = "0.2.191"
 pin-project-lite = "0.2.17"
 socket2 = { version = "0.6.5", features = ["all"] }
 memchr = "2.8.3"
 
 bytes = { version = "1.12.1", optional = true }
-flume = { version = "0.12.0", optional = true }
 threadpool = { version = "1.8.1", optional = true }
 tracing = { version = "0.1.44", default-features = false, features = [
     "std",
@@ -74,7 +72,7 @@ symlinkat = []
 # enable `async main` macros support
 macros = ["monoio-macros"]
 # allow waker to be sent across threads
-sync = ["flume", "threadpool", "once_cell"]
+sync = ["threadpool", "once_cell"]
 # enable bind cpu set
 utils = ["nix"]
 # enable debug if you want to know what runtime does

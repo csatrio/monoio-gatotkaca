@@ -15,8 +15,7 @@ use crate::{
 thread_local! {
     pub(crate) static DEFAULT_CTX: Context = Context {
         thread_id: crate::utils::thread_id::DEFAULT_THREAD_ID,
-        unpark_cache: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
-        waker_sender_cache: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
+        remote_targets: Default::default(),
         tasks: Default::default(),
         time_handle: None,
         blocking_handle: crate::blocking::BlockingHandle::Empty(crate::blocking::BlockingStrategy::Panic),
@@ -33,15 +32,9 @@ pub(crate) struct Context {
     /// Thread id(not the kernel thread id but a generated unique number)
     pub(crate) thread_id: usize,
 
-    /// Thread unpark handles
+    /// Remote-waker queues and unpark handles of other runtimes this thread woke tasks of.
     #[cfg(feature = "sync")]
-    pub(crate) unpark_cache:
-        std::cell::RefCell<rustc_hash::FxHashMap<usize, crate::driver::UnparkHandle>>,
-
-    /// Waker sender cache
-    #[cfg(feature = "sync")]
-    pub(crate) waker_sender_cache:
-        std::cell::RefCell<rustc_hash::FxHashMap<usize, flume::Sender<std::task::Waker>>>,
+    pub(crate) remote_targets: std::cell::RefCell<RemoteTargets>,
 
     /// Time Handle
     pub(crate) time_handle: Option<TimeHandle>,
@@ -61,8 +54,7 @@ impl Context {
 
         Self {
             thread_id,
-            unpark_cache: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
-            waker_sender_cache: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
+            remote_targets: Default::default(),
             tasks: TaskQueue::default(),
             time_handle: None,
             blocking_handle,
@@ -82,35 +74,63 @@ impl Context {
         }
     }
 
+    /// Hand `waker` (of a task owned by runtime `id`) to its runtime and wake it if it sleeps.
+    /// The waker is dropped if that runtime is gone.
     #[cfg(feature = "sync")]
-    pub(crate) fn unpark_thread(&self, id: usize) {
-        use crate::driver::{thread::get_unpark_handle, unpark::Unpark};
-        if let Some(handle) = self.unpark_cache.borrow().get(&id) {
-            let _ = handle.unpark();
+    pub(crate) fn remote_wake(&self, id: usize, mut waker: std::task::Waker) {
+        use crate::driver::unpark::Unpark;
+        let mut targets = self.remote_targets.borrow_mut();
+        let Some(target) = targets.get(id) else {
             return;
+        };
+        // The queue only fills at 2^31 wakers; back off rather than lose a wakeup.
+        while let Err(w) = target.queue.push(waker) {
+            waker = w;
+            std::thread::yield_now();
         }
-
-        if let Some(v) = get_unpark_handle(id) {
-            // Write back to local cache
-            let w = v.clone();
-            self.unpark_cache.borrow_mut().insert(id, w);
-            let _ = v.unpark();
-        }
+        // Pairs with the fence in the driver's park: either we see it is going to sleep, or it
+        // sees our waker when it drains again.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        let _ = target.unpark.unpark();
     }
+}
 
-    #[cfg(feature = "sync")]
-    pub(crate) fn send_waker(&self, id: usize, w: std::task::Waker) {
-        use crate::driver::thread::get_waker_sender;
-        if let Some(sender) = self.waker_sender_cache.borrow().get(&id) {
-            let _ = sender.send(w);
-            return;
-        }
+/// Where to send wakers of another runtime's tasks.
+#[cfg(feature = "sync")]
+#[derive(Clone)]
+pub(crate) struct RemoteTarget {
+    queue: crate::driver::thread::WakerQueue,
+    unpark: crate::driver::UnparkHandle,
+}
 
-        if let Some(s) = get_waker_sender(id) {
-            // Write back to local cache
-            let _ = s.send(w);
-            self.waker_sender_cache.borrow_mut().insert(id, s);
+/// Per-thread cache of [`RemoteTarget`]s, with the last one used checked first.
+#[cfg(feature = "sync")]
+#[derive(Default)]
+pub(crate) struct RemoteTargets {
+    last: Option<(usize, RemoteTarget)>,
+    map: adaptif_gatotkaca_utils::FastU64Map<RemoteTarget>,
+}
+
+#[cfg(feature = "sync")]
+impl RemoteTargets {
+    fn get(&mut self, id: usize) -> Option<&RemoteTarget> {
+        if self.last.as_ref().is_some_and(|(last, _)| *last == id) {
+            return self.last.as_ref().map(|(_, t)| t);
         }
+        let target = match self.map.get(&(id as u64)) {
+            Some(t) => t.clone(),
+            None => {
+                use crate::driver::thread::{get_unpark_handle, get_waker_sender};
+                let target = RemoteTarget {
+                    queue: get_waker_sender(id)?,
+                    unpark: get_unpark_handle(id)?,
+                };
+                self.map.insert(id as u64, target.clone());
+                target
+            }
+        };
+        self.last = Some((id, target));
+        self.last.as_ref().map(|(_, t)| t)
     }
 }
 
