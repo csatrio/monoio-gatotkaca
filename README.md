@@ -81,6 +81,12 @@ cargo test -p adaptif-gatotkaca-monoio
 cargo run -p monoio-examples --example echo
 ```
 
+## Documentation
+- [AGENTS.md](AGENTS.md): design, APIs, feature flags and configuration.
+- [docs/RELEASES.md](docs/RELEASES.md): what each release changed.
+- [docs/TODO.md](docs/TODO.md): open work and known limits.
+- [docs/performance-improvement/](docs/performance-improvement/): the performance rounds, with the spec ([ROUND1.md](docs/performance-improvement/ROUND1.md)) and the work plan ([ROUND1-PLAN.md](docs/performance-improvement/ROUND1-PLAN.md)).
+
 ## Related projects
 - [local-sync](https://github.com/monoio-rs/local-sync): thread-local channels.
 - [monoio-tls](https://github.com/monoio-rs/monoio-tls): TLS wrapper.
