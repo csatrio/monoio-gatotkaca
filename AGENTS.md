@@ -37,7 +37,7 @@ Monoio (published as `adaptif-gatotkaca-monoio`, library name `monoio`): a strip
 ## Runtime configuration
 Via builder or macro: `RuntimeBuilder::<IoUringDriver>::new().with_entries(n).enable_timer().build()`, or `#[monoio::main(entries = n, timer_enabled = true, worker_threads = n)]`.
 
-- `entries`: io_uring ring size. Default 1024, minimum 256 (smaller values are raised to 256), 0 is a macro error. Larger rings mean fewer submits and more memory. It also sets the initial inflight-op cache (`10 * entries`).
+- `entries`: io_uring ring size. Default 1024, minimum 256 (smaller values are raised to 256), 0 is a macro error. Larger rings mean fewer submits and more memory. The completion queue gets the kernel default of `2 * entries`; with multishot ops (many CQEs per SQE), raise it through `uring_builder(..)` with `setup_cqsize(n)` to avoid CQ overflow. The in-flight op table is not pre-sized: it grows in pages as ops are submitted.
 - `enable_timer` / `timer_enabled`: off by default. `monoio::time::{sleep, interval, ...}` panics unless it is on. `std::time` is unaffected. `enable_all()` is also available.
 - `worker_threads` (aliases `workers`, `threads`): default 1. With `n`, the macro starts `n-1` extra threads, each with its own runtime, plus the main thread. For CPU pinning or other per-thread setup, create threads and runtimes yourself (see `utils::bind_to_cpu_set`).
 - `uring_builder(io_uring::Builder)`: tune the raw io_uring settings.
