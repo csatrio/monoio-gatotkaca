@@ -1,6 +1,6 @@
 # TODO
 
-What is still open after 0.6.0. Item ids (A1, F7, ...) refer to [performance-improvement/ROUND1.md](performance-improvement/ROUND1.md).
+What is still open after 0.7.0. Item ids (A1, F7, ...) refer to [performance-improvement/ROUND1.md](performance-improvement/ROUND1.md).
 
 ## Measure first
 Everything in round 1 was checked by tests only. Nothing has been benchmarked.

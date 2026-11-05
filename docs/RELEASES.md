@@ -2,6 +2,30 @@
 
 Releases of `adaptif-gatotkaca-monoio` (library name `monoio`), newest first. The fork starts from upstream [Monoio](https://github.com/bytedance/monoio) 0.2.4 (`8675e94`). Open work is in [TODO.md](TODO.md).
 
+## 0.7.0 (2026-11-06)
+Lock-free `uring::event_channel`. Breaking: the send error type and the minimum Rust version changed. Commit `3f8e7f0`.
+
+**Breaking**
+- `EventSender::send` returns `Result<(), SendError<T>>`: `SendError::Full(v)` when the channel is at capacity, `SendError::Disconnected(v)` when the receiver is gone (was `Result<(), T>`).
+- Minimum Rust version is 1.85 (was 1.75): the new `adaptif-gatotkaca-utils` dependency uses edition 2024.
+- `EventReceiver::try_recv` no longer arms a wakeup, so senders pay no syscall for a receiver that only polls.
+
+**event_channel**
+- Messages live in nodes of mmap'd segments that double in size: `EventChannelBuilder` (default 1024 slots, up to 131,072; max 2^31). Pages are faulted in on first use.
+- Free nodes come from a tagged-index free list (ABA-safe CAS pop); the receiver returns them in batches with one CAS.
+- The inbox is the Treiber stack of `adaptif-gatotkaca-utils` 0.11.1: one CAS per send, one swap per received batch, with cache padding and CAS backoff from `crossbeam-utils`.
+- Wakeups only when the receiver waits: `MSG_RING` from ring threads through a new driver doorbell (rung directly on the receiver's own ring, eventfd fallback if the `MSG_RING` fails), an eventfd write from other threads.
+- The receiver's runtime thread never blocks on a lock held by a sender.
+- `EventReceiver::stats()`: eventfd and ring wakeups, `Full` errors, mapped capacity.
+
+**Measured** (1M `u64` messages into one receiver, release build, 12 cores, three runs of best-of-5; a throwaway test, see [TODO.md](TODO.md)):
+
+| Producers | 0.6.0 mutex | 0.7.0 lock-free |
+|---|---|---|
+| 1 | 42–44 M msg/s, ~11k wakeups | 17–44 M msg/s, 1–22 wakeups |
+| 4 | 13–15 M msg/s, ~7k wakeups | 23–44 M msg/s, 2–18 wakeups |
+| 8 | ~10 M msg/s, ~6k wakeups | 15–22 M msg/s, 6–153 wakeups |
+
 ## 0.6.0 (2026-11-06)
 Round 1 performance work, specified in [performance-improvement/ROUND1.md](performance-improvement/ROUND1.md) and planned in [ROUND1-PLAN.md](performance-improvement/ROUND1-PLAN.md). Everything new is opt-in except the bug fixes and the TLS batching: with the default builder and features the runtime submits the same SQEs as 0.5.0. Commits `0dce84e`..`6cb8d82`.
 
