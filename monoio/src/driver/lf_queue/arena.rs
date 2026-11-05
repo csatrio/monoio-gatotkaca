@@ -24,8 +24,8 @@ use std::{
     },
 };
 
+use adaptif_gatotkaca_utils::crossbeam_utils::{Backoff, CachePadded};
 use adaptif_gatotkaca_utils::TreiberNode;
-use crossbeam_utils::{Backoff, CachePadded};
 
 /// No node: an empty free list.
 const NIL: u32 = u32::MAX;

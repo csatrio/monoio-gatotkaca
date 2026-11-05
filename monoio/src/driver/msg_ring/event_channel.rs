@@ -19,7 +19,7 @@ use std::{
     task::Poll,
 };
 
-use crossbeam_utils::CachePadded;
+use adaptif_gatotkaca_utils::crossbeam_utils::CachePadded;
 
 use super::super::{
     doorbell::{self, BellAddr, Doorbell},

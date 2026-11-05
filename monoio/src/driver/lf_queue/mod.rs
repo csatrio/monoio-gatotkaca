@@ -12,9 +12,9 @@ mod arena;
 
 use std::{io, ptr, sync::atomic::AtomicPtr};
 
+use adaptif_gatotkaca_utils::crossbeam_utils::CachePadded;
 use adaptif_gatotkaca_utils::{GkTreiberPtr, GkTreiberStackIterator, TreiberStackIterator};
 use arena::{Arena, Node};
-use crossbeam_utils::CachePadded;
 
 /// Largest `max` capacity.
 pub(crate) const LIMIT: u32 = 1 << 31;
