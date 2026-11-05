@@ -227,6 +227,18 @@ impl Handle {
         self.process_at_time(now)
     }
 
+    /// Fire due timers, cheaply: no clock read without pending timers, no wheel poll before the
+    /// earliest deadline (`next_wake` is never later than it).
+    pub(self) fn process_if_due(&self) {
+        let Some(next) = self.get().state.borrow().next_wake else {
+            return;
+        };
+        let now = self.time_source().now();
+        if now >= next.get() {
+            self.process_at_time(now);
+        }
+    }
+
     pub(self) fn process_at_time(&self, mut now: u64) {
         let mut state = self.get().state.borrow_mut();
 
@@ -298,7 +310,13 @@ impl Handle {
             // thread, because add_entry and reregister require exclusive control of
             // the timer entry.
             match unsafe { state.wheel.insert(entry) } {
-                Ok(_) => None,
+                Ok(_) => {
+                    // Keep `next_wake` no later than any registered timer, so
+                    // `process_if_due` never skips a due one.
+                    let tick = NonZeroU64::new(new_tick.max(1)).unwrap();
+                    state.next_wake = Some(state.next_wake.map_or(tick, |w| w.min(tick)));
+                    None
+                }
                 Err((entry, super::error::InsertError::Elapsed)) => unsafe { entry.fire(Ok(())) },
             }
         };
@@ -321,7 +339,12 @@ where
     }
 
     fn submit(&self) -> io::Result<()> {
-        self.park.submit()
+        self.park.submit()?;
+        // The runtime takes this path instead of `park` when ready tasks remain after a round (for
+        // example with `task_budget`), and under saturation it may never park. Fire due timers here
+        // too, or they would wait until the ready queue empties.
+        self.handle.process_if_due();
+        Ok(())
     }
 
     fn park(&self) -> io::Result<()> {
