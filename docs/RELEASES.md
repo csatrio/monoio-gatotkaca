@@ -2,7 +2,10 @@
 
 Releases of `adaptif-gatotkaca-monoio` (library name `monoio`), newest first. The fork starts from upstream [Monoio](https://github.com/bytedance/monoio) 0.2.4 (`8675e94`). Open work is in [TODO.md](TODO.md).
 
-## Unreleased
+## 0.7.1 (2026-11-06)
+No public API changes. Commits `ec850da`..HEAD.
+
+- Fix: timers stalled while the ready queue never empties. `Runtime::block_on` calls `driver.submit()` instead of `park()` when tasks remain after a round (always the case under saturation with `task_budget`, and possible with the default budget), and `TimeDriver::submit` did not process timers, so no `sleep`/`timeout` fired. `TimeDriver::submit` now fires due timers too, with an early-out: no clock read while no timer is pending, no wheel poll before the earliest deadline (registering a timer now keeps `next_wake` up to date). Busy-queue rounds with the timer enabled: no measurable change at the default budget or `task_budget(16)`, with or without 1000 pending timers; about 25 ns more per round (~10%) only with `task_budget(1)` and pending timers, where timers previously never fired. Regression test `tests/timer_cold_path.rs` (fails without the fix, also at the default budget). Found by the gatotkaca-transport harness (run 72).
 - Remote wakes (feature `sync`): a waker woken on another thread now goes through the lock-free queue behind `event_channel` (moved to `driver::lf_queue`) instead of a `flume` channel. `flume`, `rustc-hash` and `crossbeam-utils` are no longer direct dependencies (crossbeam-utils comes re-exported from `adaptif-gatotkaca-utils` 0.11.3).
 - The remote-waker queue is drained without reversing each batch (wake order doesn't matter); `event_channel` keeps send order.
 - The per-thread cache of other runtimes' queues checks the last one used first; registries use `FastU64Map` from `adaptif-gatotkaca-utils` (0.11.2+, whose iterators no longer use an atomic swap per node).
