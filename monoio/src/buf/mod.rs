@@ -12,6 +12,9 @@ pub use io_buf::{IoBuf, IoBufMut};
 mod io_vec_buf;
 pub use io_vec_buf::{IoVecBuf, IoVecBufMut, VecBuf};
 
+mod io_vec_array;
+pub use io_vec_array::{IoVecArray, IoVecArrayMut};
+
 mod slice;
 pub use slice::{IoVecWrapper, IoVecWrapperMut, Slice, SliceMut};
 

@@ -69,7 +69,8 @@ impl IoVecMeta {
                         return;
                     }
                     std::cmp::Ordering::Greater => {
-                        let _ = unsafe { iovec.iov_base.add(amt) };
+                        // Move the start past the consumed bytes.
+                        iovec.iov_base = unsafe { (iovec.iov_base as *mut u8).add(amt) } as *mut _;
                         iovec.iov_len -= amt;
                         self.offset = offset;
                         return;
@@ -90,7 +91,8 @@ unsafe impl IoVecBuf for IoVecMeta {
         unsafe { self.data.as_ptr().add(self.offset) }
     }
     fn read_iovec_len(&self) -> usize {
-        self.data.len()
+        // The pointer starts at `offset`, so only the rest counts.
+        self.data.len() - self.offset
     }
 }
 
@@ -100,7 +102,8 @@ unsafe impl IoVecBufMut for IoVecMeta {
     }
 
     fn write_iovec_len(&mut self) -> usize {
-        self.data.len()
+        // The pointer starts at `offset`, so only the rest counts.
+        self.data.len() - self.offset
     }
 
     unsafe fn set_init(&mut self, pos: usize) {

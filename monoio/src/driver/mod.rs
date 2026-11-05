@@ -16,8 +16,9 @@ use std::{
 };
 
 use self::op::{CompletionMeta, Op, OpAble};
-pub use self::uring::IoUringDriver;
+pub(crate) use self::uring::DriverOptions;
 use self::uring::UringInner;
+pub use self::uring::{DriverStats, IoUringDriver};
 
 /// Unpark a runtime of another thread.
 pub(crate) mod unpark {
@@ -70,6 +71,22 @@ pub trait Driver {
 }
 
 scoped_thread_local!(pub(crate) static CURRENT: Inner);
+
+/// The counters of the current thread's driver, see [`IoUringDriver::stats`].
+///
+/// # Panics
+/// Panics if called outside of a monoio runtime.
+pub fn driver_stats() -> DriverStats {
+    CURRENT.with(|inner| unsafe { (*inner.0.get()).stats() })
+}
+
+/// Reset the counters of the current thread's driver, see [`IoUringDriver::reset_stats`].
+///
+/// # Panics
+/// Panics if called outside of a monoio runtime.
+pub fn reset_driver_stats() {
+    CURRENT.with(|inner| unsafe { (*inner.0.get()).reset_stats() })
+}
 
 #[derive(Clone)]
 pub(crate) struct Inner(std::rc::Rc<std::cell::UnsafeCell<UringInner>>);

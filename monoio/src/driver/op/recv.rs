@@ -10,7 +10,7 @@ use {
     libc::{sockaddr_in, sockaddr_in6, sockaddr_storage, socklen_t, AF_INET, AF_INET6},
 };
 
-use super::{super::shared_fd::SharedFd, Op, OpAble};
+use super::{super::shared_fd::SharedFd, submit::SubmitResult, Op, OpAble};
 use crate::{
     buf::{IoBufMut, IoVecBufMut, IoVecMeta, MsgMeta},
     BufResult,
@@ -23,11 +23,37 @@ pub(crate) struct Recv<T> {
 
     /// Reference to the in-flight buffer.
     pub(crate) buf: T,
+
+    /// `MSG_*` flags.
+    flags: libc::c_int,
+
+    /// SQE ioprio, e.g. `IORING_RECVSEND_POLL_FIRST`.
+    ioprio: u16,
 }
 
+/// `IORING_RECVSEND_POLL_FIRST`: poll before trying the receive.
+const RECVSEND_POLL_FIRST: u16 = 1 << 0;
+
 impl<T: IoBufMut> Op<Recv<T>> {
-    pub(crate) fn recv(fd: SharedFd, buf: T) -> io::Result<Self> {
-        Op::submit_with(Recv { fd, buf })
+    pub(crate) fn recv(fd: SharedFd, buf: T) -> SubmitResult<Self, T> {
+        Self::recv_with(fd, buf, 0, false)
+    }
+
+    /// Receive with `MSG_*` flags; `poll_first` sets `IORING_RECVSEND_POLL_FIRST`.
+    pub(crate) fn recv_with(
+        fd: SharedFd,
+        buf: T,
+        flags: libc::c_int,
+        poll_first: bool,
+    ) -> SubmitResult<Self, T> {
+        let ioprio = if poll_first { RECVSEND_POLL_FIRST } else { 0 };
+        Op::submit_or_return(Recv {
+            fd,
+            buf,
+            flags,
+            ioprio,
+        })
+        .map_err(|(e, d)| (e, d.buf))
     }
 
     pub(crate) async fn result(self) -> BufResult<usize, T> {
@@ -52,6 +78,8 @@ impl<T: IoBufMut> OpAble for Recv<T> {
             self.buf.write_ptr(),
             self.buf.bytes_total() as _,
         )
+        .flags(self.flags)
+        .ioprio(self.ioprio)
         .build()
     }
 }
@@ -68,7 +96,7 @@ pub(crate) struct RecvMsg<T> {
 }
 
 impl<T: IoBufMut> Op<RecvMsg<T>> {
-    pub(crate) fn recv_msg(fd: SharedFd, mut buf: T) -> io::Result<Self> {
+    pub(crate) fn recv_msg(fd: SharedFd, mut buf: T) -> SubmitResult<Self, T> {
         let mut info: Box<(MaybeUninit<sockaddr_storage>, IoVecMeta, MsgMeta)> =
             Box::new((MaybeUninit::uninit(), IoVecMeta::from(&mut buf), unsafe {
                 std::mem::zeroed()
@@ -81,7 +109,7 @@ impl<T: IoBufMut> Op<RecvMsg<T>> {
             info.2.msg_namelen = std::mem::size_of::<sockaddr_storage>() as socklen_t;
         }
 
-        Op::submit_with(RecvMsg { fd, buf, info })
+        Op::submit_or_return(RecvMsg { fd, buf, info }).map_err(|(e, d)| (e, d.buf))
     }
 
     pub(crate) async fn wait(self) -> BufResult<(usize, SocketAddr), T> {
@@ -89,7 +117,14 @@ impl<T: IoBufMut> Op<RecvMsg<T>> {
         let res = complete.meta.result.map(|v| v.into_inner() as _);
         let mut buf = complete.data.buf;
 
-        let res = res.map(|n| {
+        let res = res.and_then(|n| {
+            // Safety: the kernel wrote `n` bytes to the buffer.
+            unsafe { buf.set_init(n) };
+
+            // No address was written (e.g. not an inet socket): report it, don't read garbage.
+            if complete.data.info.2.msg_namelen == 0 {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
             let storage = unsafe { complete.data.info.0.assume_init() };
 
             let addr = unsafe {
@@ -111,16 +146,11 @@ impl<T: IoBufMut> Op<RecvMsg<T>> {
                         let scope_id = addr.sin6_scope_id;
                         SocketAddr::V6(SocketAddrV6::new(ip, port, addr.sin6_flowinfo, scope_id))
                     }
-                    _ => {
-                        unreachable!()
-                    }
+                    _ => return Err(io::ErrorKind::InvalidInput.into()),
                 }
             };
 
-            // Safety: the kernel wrote `n` bytes to the buffer.
-            unsafe { buf.set_init(n) };
-
-            (n, addr)
+            Ok((n, addr))
         });
         (res, buf)
     }
@@ -144,7 +174,7 @@ pub(crate) struct RecvMsgUnix<T> {
 }
 
 impl<T: IoBufMut> Op<RecvMsgUnix<T>> {
-    pub(crate) fn recv_msg_unix(fd: SharedFd, mut buf: T) -> io::Result<Self> {
+    pub(crate) fn recv_msg_unix(fd: SharedFd, mut buf: T) -> SubmitResult<Self, T> {
         let mut info: Box<(MaybeUninit<sockaddr_storage>, IoVecMeta, libc::msghdr)> =
             Box::new((MaybeUninit::uninit(), IoVecMeta::from(&mut buf), unsafe {
                 std::mem::zeroed()
@@ -155,7 +185,7 @@ impl<T: IoBufMut> Op<RecvMsgUnix<T>> {
         info.2.msg_name = &mut info.0 as *mut _ as *mut libc::c_void;
         info.2.msg_namelen = std::mem::size_of::<sockaddr_storage>() as socklen_t;
 
-        Op::submit_with(RecvMsgUnix { fd, buf, info })
+        Op::submit_or_return(RecvMsgUnix { fd, buf, info }).map_err(|(e, d)| (e, d.buf))
     }
 
     pub(crate) async fn wait(self) -> BufResult<(usize, UnixSocketAddr), T> {

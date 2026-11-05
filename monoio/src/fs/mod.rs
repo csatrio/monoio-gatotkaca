@@ -40,8 +40,10 @@ use crate::buf::IoBuf;
 macro_rules! uring_op {
     ($fn_name:ident<$trait_name:ident>($op_name: ident, $buf_name:ident $(, $pos:ident: $pos_type:ty)?)) => {
         pub(crate) async fn $fn_name<T: $trait_name>(fd: SharedFd, $buf_name: T, $($pos: $pos_type)?) -> $crate::BufResult<usize, T> {
-            let op = $crate::driver::op::Op::$op_name(fd, $buf_name, $($pos)?).unwrap();
-            op.result().await
+            match $crate::driver::op::Op::$op_name(fd, $buf_name, $($pos)?) {
+                Ok(op) => op.result().await,
+                Err((e, buf)) => (Err(e), buf),
+            }
         }
     };
 }

@@ -1,9 +1,8 @@
-use std::io;
 use std::os::unix::prelude::AsRawFd;
 
 use io_uring::{opcode, types};
 
-use super::{super::shared_fd::SharedFd, Op, OpAble};
+use super::{super::shared_fd::SharedFd, submit::SubmitResult, Op, OpAble};
 use crate::{
     buf::{IoBuf, IoVecBuf},
     BufResult,
@@ -34,8 +33,8 @@ pub(crate) struct Write<T> {
 }
 
 impl<T: IoBuf> Op<Write<T>> {
-    pub(crate) fn write(fd: SharedFd, buf: T) -> io::Result<Self> {
-        Op::submit_with(Write { fd, buf })
+    pub(crate) fn write(fd: SharedFd, buf: T) -> SubmitResult<Self, T> {
+        Op::submit_or_return(Write { fd, buf }).map_err(|(e, d)| (e, d.buf))
     }
 }
 
@@ -68,8 +67,8 @@ pub(crate) struct WriteAt<T> {
 }
 
 impl<T: IoBuf> Op<WriteAt<T>> {
-    pub(crate) fn write_at(fd: SharedFd, buf: T, offset: u64) -> io::Result<Op<WriteAt<T>>> {
-        Op::submit_with(WriteAt { fd, offset, buf })
+    pub(crate) fn write_at(fd: SharedFd, buf: T, offset: u64) -> SubmitResult<Op<WriteAt<T>>, T> {
+        Op::submit_or_return(WriteAt { fd, offset, buf }).map_err(|(e, d)| (e, d.buf))
     }
 }
 
@@ -93,8 +92,8 @@ pub(crate) struct WriteVec<T> {
 }
 
 impl<T: IoVecBuf> Op<WriteVec<T>> {
-    pub(crate) fn writev(fd: SharedFd, buf_vec: T) -> io::Result<Self> {
-        Op::submit_with(WriteVec { fd, buf_vec })
+    pub(crate) fn writev(fd: SharedFd, buf_vec: T) -> SubmitResult<Self, T> {
+        Op::submit_or_return(WriteVec { fd, buf_vec }).map_err(|(e, d)| (e, d.buf_vec))
     }
 }
 

@@ -9,7 +9,7 @@ use super::{socket_addr::SocketAddr, UnixStream};
 use crate::{
     driver::{op::Op, shared_fd::SharedFd},
     io::{stream::Stream, CancelHandle},
-    net::ListenerOpts,
+    net::{AcceptFlags, ListenerOpts},
 };
 
 /// UnixListener
@@ -68,37 +68,41 @@ impl UnixListener {
 
     /// Accept
     pub async fn accept(&self) -> io::Result<(UnixStream, SocketAddr)> {
-        let op = Op::accept(&self.fd)?;
+        self.accept_inner(0, None).await
+    }
 
-        // Await the completion of the event
-        let completion = op.await;
-
-        // Convert fd
-        let fd = completion.meta.result?;
-
-        // Construct stream
-        let stream = UnixStream::from_shared_fd(SharedFd::new(fd.into_inner() as _)?);
-
-        // Construct SocketAddr
-        let mut storage = unsafe { std::mem::MaybeUninit::assume_init(completion.data.addr.0) };
-        let storage: *mut libc::sockaddr_storage = &mut storage as *mut _;
-        let raw_addr_un: libc::sockaddr_un = unsafe { *storage.cast() };
-        let raw_addr_len = completion.data.addr.1;
-
-        let addr = SocketAddr::from_parts(raw_addr_un, raw_addr_len);
-
-        Ok((stream, addr))
+    /// Accept a connection and set `flags` on the new socket in the same step (`accept4`).
+    /// See [`TcpListener::accept_with`](crate::net::TcpListener::accept_with).
+    pub async fn accept_with(&self, flags: AcceptFlags) -> io::Result<(UnixStream, SocketAddr)> {
+        self.accept_inner(flags.bits(), None).await
     }
 
     /// Cancelable accept
     pub async fn cancelable_accept(&self, c: CancelHandle) -> io::Result<(UnixStream, SocketAddr)> {
-        use crate::io::operation_canceled;
+        self.accept_inner(0, Some(c)).await
+    }
 
-        if c.canceled() {
-            return Err(operation_canceled());
+    /// Cancelable [`accept_with`](Self::accept_with).
+    pub async fn cancelable_accept_with(
+        &self,
+        flags: AcceptFlags,
+        c: CancelHandle,
+    ) -> io::Result<(UnixStream, SocketAddr)> {
+        self.accept_inner(flags.bits(), Some(c)).await
+    }
+
+    async fn accept_inner(
+        &self,
+        flags: libc::c_int,
+        c: Option<CancelHandle>,
+    ) -> io::Result<(UnixStream, SocketAddr)> {
+        if let Some(c) = &c {
+            if c.canceled() {
+                return Err(crate::io::operation_canceled());
+            }
         }
-        let op = Op::accept(&self.fd)?;
-        let _guard = c.associate_op(op.op_canceller());
+        let op = Op::accept_with(&self.fd, flags)?;
+        let _guard = c.map(|c| c.associate_op(op.op_canceller()));
 
         // Await the completion of the event
         let completion = op.await;
@@ -126,7 +130,7 @@ impl UnixListener {
     /// Everytime call to this method may pay a syscall cost.
     /// It pushes a PollAdd op to the ring.
     pub async fn readable(&self) -> io::Result<()> {
-        let op = Op::poll_read(&self.fd).unwrap();
+        let op = Op::poll_read(&self.fd)?;
         op.wait().await
     }
 

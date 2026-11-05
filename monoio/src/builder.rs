@@ -1,10 +1,9 @@
-use std::{io, marker::PhantomData};
+use std::{io, marker::PhantomData, time::Duration};
 
-use crate::driver::IoUringDriver;
-use crate::utils::thread_id::gen_id;
 use crate::{
-    driver::Driver,
+    driver::{Driver, DriverOptions, IoUringDriver},
     time::{driver::TimeDriver, Clock},
+    utils::thread_id::gen_id,
     Runtime,
 };
 
@@ -16,6 +15,12 @@ pub struct RuntimeBuilder<D> {
     entries: Option<u32>,
 
     urb: io_uring::Builder,
+
+    // driver settings beyond the ring flags
+    opts: DriverOptions,
+
+    // tasks run per round, see `task_budget`
+    task_budget: Option<usize>,
 
     // blocking handle
     #[cfg(feature = "sync")]
@@ -55,6 +60,8 @@ impl<T> RuntimeBuilder<T> {
             entries: None,
 
             urb: io_uring::IoUring::builder(),
+            opts: DriverOptions::default(),
+            task_budget: None,
 
             #[cfg(feature = "sync")]
             blocking_handle: crate::blocking::BlockingStrategy::ExecuteLocal.into(),
@@ -94,14 +101,12 @@ impl Buildable for IoUringDriver {
         let blocking_handle = this.blocking_handle;
 
         BUILD_THREAD_ID.set(&thread_id, || {
-            let driver = match this.entries {
-                Some(entries) => IoUringDriver::new_with_entries(&this.urb, entries)?,
-                None => IoUringDriver::new(&this.urb)?,
-            };
+            let driver = IoUringDriver::new_with_entries(&this.urb, this.entries, this.opts)?;
             #[cfg(feature = "sync")]
-            let context = crate::runtime::Context::new(blocking_handle);
+            let mut context = crate::runtime::Context::new(blocking_handle);
             #[cfg(not(feature = "sync"))]
-            let context = crate::runtime::Context::new();
+            let mut context = crate::runtime::Context::new();
+            context.task_budget = this.task_budget;
             Ok(Runtime::new(context, driver))
         })
     }
@@ -137,9 +142,102 @@ impl<D> RuntimeBuilder<D> {
     /// inner `io_uring` API.
     ///
     /// Refer to the [`io_uring::Builder`] documentation for all the supported methods.
+    ///
+    /// This replaces all ring flags set before (`attach_wq`, `coop_taskrun`, `taskrun_flag`,
+    /// `single_issuer`, `defer_taskrun`, `cq_size`), so call it first.
     #[must_use]
     pub fn uring_builder(mut self, urb: io_uring::Builder) -> Self {
         self.urb = urb;
+        self
+    }
+
+    /// Run completion task work only when the thread enters the kernel instead of interrupting
+    /// it (`IORING_SETUP_COOP_TASKRUN`, 5.19+). Call it after
+    /// [`uring_builder`](Self::uring_builder).
+    #[must_use]
+    pub fn coop_taskrun(mut self) -> Self {
+        self.urb.setup_coop_taskrun();
+        self
+    }
+
+    /// Let the kernel flag pending completion task work in the SQ ring
+    /// (`IORING_SETUP_TASKRUN_FLAG`, 5.19+), so the driver enters the kernel to run it only when
+    /// needed. Use it with `coop_taskrun` or `defer_taskrun`. Call it after
+    /// [`uring_builder`](Self::uring_builder).
+    #[must_use]
+    pub fn taskrun_flag(mut self) -> Self {
+        self.urb.setup_taskrun_flag();
+        self
+    }
+
+    /// Promise that only this thread submits to the ring (`IORING_SETUP_SINGLE_ISSUER`, 6.0+).
+    /// Call it after [`uring_builder`](Self::uring_builder).
+    #[must_use]
+    pub fn single_issuer(mut self) -> Self {
+        self.urb.setup_single_issuer();
+        self
+    }
+
+    /// Run completion task work only when the driver asks for events
+    /// (`IORING_SETUP_DEFER_TASKRUN`, 6.1+). Also sets `single_issuer` (required by the kernel)
+    /// and `taskrun_flag` (so the driver knows when to collect completions while tasks keep
+    /// running). Call it after [`uring_builder`](Self::uring_builder).
+    #[must_use]
+    pub fn defer_taskrun(mut self) -> Self {
+        self.urb
+            .setup_single_issuer()
+            .setup_defer_taskrun()
+            .setup_taskrun_flag();
+        self
+    }
+
+    /// Set the CQ size (`IORING_SETUP_CQSIZE`); the default is twice the SQ entries. A bigger CQ
+    /// helps when multishot operations post many CQEs. Call it after
+    /// [`uring_builder`](Self::uring_builder).
+    #[must_use]
+    pub fn cq_size(mut self, entries: u32) -> Self {
+        self.urb.setup_cqsize(entries);
+        self
+    }
+
+    /// Register the ring fd with the kernel (`IORING_REGISTER_RING_FDS`, 5.18+), which saves a
+    /// file lookup per `io_uring_enter`. If the kernel refuses, the driver silently keeps using
+    /// the plain fd; check with [`IoUringDriver::is_ring_fd_registered`].
+    #[must_use]
+    pub fn register_ring_fd(mut self) -> Self {
+        self.opts.register_ring_fd = true;
+        self
+    }
+
+    /// Batch wakeups: when the driver waits for completions, it waits for `batch` CQEs, or for
+    /// `wait` to pass with at least one CQE ready (`min_wait_usec`, needs
+    /// `IORING_FEAT_MIN_TIMEOUT`, 6.12+; ignored on older kernels or when `batch < 2`).
+    ///
+    /// This adds up to `wait` of latency when there is little traffic, including for wakeups from
+    /// other threads.
+    #[must_use]
+    pub fn min_wait(mut self, wait: Duration, batch: u32) -> Self {
+        self.opts.min_wait = Some(wait);
+        self.opts.min_wait_batch = batch;
+        self
+    }
+
+    /// Skip `io_uring_enter` between task rounds when no SQE is queued and the kernel flags no
+    /// pending task work or CQ overflow. Completions are still reaped.
+    ///
+    /// Off by default. It has no effect on a `coop_taskrun`/`defer_taskrun` ring without
+    /// `taskrun_flag` (the driver can't see pending task work there) or with `IOPOLL`.
+    #[must_use]
+    pub fn skip_empty_enter(mut self) -> Self {
+        self.opts.skip_empty_enter = true;
+        self
+    }
+
+    /// Run at most `n` ready tasks (at least 1) before checking the driver for completions. The
+    /// default is about twice the number of tasks queued at the start of the round.
+    #[must_use]
+    pub fn task_budget(mut self, n: usize) -> Self {
+        self.task_budget = Some(n);
         self
     }
 }
@@ -163,6 +261,8 @@ where
         } = Buildable::build(RuntimeBuilder::<D> {
             entries: this.entries,
             urb: this.urb,
+            opts: this.opts,
+            task_budget: this.task_budget,
             #[cfg(feature = "sync")]
             blocking_handle: this.blocking_handle,
             _mark: PhantomData,
@@ -190,6 +290,8 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
         let Self {
             entries,
             urb,
+            opts,
+            task_budget,
             #[cfg(feature = "sync")]
             blocking_handle,
             ..
@@ -197,6 +299,8 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
         RuntimeBuilder {
             entries,
             urb,
+            opts,
+            task_budget,
             #[cfg(feature = "sync")]
             blocking_handle,
             _mark: PhantomData,

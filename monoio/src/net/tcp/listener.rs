@@ -13,7 +13,7 @@ use super::stream::TcpStream;
 use crate::{
     driver::{op::Op, shared_fd::SharedFd},
     io::{stream::Stream, CancelHandle},
-    net::ListenerOpts,
+    net::{AcceptFlags, ListenerOpts},
 };
 
 /// TcpListener
@@ -81,55 +81,45 @@ impl TcpListener {
 
     /// Accept
     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-        let op = Op::accept(&self.fd)?;
+        self.accept_inner(0, None).await
+    }
 
-        // Await the completion of the event
-        let completion = op.await;
-
-        // Convert fd
-        let fd = completion.meta.result?;
-
-        // Construct stream
-        let stream = TcpStream::from_shared_fd(SharedFd::new(fd.into_inner() as _)?);
-
-        // Construct SocketAddr
-        let storage = completion.data.addr.0.as_ptr();
-        let addr = unsafe {
-            match (*storage).ss_family as _ {
-                AF_INET => {
-                    // Safety: if the ss_family field is AF_INET then storage must be a sockaddr_in.
-                    let addr: &sockaddr_in = &*(storage as *const sockaddr_in);
-                    let ip = Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes());
-                    let port = u16::from_be(addr.sin_port);
-                    SocketAddr::V4(SocketAddrV4::new(ip, port))
-                }
-                AF_INET6 => {
-                    // Safety: if the ss_family field is AF_INET6 then storage must be a
-                    // sockaddr_in6.
-                    let addr: &sockaddr_in6 = &*(storage as *const sockaddr_in6);
-                    let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
-                    let port = u16::from_be(addr.sin6_port);
-                    let scope_id = addr.sin6_scope_id;
-                    SocketAddr::V6(SocketAddrV6::new(ip, port, addr.sin6_flowinfo, scope_id))
-                }
-                _ => {
-                    return Err(io::ErrorKind::InvalidInput.into());
-                }
-            }
-        };
-
-        Ok((stream, addr))
+    /// Accept a connection and set `flags` on the new socket in the same step (`accept4`).
+    ///
+    /// For example `AcceptFlags::NONBLOCK | AcceptFlags::CLOEXEC` saves the `fcntl` calls that
+    /// code handing the socket to another event loop would make. Monoio itself does not need
+    /// `O_NONBLOCK`; plain [`accept`](Self::accept) sets no flags. The peer address is returned
+    /// as usual.
+    pub async fn accept_with(&self, flags: AcceptFlags) -> io::Result<(TcpStream, SocketAddr)> {
+        self.accept_inner(flags.bits(), None).await
     }
 
     /// Cancelable accept
     pub async fn cancelable_accept(&self, c: CancelHandle) -> io::Result<(TcpStream, SocketAddr)> {
-        use crate::io::operation_canceled;
+        self.accept_inner(0, Some(c)).await
+    }
 
-        if c.canceled() {
-            return Err(operation_canceled());
+    /// Cancelable [`accept_with`](Self::accept_with).
+    pub async fn cancelable_accept_with(
+        &self,
+        flags: AcceptFlags,
+        c: CancelHandle,
+    ) -> io::Result<(TcpStream, SocketAddr)> {
+        self.accept_inner(flags.bits(), Some(c)).await
+    }
+
+    async fn accept_inner(
+        &self,
+        flags: libc::c_int,
+        c: Option<CancelHandle>,
+    ) -> io::Result<(TcpStream, SocketAddr)> {
+        if let Some(c) = &c {
+            if c.canceled() {
+                return Err(crate::io::operation_canceled());
+            }
         }
-        let op = Op::accept(&self.fd)?;
-        let _guard = c.associate_op(op.op_canceller());
+        let op = Op::accept_with(&self.fd, flags)?;
+        let _guard = c.map(|c| c.associate_op(op.op_canceller()));
 
         // Await the completion of the event
         let completion = op.await;
@@ -190,7 +180,7 @@ impl TcpListener {
     /// Everytime call to this method may pay a syscall cost.
     /// It pushes a PollAdd op to the ring.
     pub async fn readable(&self) -> io::Result<()> {
-        let op = Op::poll_read(&self.fd).unwrap();
+        let op = Op::poll_read(&self.fd)?;
         op.wait().await
     }
 

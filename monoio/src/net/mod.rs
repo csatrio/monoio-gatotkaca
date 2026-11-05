@@ -1,11 +1,13 @@
 //! Network related
 //! Currently, TCP/UnixStream/UnixDatagram are implemented.
 
+mod flags;
 mod listener_config;
 pub mod tcp;
 pub mod udp;
 pub mod unix;
 
+pub use flags::{AcceptFlags, MsgFlags};
 pub use listener_config::ListenerOpts;
 #[deprecated(since = "0.2.0", note = "use ListenerOpts")]
 pub use listener_config::ListenerOpts as ListenerConfig;

@@ -3,11 +3,102 @@
 use std::{fmt::Debug, io, mem};
 
 use crate::{
-    buf::{IoBuf, IoBufMut},
+    buf::{IoBuf, IoBufMut, IoVecBuf},
     io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt},
 };
 
-const BUFFER_SIZE: usize = 16 * 1024;
+/// Largest TLS plaintext fragment (2^14 bytes).
+pub(crate) const MAX_FRAGMENT_LEN: usize = 16 * 1024;
+/// Upper bound of the per-record wire overhead we plan for (header, nonce, tag, padding).
+/// TLS 1.3 AES-GCM adds 22 bytes, TLS 1.2 AES-GCM 29.
+pub(crate) const RECORD_OVERHEAD: usize = 64;
+/// Default staging buffer size: 64 KiB of plaintext plus the overhead of the 4 records it makes,
+/// so one 64 KiB write goes out in one socket write.
+pub(crate) const DEFAULT_BUFFER_SIZE: usize = 64 * 1024 + 4 * RECORD_OVERHEAD;
+/// Smallest staging buffer: one full record (16 KiB + up to 2 KiB of expansion allowed by TLS 1.2).
+/// Smaller requested sizes are raised to this.
+pub(crate) const MIN_BUFFER_SIZE: usize = 16 * 1024 + 2 * 1024;
+
+/// The non-empty slices of an `IoVecBuf`, for feeding a TLS engine.
+///
+/// # Safety
+/// The iovecs of `buf` must describe valid initialized memory owned by `buf`.
+pub(crate) unsafe fn iovec_slices<T: IoVecBuf>(buf: &T) -> Vec<io::IoSlice<'_>> {
+    let len = buf.read_iovec_len();
+    if len == 0 {
+        return Vec::new();
+    }
+    std::slice::from_raw_parts(buf.read_iovec_ptr(), len)
+        .iter()
+        .filter(|v| v.iov_len > 0 && !v.iov_base.is_null())
+        .map(|v| {
+            io::IoSlice::new(std::slice::from_raw_parts(
+                v.iov_base as *const u8,
+                v.iov_len,
+            ))
+        })
+        .collect()
+}
+
+/// The bytes of `bufs` after skipping `skip`, limited to `limit` bytes.
+pub(crate) fn sub_slices<'a>(
+    bufs: &[io::IoSlice<'a>],
+    mut skip: usize,
+    mut limit: usize,
+) -> Vec<io::IoSlice<'a>> {
+    let mut out = Vec::with_capacity(bufs.len());
+    for b in bufs {
+        // SAFETY: io::IoSlice derefs to a slice with the lifetime 'a of its data.
+        let b: &'a [u8] = unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) };
+        if skip >= b.len() {
+            skip -= b.len();
+            continue;
+        }
+        let b = &b[skip..];
+        skip = 0;
+        let take = b.len().min(limit);
+        out.push(io::IoSlice::new(&b[..take]));
+        limit -= take;
+        if limit == 0 {
+            break;
+        }
+    }
+    out
+}
+
+/// `writev` helper: call `$stream.$write(slices)` until every byte of `$slices` is accepted.
+///
+/// A TLS `writev` takes all slices at once: callers like `write_vectored_all` then never retry
+/// with a partially consumed iovec list.
+macro_rules! write_all_slices {
+    ($stream:ident, $write:ident, $slices:expr) => {{
+        let slices: &[std::io::IoSlice<'_>] = $slices;
+        let total: usize = slices.iter().map(|b| b.len()).sum();
+        let mut done = 0;
+        loop {
+            if done == total {
+                break Ok(done);
+            }
+            let res = if done == 0 {
+                $stream.$write(slices).await
+            } else {
+                let rest = $crate::tls::io_wrapper::sub_slices(slices, done, usize::MAX);
+                $stream.$write(&rest).await
+            };
+            match res {
+                Ok(0) => break Ok(done),
+                Ok(n) => done += n,
+                Err(e) => break Err(e),
+            }
+        }
+    }};
+}
+pub(crate) use write_all_slices;
+
+/// Clamp a user-requested buffer size; `None` means the default.
+pub(crate) fn buffer_size(size: Option<usize>) -> usize {
+    size.map_or(DEFAULT_BUFFER_SIZE, |s| s.max(MIN_BUFFER_SIZE))
+}
 
 struct Buffer {
     read: usize,
@@ -15,17 +106,12 @@ struct Buffer {
     buf: Box<[u8]>,
 }
 
-impl Default for Buffer {
-    fn default() -> Self {
-        Self::new(BUFFER_SIZE)
-    }
-}
-
 impl Buffer {
     fn new(size: usize) -> Self {
         Self {
             read: 0,
             write: 0,
+            // `vec![0; n]` is a calloc: fresh zeroed pages, no memset for large sizes.
             buf: vec![0; size].into_boxed_slice(),
         }
     }
@@ -103,21 +189,23 @@ enum ReadStatus {
 
 impl Default for ReadBuffer {
     fn default() -> Self {
-        Self {
-            buffer: Some(Buffer::default()),
-            status: ReadStatus::Ok,
-        }
+        Self::new(None)
     }
 }
 
 impl ReadBuffer {
-    /// Create a new ReadBuffer with given buffer size.
-    #[cfg(feature = "tls-native")]
-    pub(crate) fn new(buffer_size: usize) -> Self {
+    /// Create a new ReadBuffer; `None` is the default size, smaller sizes are clamped up.
+    pub(crate) fn new(size: Option<usize>) -> Self {
         Self {
-            buffer: Some(Buffer::new(buffer_size)),
+            buffer: Some(Buffer::new(buffer_size(size))),
             status: ReadStatus::Ok,
         }
+    }
+
+    /// Whether received bytes are waiting in the buffer (so reading them needs no IO).
+    #[cfg(feature = "tls-rustls")]
+    pub(crate) fn has_buffered(&self) -> bool {
+        self.buffer.as_ref().is_some_and(|b| !b.is_empty())
     }
 
     /// `do_io` do async read from io to inner buffer.
@@ -201,21 +289,32 @@ enum WriteStatus {
 
 impl Default for WriteBuffer {
     fn default() -> Self {
-        Self {
-            buffer: Some(Buffer::default()),
-            status: WriteStatus::Ok,
-        }
+        Self::new(None)
     }
 }
 
 impl WriteBuffer {
-    /// Create a new WriteBuffer with given buffer size.
-    #[cfg(feature = "tls-native")]
-    pub(crate) fn new(buffer_size: usize) -> Self {
+    /// Create a new WriteBuffer; `None` is the default size, smaller sizes are clamped up.
+    pub(crate) fn new(size: Option<usize>) -> Self {
         Self {
-            buffer: Some(Buffer::new(buffer_size)),
+            buffer: Some(Buffer::new(buffer_size(size))),
             status: WriteStatus::Ok,
         }
+    }
+
+    fn buffer(&self) -> &Buffer {
+        self.buffer.as_ref().expect("buffer ref expected")
+    }
+
+    /// No bytes are waiting to be written.
+    #[cfg(feature = "tls-rustls")]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.buffer().is_empty()
+    }
+
+    /// Free space at the end of the buffer.
+    pub(crate) fn available(&self) -> usize {
+        self.buffer().available()
     }
 
     /// `do_io` do async write from inner buffer to io.
@@ -267,6 +366,29 @@ impl io::Write for WriteBuffer {
         unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), buffer.write_ptr(), to_copy) };
         unsafe { buffer.set_init(to_copy) };
         Ok(to_copy)
+    }
+
+    /// `write_vectored` to buffer: copies as many slices as fit (the last one maybe partially).
+    /// rustls' `write_tls` hands over all queued records this way.
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        let buffer = self.buffer.as_mut().expect("buffer mut expected");
+        match mem::replace(&mut self.status, WriteStatus::Ok) {
+            WriteStatus::Err(e) => return Err(e),
+            WriteStatus::Ok if buffer.is_full() => return Err(io::ErrorKind::WouldBlock.into()),
+            _ => (),
+        }
+
+        let mut copied = 0;
+        for buf in bufs {
+            let to_copy = buf.len().min(buffer.available());
+            if to_copy == 0 && !buf.is_empty() {
+                break;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), buffer.write_ptr(), to_copy) };
+            unsafe { buffer.set_init(to_copy) };
+            copied += to_copy;
+        }
+        Ok(copied)
     }
 
     /// `flush` to buffer.

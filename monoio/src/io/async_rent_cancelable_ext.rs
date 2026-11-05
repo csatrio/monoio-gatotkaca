@@ -145,6 +145,9 @@ where
                 Err(e) => return (Err(e), buf),
             }
         }
+        // The reads went through `meta`; mark the bytes as initialized in `buf` too.
+        // Safety: the kernel filled `read` bytes in iovec order.
+        unsafe { buf.set_init(read) };
         (Ok(read), buf)
     }
 

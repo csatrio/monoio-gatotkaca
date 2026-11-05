@@ -39,7 +39,9 @@ use std::future::Future;
 #[cfg(feature = "sync")]
 pub use blocking::spawn_blocking;
 pub use builder::{Buildable, RuntimeBuilder};
-pub use driver::{raw as uring, Driver, IoUringDriver};
+pub use driver::{
+    driver_stats, raw as uring, reset_driver_stats, Driver, DriverStats, IoUringDriver,
+};
 /// The `io_uring` crate this runtime is built on, re-exported so that users get the exact same
 /// version (`monoio::io_uring::{opcode, squeue, cqueue, types, Probe, ..}`).
 pub use io_uring;

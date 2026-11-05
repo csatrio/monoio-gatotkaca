@@ -31,16 +31,7 @@ impl<IO> IOWrapper<IO> {
     }
 
     pub(crate) fn new_with_buffer_size(io: IO, r: Option<usize>, w: Option<usize>) -> Self {
-        let r_buffer = match r {
-            Some(rb) => ReadBuffer::new(rb),
-            None => ReadBuffer::default(),
-        };
-        let w_buffer = match w {
-            Some(rb) => WriteBuffer::new(rb),
-            None => WriteBuffer::default(),
-        };
-
-        Self::new(io, r_buffer, w_buffer)
+        Self::new(io, ReadBuffer::new(r), WriteBuffer::new(w))
     }
 
     pub(crate) fn buffers(&self) -> Buffers {
@@ -54,6 +45,11 @@ impl<IO> IOWrapper<IO> {
         self,
     ) -> (IO, Rc<UnsafeCell<ReadBuffer>>, Rc<UnsafeCell<WriteBuffer>>) {
         (self.io, self.r_buffer, self.w_buffer)
+    }
+
+    /// Free space in the write staging buffer.
+    pub(crate) fn write_available(&self) -> usize {
+        unsafe { &*self.w_buffer.get() }.available()
     }
 
     pub(crate) async unsafe fn do_read_io(&mut self) -> std::io::Result<usize>

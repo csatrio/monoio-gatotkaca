@@ -1,8 +1,6 @@
-use std::io;
-
 use io_uring::{opcode, types};
 
-use super::{super::shared_fd::SharedFd, Op, OpAble};
+use super::{super::shared_fd::SharedFd, submit::SubmitResult, Op, OpAble};
 use crate::{
     buf::{IoBufMut, IoVecBufMut},
     BufResult,
@@ -47,8 +45,8 @@ pub(crate) struct Read<T> {
 }
 
 impl<T: IoBufMut> Op<Read<T>> {
-    pub(crate) fn read(fd: SharedFd, buf: T) -> io::Result<Op<Read<T>>> {
-        Op::submit_with(Read { fd, buf })
+    pub(crate) fn read(fd: SharedFd, buf: T) -> SubmitResult<Op<Read<T>>, T> {
+        Op::submit_or_return(Read { fd, buf }).map_err(|(e, d)| (e, d.buf))
     }
 }
 
@@ -77,8 +75,8 @@ pub(crate) struct ReadAt<T> {
 }
 
 impl<T: IoBufMut> Op<ReadAt<T>> {
-    pub(crate) fn read_at(fd: SharedFd, buf: T, offset: u64) -> io::Result<Op<ReadAt<T>>> {
-        Op::submit_with(ReadAt { fd, offset, buf })
+    pub(crate) fn read_at(fd: SharedFd, buf: T, offset: u64) -> SubmitResult<Op<ReadAt<T>>, T> {
+        Op::submit_or_return(ReadAt { fd, offset, buf }).map_err(|(e, d)| (e, d.buf))
     }
 }
 
@@ -103,8 +101,8 @@ pub(crate) struct ReadVec<T> {
 }
 
 impl<T: IoVecBufMut> Op<ReadVec<T>> {
-    pub(crate) fn readv(fd: SharedFd, buf_vec: T) -> io::Result<Self> {
-        Op::submit_with(ReadVec { fd, buf_vec })
+    pub(crate) fn readv(fd: SharedFd, buf_vec: T) -> SubmitResult<Self, T> {
+        Op::submit_or_return(ReadVec { fd, buf_vec }).map_err(|(e, d)| (e, d.buf_vec))
     }
 }
 

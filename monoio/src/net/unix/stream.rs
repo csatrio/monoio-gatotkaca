@@ -17,7 +17,7 @@ use crate::{
         operation_canceled, AsyncReadRent, AsyncWriteRent, CancelHandle, CancelableAsyncReadRent,
         CancelableAsyncWriteRent, Split,
     },
-    net::new_socket,
+    net::{flags, new_socket, MsgFlags},
     BufResult,
 };
 
@@ -75,6 +75,54 @@ impl UnixStream {
         Ok((Self::from_std(a)?, Self::from_std(b)?))
     }
 
+    /// Sends `buf` with extra `MSG_*` flags, e.g. [`MsgFlags::MORE`] on a response head that a
+    /// body follows. `MSG_NOSIGNAL` is always added.
+    ///
+    /// Like `write`, it may send fewer bytes than `buf` holds.
+    pub async fn send_with_flags<T: IoBuf>(&self, buf: T, flags: MsgFlags) -> BufResult<usize, T> {
+        flags::send_with_flags(&self.fd, buf, flags).await
+    }
+
+    /// Receives into `buf` with `MSG_*` flags, e.g. [`MsgFlags::WAITALL`] to fill the whole
+    /// buffer (it still returns less on EOF, an error or a signal).
+    pub async fn recv_with_flags<T: IoBufMut>(
+        &self,
+        buf: T,
+        flags: MsgFlags,
+    ) -> BufResult<usize, T> {
+        flags::recv_with_flags(&self.fd, buf, flags, false).await
+    }
+
+    /// Like [`recv_with_flags`](Self::recv_with_flags), with `IORING_RECVSEND_POLL_FIRST` set:
+    /// the kernel waits for data before it tries the receive. Use it on connections that are
+    /// probably idle (keep-alive waits), where the first try would just get `EAGAIN`.
+    /// Kernel 5.19+; older kernels reject it with `EINVAL`.
+    pub async fn recv_poll_first<T: IoBufMut>(
+        &self,
+        buf: T,
+        flags: MsgFlags,
+    ) -> BufResult<usize, T> {
+        flags::recv_with_flags(&self.fd, buf, flags, true).await
+    }
+
+    /// Vectored send through `sendmsg` with `MSG_NOSIGNAL`.
+    ///
+    /// Unlike `writev` (`IORING_OP_WRITEV`), a reset peer gives `EPIPE`/`ECONNRESET` and never
+    /// raises `SIGPIPE`. Pair it with [`IoVecArray`](crate::buf::IoVecArray) to avoid an iovec
+    /// allocation per write. It may send fewer bytes than the buffers hold.
+    pub async fn send_vectored<T: IoVecBuf>(&self, buf_vec: T) -> BufResult<usize, T> {
+        flags::send_vectored_with_flags(&self.fd, buf_vec, MsgFlags::EMPTY).await
+    }
+
+    /// [`send_vectored`](Self::send_vectored) with extra `MSG_*` flags.
+    pub async fn send_vectored_with_flags<T: IoVecBuf>(
+        &self,
+        buf_vec: T,
+        flags: MsgFlags,
+    ) -> BufResult<usize, T> {
+        flags::send_vectored_with_flags(&self.fd, buf_vec, flags).await
+    }
+
     /// Returns effective credentials of the process which called `connect` or
     /// `pair`.
     pub fn peer_cred(&self) -> io::Result<UCred> {
@@ -108,7 +156,7 @@ impl UnixStream {
     /// Everytime call to this method may pay a syscall cost.
     /// It pushes a PollAdd op to the ring.
     pub async fn readable(&self) -> io::Result<()> {
-        let op = Op::poll_read(&self.fd).unwrap();
+        let op = Op::poll_read(&self.fd)?;
         op.wait().await
     }
 
@@ -118,7 +166,7 @@ impl UnixStream {
     /// Everytime call to this method may pay a syscall cost.
     /// It pushes a PollAdd op to the ring.
     pub async fn writable(&self) -> io::Result<()> {
-        let op = Op::poll_write(&self.fd).unwrap();
+        let op = Op::poll_write(&self.fd)?;
         op.wait().await
     }
 }
@@ -163,14 +211,24 @@ impl AsyncWriteRent for UnixStream {
     #[inline]
     fn write<T: IoBuf>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
         // Submit the write operation
-        let op = Op::send(self.fd.clone(), buf).unwrap();
-        op.result()
+        let op = Op::send(self.fd.clone(), buf);
+        async move {
+            match op {
+                Ok(op) => op.result().await,
+                Err((e, buf)) => (Err(e), buf),
+            }
+        }
     }
 
     #[inline]
     fn writev<T: IoVecBuf>(&mut self, buf_vec: T) -> impl Future<Output = BufResult<usize, T>> {
-        let op = Op::writev(self.fd.clone(), buf_vec).unwrap();
-        op.result()
+        let op = Op::writev(self.fd.clone(), buf_vec);
+        async move {
+            match op {
+                Ok(op) => op.result().await,
+                Err((e, buf)) => (Err(e), buf),
+            }
+        }
     }
 
     #[inline]
@@ -205,7 +263,10 @@ impl CancelableAsyncWriteRent for UnixStream {
             return (Err(operation_canceled()), buf);
         }
 
-        let op = Op::send(fd, buf).unwrap();
+        let op = match Op::send(fd, buf) {
+            Ok(op) => op,
+            Err((e, buf)) => return (Err(e), buf),
+        };
         let _guard = c.associate_op(op.op_canceller());
         op.result().await
     }
@@ -222,7 +283,10 @@ impl CancelableAsyncWriteRent for UnixStream {
             return (Err(operation_canceled()), buf_vec);
         }
 
-        let op = Op::writev(fd.clone(), buf_vec).unwrap();
+        let op = match Op::writev(fd.clone(), buf_vec) {
+            Ok(op) => op,
+            Err((e, buf)) => return (Err(e), buf),
+        };
         let _guard = c.associate_op(op.op_canceller());
         op.result().await
     }
@@ -248,15 +312,25 @@ impl AsyncReadRent for UnixStream {
     #[inline]
     fn read<T: IoBufMut>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
         // Submit the read operation
-        let op = Op::recv(self.fd.clone(), buf).unwrap();
-        op.result()
+        let op = Op::recv(self.fd.clone(), buf);
+        async move {
+            match op {
+                Ok(op) => op.result().await,
+                Err((e, buf)) => (Err(e), buf),
+            }
+        }
     }
 
     #[inline]
     fn readv<T: IoVecBufMut>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
         // Submit the read operation
-        let op = Op::readv(self.fd.clone(), buf).unwrap();
-        op.result()
+        let op = Op::readv(self.fd.clone(), buf);
+        async move {
+            match op {
+                Ok(op) => op.result().await,
+                Err((e, buf)) => (Err(e), buf),
+            }
+        }
     }
 }
 
@@ -273,7 +347,10 @@ impl CancelableAsyncReadRent for UnixStream {
             return (Err(operation_canceled()), buf);
         }
 
-        let op = Op::recv(fd, buf).unwrap();
+        let op = match Op::recv(fd, buf) {
+            Ok(op) => op,
+            Err((e, buf)) => return (Err(e), buf),
+        };
         let _guard = c.associate_op(op.op_canceller());
         op.result().await
     }
@@ -290,7 +367,10 @@ impl CancelableAsyncReadRent for UnixStream {
             return (Err(operation_canceled()), buf);
         }
 
-        let op = Op::readv(fd, buf).unwrap();
+        let op = match Op::readv(fd, buf) {
+            Ok(op) => op,
+            Err((e, buf)) => return (Err(e), buf),
+        };
         let _guard = c.associate_op(op.op_canceller());
         op.result().await
     }

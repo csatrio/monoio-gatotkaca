@@ -20,6 +20,7 @@ thread_local! {
         tasks: Default::default(),
         time_handle: None,
         blocking_handle: crate::blocking::BlockingHandle::Empty(crate::blocking::BlockingStrategy::Panic),
+        task_budget: None,
     };
 }
 
@@ -48,6 +49,9 @@ pub(crate) struct Context {
     /// Blocking Handle
     #[cfg(feature = "sync")]
     pub(crate) blocking_handle: crate::blocking::BlockingHandle,
+
+    /// Tasks run before the driver is checked again; `None`: about twice the queue length.
+    pub(crate) task_budget: Option<usize>,
 }
 
 impl Context {
@@ -62,6 +66,7 @@ impl Context {
             tasks: TaskQueue::default(),
             time_handle: None,
             blocking_handle,
+            task_budget: None,
         }
     }
 
@@ -73,6 +78,7 @@ impl Context {
             thread_id,
             tasks: TaskQueue::default(),
             time_handle: None,
+            task_budget: None,
         }
     }
 
@@ -150,7 +156,11 @@ impl<D> Runtime<D> {
                 loop {
                     loop {
                         // Consume all tasks(with max round to prevent io starvation)
-                        let mut max_round = self.context.tasks.len() * 2;
+                        // (with an explicit budget of `n`, exactly `n` tasks run)
+                        let mut max_round = match self.context.task_budget {
+                            Some(n) => n.saturating_sub(1),
+                            None => self.context.tasks.len() * 2,
+                        };
                         while let Some(t) = self.context.tasks.pop() {
                             t.run();
                             if max_round == 0 {

@@ -57,7 +57,7 @@ One commit per wave on `main`, made after the wave's diffs are merged and the fu
 
 | Wave | State |
 |---|---|
-| 1 | running |
-| 2 | not started |
+| 1 | done: F1, F2, F4, F7, A2, A6, A7, A9, A10, A15 rows 1–4. Also fixed: `IoVecMeta` iovec length and `consume` offset bugs, `read_vectored_exact` not setting init. Not done: A6 recv bundles (moved to W2-multishot). |
+| 2 | next. W2-multishot must also: make `submit_with_data` return `data` on failure, so `driver/op/submit.rs` (`submit_or_return`) can drop its no-op flush trick. |
 | 3 | not started |
 | 4 | not started |

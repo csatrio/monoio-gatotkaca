@@ -14,6 +14,7 @@ pub struct TlsAcceptor {
     inner: native_tls::TlsAcceptor,
     read_buffer: Option<usize>,
     write_buffer: Option<usize>,
+    write_coalescing: bool,
 }
 
 impl TlsAcceptor {
@@ -32,18 +33,37 @@ impl TlsAcceptor {
         S: AsyncReadRent + AsyncWriteRent,
     {
         let io = IOWrapper::new_with_buffer_size(stream, self.read_buffer, self.write_buffer);
-        handshake(move |s_wrap| self.inner.accept(s_wrap), io).await
+        let mut stream = handshake(move |s_wrap| self.inner.accept(s_wrap), io).await?;
+        stream.set_write_coalescing(self.write_coalescing);
+        Ok(stream)
     }
 
-    /// Set the size of the internal read buffer in bytes (default 16 KiB).
+    /// Set the size of the internal read buffer in bytes.
+    ///
+    /// `None` (the default) is 64 KiB plus room for record overhead (65,792 bytes). Values below
+    /// one full TLS record (18 KiB) are raised to 18 KiB.
     pub fn read_buffer(mut self, size: Option<usize>) -> Self {
         self.read_buffer = size;
         self
     }
 
-    /// Set the size of the internal write buffer in bytes (default 16 KiB).
+    /// Set the size of the internal write buffer, where TLS records are gathered before one
+    /// socket write.
+    ///
+    /// `None` (the default) is 64 KiB plus room for record overhead (65,792 bytes). Values below
+    /// one full TLS record (18 KiB) are raised to 18 KiB.
     pub fn write_buffer(mut self, size: Option<usize>) -> Self {
         self.write_buffer = size;
+        self
+    }
+
+    /// Enable write coalescing on the streams this creates (off by default); see
+    /// [`TlsStream::set_write_coalescing`].
+    ///
+    /// With coalescing on, `write` does not send: data goes out when the write buffer is full or
+    /// on `flush()`/`shutdown()`, so **you must call `flush()`** before waiting for the peer.
+    pub fn write_coalescing(mut self, enabled: bool) -> Self {
+        self.write_coalescing = enabled;
         self
     }
 }
@@ -60,6 +80,7 @@ impl From<native_tls::TlsAcceptor> for TlsAcceptor {
             inner,
             read_buffer: None,
             write_buffer: None,
+            write_coalescing: false,
         }
     }
 }

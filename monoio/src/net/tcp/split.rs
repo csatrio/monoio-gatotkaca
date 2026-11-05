@@ -1,9 +1,14 @@
 use std::{io, net::SocketAddr};
 
 use super::TcpStream;
-use crate::io::{
-    as_fd::{AsReadFd, AsWriteFd, SharedFdWrapper},
-    OwnedReadHalf, OwnedWriteHalf,
+use crate::{
+    buf::{IoBuf, IoBufMut, IoVecBuf},
+    io::{
+        as_fd::{AsReadFd, AsWriteFd, SharedFdWrapper},
+        OwnedReadHalf, OwnedWriteHalf,
+    },
+    net::MsgFlags,
+    BufResult,
 };
 
 /// OwnedReadHalf.
@@ -22,6 +27,27 @@ impl TcpOwnedReadHalf {
     #[inline]
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         unsafe { &*self.0.get() }.local_addr()
+    }
+
+    /// See [`TcpStream::recv_with_flags`].
+    pub async fn recv_with_flags<T: IoBufMut>(
+        &mut self,
+        buf: T,
+        flags: MsgFlags,
+    ) -> BufResult<usize, T> {
+        // Safety: halves of one stream share a thread; the op only clones the fd.
+        let stream = unsafe { &*self.0.get() };
+        stream.recv_with_flags(buf, flags).await
+    }
+
+    /// See [`TcpStream::recv_poll_first`].
+    pub async fn recv_poll_first<T: IoBufMut>(
+        &mut self,
+        buf: T,
+        flags: MsgFlags,
+    ) -> BufResult<usize, T> {
+        let stream = unsafe { &*self.0.get() };
+        stream.recv_poll_first(buf, flags).await
     }
 }
 
@@ -44,6 +70,33 @@ impl TcpOwnedWriteHalf {
     #[inline]
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         unsafe { &*self.0.get() }.local_addr()
+    }
+
+    /// See [`TcpStream::send_with_flags`].
+    pub async fn send_with_flags<T: IoBuf>(
+        &mut self,
+        buf: T,
+        flags: MsgFlags,
+    ) -> BufResult<usize, T> {
+        // Safety: halves of one stream share a thread; the op only clones the fd.
+        let stream = unsafe { &*self.0.get() };
+        stream.send_with_flags(buf, flags).await
+    }
+
+    /// See [`TcpStream::send_vectored`].
+    pub async fn send_vectored<T: IoVecBuf>(&mut self, buf_vec: T) -> BufResult<usize, T> {
+        let stream = unsafe { &*self.0.get() };
+        stream.send_vectored(buf_vec).await
+    }
+
+    /// See [`TcpStream::send_vectored_with_flags`].
+    pub async fn send_vectored_with_flags<T: IoVecBuf>(
+        &mut self,
+        buf_vec: T,
+        flags: MsgFlags,
+    ) -> BufResult<usize, T> {
+        let stream = unsafe { &*self.0.get() };
+        stream.send_vectored_with_flags(buf_vec, flags).await
     }
 }
 

@@ -59,7 +59,10 @@ impl UdpSocket {
     /// Receives a single datagram message on the socket. On success, returns the number
     /// of bytes read and the origin.
     pub async fn recv_from<T: IoBufMut>(&self, buf: T) -> crate::BufResult<(usize, SocketAddr), T> {
-        let op = Op::recv_msg(self.fd.clone(), buf).unwrap();
+        let op = match Op::recv_msg(self.fd.clone(), buf) {
+            Ok(op) => op,
+            Err((e, buf)) => return (Err(e), buf),
+        };
         op.wait().await
     }
 
@@ -70,7 +73,10 @@ impl UdpSocket {
         buf: T,
         socket_addr: SocketAddr,
     ) -> crate::BufResult<usize, T> {
-        let op = Op::send_msg(self.fd.clone(), buf, Some(socket_addr)).unwrap();
+        let op = match Op::send_msg(self.fd.clone(), buf, Some(socket_addr)) {
+            Ok(op) => op,
+            Err((e, buf)) => return (Err(e), buf),
+        };
         op.wait().await
     }
 
@@ -106,14 +112,20 @@ impl UdpSocket {
 
     /// Sends data on the socket to the remote address to which it is connected.
     pub async fn send<T: IoBuf>(&self, buf: T) -> crate::BufResult<usize, T> {
-        let op = Op::send_msg(self.fd.clone(), buf, None).unwrap();
+        let op = match Op::send_msg(self.fd.clone(), buf, None) {
+            Ok(op) => op,
+            Err((e, buf)) => return (Err(e), buf),
+        };
         op.wait().await
     }
 
     /// Receives a single datagram message on the socket from the remote address to
     /// which it is connected. On success, returns the number of bytes read.
     pub async fn recv<T: IoBufMut>(&self, buf: T) -> crate::BufResult<usize, T> {
-        let op = Op::recv(self.fd.clone(), buf).unwrap();
+        let op = match Op::recv(self.fd.clone(), buf) {
+            Ok(op) => op,
+            Err((e, buf)) => return (Err(e), buf),
+        };
         op.result().await
     }
 
@@ -159,7 +171,7 @@ impl UdpSocket {
     /// Everytime call to this method may pay a syscall cost.
     /// It pushes a PollAdd op to the ring.
     pub async fn readable(&self) -> io::Result<()> {
-        let op = Op::poll_read(&self.fd).unwrap();
+        let op = Op::poll_read(&self.fd)?;
         op.wait().await
     }
 
@@ -169,7 +181,7 @@ impl UdpSocket {
     /// Everytime call to this method may pay a syscall cost.
     /// It pushes a PollAdd op to the ring.
     pub async fn writable(&self) -> io::Result<()> {
-        let op = Op::poll_write(&self.fd).unwrap();
+        let op = Op::poll_write(&self.fd)?;
         op.wait().await
     }
 }
@@ -193,7 +205,10 @@ impl UdpSocket {
             return (Err(operation_canceled()), buf);
         }
 
-        let op = Op::recv_msg(self.fd.clone(), buf).unwrap();
+        let op = match Op::recv_msg(self.fd.clone(), buf) {
+            Ok(op) => op,
+            Err((e, buf)) => return (Err(e), buf),
+        };
         let _guard = c.associate_op(op.op_canceller());
         op.wait().await
     }
@@ -210,7 +225,10 @@ impl UdpSocket {
             return (Err(operation_canceled()), buf);
         }
 
-        let op = Op::send_msg(self.fd.clone(), buf, Some(socket_addr)).unwrap();
+        let op = match Op::send_msg(self.fd.clone(), buf, Some(socket_addr)) {
+            Ok(op) => op,
+            Err((e, buf)) => return (Err(e), buf),
+        };
         let _guard = c.associate_op(op.op_canceller());
         op.wait().await
     }
@@ -225,7 +243,10 @@ impl UdpSocket {
             return (Err(operation_canceled()), buf);
         }
 
-        let op = Op::send_msg(self.fd.clone(), buf, None).unwrap();
+        let op = match Op::send_msg(self.fd.clone(), buf, None) {
+            Ok(op) => op,
+            Err((e, buf)) => return (Err(e), buf),
+        };
         let _guard = c.associate_op(op.op_canceller());
         op.wait().await
     }
@@ -241,7 +262,10 @@ impl UdpSocket {
             return (Err(operation_canceled()), buf);
         }
 
-        let op = Op::recv(self.fd.clone(), buf).unwrap();
+        let op = match Op::recv(self.fd.clone(), buf) {
+            Ok(op) => op,
+            Err((e, buf)) => return (Err(e), buf),
+        };
         let _guard = c.associate_op(op.op_canceller());
         op.result().await
     }

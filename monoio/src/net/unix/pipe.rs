@@ -82,14 +82,24 @@ impl AsyncReadRent for Pipe {
     #[inline]
     fn read<T: IoBufMut>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
         // Submit the read operation
-        let op = Op::read(self.fd.clone(), buf).unwrap();
-        op.result()
+        let op = Op::read(self.fd.clone(), buf);
+        async move {
+            match op {
+                Ok(op) => op.result().await,
+                Err((e, buf)) => (Err(e), buf),
+            }
+        }
     }
 
     #[inline]
     fn readv<T: IoVecBufMut>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
         // Submit the read operation
-        let op = Op::readv(self.fd.clone(), buf).unwrap();
-        op.result()
+        let op = Op::readv(self.fd.clone(), buf);
+        async move {
+            match op {
+                Ok(op) => op.result().await,
+                Err((e, buf)) => (Err(e), buf),
+            }
+        }
     }
 }

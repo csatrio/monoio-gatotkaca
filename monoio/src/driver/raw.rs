@@ -20,7 +20,7 @@ use std::{
 // (and cannot end up with a mismatching `io_uring` version).
 pub use io_uring::{cqueue, opcode, squeue, types, IoUring, Probe};
 
-pub use super::buf_ring::{BufRing, SelectedBuf};
+pub use super::buf_ring::{BufRing, BufRingOptions, BufRingStats, SelectedBuf};
 // errno and poll constants for SQEs and completions (`libc::ENOBUFS`, `libc::POLLIN`, ...).
 pub use libc;
 

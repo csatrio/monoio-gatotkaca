@@ -1,12 +1,12 @@
-use std::{io, net::SocketAddr};
+use std::net::SocketAddr;
 
 use io_uring::{opcode, types};
 use socket2::SockAddr;
 
-use super::{super::shared_fd::SharedFd, Op, OpAble};
+use super::{super::shared_fd::SharedFd, submit::SubmitResult, Op, OpAble};
 use crate::net::unix::SocketAddr as UnixSocketAddr;
 use crate::{
-    buf::{IoBuf, IoVecBufMut, IoVecMeta, MsgMeta},
+    buf::{IoBuf, IoVecBuf, IoVecBufMut, IoVecMeta, MsgMeta},
     BufResult,
 };
 
@@ -16,11 +16,22 @@ pub(crate) struct Send<T> {
     fd: SharedFd,
 
     pub(crate) buf: T,
+
+    /// Extra `MSG_*` flags, ORed with `MSG_NOSIGNAL`.
+    flags: libc::c_int,
 }
 
 impl<T: IoBuf> Op<Send<T>> {
-    pub(crate) fn send(fd: SharedFd, buf: T) -> io::Result<Self> {
-        Op::submit_with(Send { fd, buf })
+    pub(crate) fn send(fd: SharedFd, buf: T) -> SubmitResult<Self, T> {
+        Self::send_with_flags(fd, buf, 0)
+    }
+
+    pub(crate) fn send_with_flags(
+        fd: SharedFd,
+        buf: T,
+        flags: libc::c_int,
+    ) -> SubmitResult<Self, T> {
+        Op::submit_or_return(Send { fd, buf, flags }).map_err(|(e, d)| (e, d.buf))
     }
 
     pub(crate) async fn result(self) -> BufResult<usize, T> {
@@ -61,7 +72,7 @@ impl<T: IoBuf> OpAble for Send<T> {
             self.buf.read_ptr(),
             self.buf.bytes_init() as _,
         )
-        .flags(flags)
+        .flags(flags | self.flags)
         .build()
     }
 }
@@ -82,7 +93,7 @@ impl<T: IoBuf> Op<SendMsg<T>> {
         fd: SharedFd,
         buf: T,
         socket_addr: Option<SocketAddr>,
-    ) -> io::Result<Self> {
+    ) -> SubmitResult<Self, T> {
         let mut info: Box<(Option<SockAddr>, IoVecMeta, MsgMeta)> = Box::new((
             socket_addr.map(Into::into),
             IoVecMeta::from(&buf),
@@ -104,7 +115,7 @@ impl<T: IoBuf> Op<SendMsg<T>> {
             }
         }
 
-        Op::submit_with(SendMsg { fd, buf, info })
+        Op::submit_or_return(SendMsg { fd, buf, info }).map_err(|(e, d)| (e, d.buf))
     }
 
     pub(crate) async fn wait(self) -> BufResult<usize, T> {
@@ -141,7 +152,7 @@ impl<T: IoBuf> Op<SendMsgUnix<T>> {
         fd: SharedFd,
         buf: T,
         socket_addr: Option<UnixSocketAddr>,
-    ) -> io::Result<Self> {
+    ) -> SubmitResult<Self, T> {
         let mut info: Box<(Option<UnixSocketAddr>, IoVecMeta, libc::msghdr)> =
             Box::new((socket_addr, IoVecMeta::from(&buf), unsafe {
                 std::mem::zeroed()
@@ -161,7 +172,7 @@ impl<T: IoBuf> Op<SendMsgUnix<T>> {
             }
         }
 
-        Op::submit_with(SendMsgUnix { fd, buf, info })
+        Op::submit_or_return(SendMsgUnix { fd, buf, info }).map_err(|(e, d)| (e, d.buf))
     }
 
     pub(crate) async fn wait(self) -> BufResult<usize, T> {
@@ -196,8 +207,8 @@ pub(crate) struct SendZc<T> {
 }
 
 impl<T: IoBuf> Op<SendZc<T>> {
-    pub(crate) fn send_zc(fd: SharedFd, buf: T) -> io::Result<Self> {
-        Op::submit_with(SendZc { fd, buf })
+    pub(crate) fn send_zc(fd: SharedFd, buf: T) -> SubmitResult<Self, T> {
+        Op::submit_or_return(SendZc { fd, buf }).map_err(|(e, d)| (e, d.buf))
     }
 
     pub(crate) async fn result(self) -> BufResult<usize, T> {
@@ -221,5 +232,61 @@ impl<T: IoBuf> OpAble for SendZc<T> {
         )
         .flags(FLAGS)
         .build()
+    }
+}
+
+/// Vectored send on a connected socket: `sendmsg` with no address and `MSG_NOSIGNAL`.
+///
+/// Unlike `writev`, a reset peer gives `EPIPE` and no `SIGPIPE`.
+pub(crate) struct SendMsgVec<T> {
+    /// Holds a strong ref to the FD, preventing the file from being closed
+    /// while the operation is in-flight.
+    fd: SharedFd,
+
+    /// The in-flight buffers; `msg` points at their iovecs.
+    pub(crate) buf_vec: T,
+
+    /// Boxed so the kernel sees a stable address after the op moves.
+    msg: Box<libc::msghdr>,
+
+    /// Extra `MSG_*` flags, ORed with `MSG_NOSIGNAL`.
+    flags: u32,
+}
+
+impl<T: IoVecBuf> Op<SendMsgVec<T>> {
+    pub(crate) fn send_msg_vec(
+        fd: SharedFd,
+        buf_vec: T,
+        flags: libc::c_int,
+    ) -> SubmitResult<Self, T> {
+        // Safety: an all-zero msghdr is valid (no name, no control). `uring_op` sets the iovecs.
+        let msg: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
+        Op::submit_or_return(SendMsgVec {
+            fd,
+            buf_vec,
+            msg,
+            flags: flags as u32,
+        })
+        .map_err(|(e, d)| (e, d.buf_vec))
+    }
+
+    pub(crate) async fn result(self) -> BufResult<usize, T> {
+        let complete = self.await;
+        (
+            complete.meta.result.map(|v| v.into_inner() as _),
+            complete.data.buf_vec,
+        )
+    }
+}
+
+impl<T: IoVecBuf> OpAble for SendMsgVec<T> {
+    fn uring_op(&mut self) -> io_uring::squeue::Entry {
+        #[allow(deprecated)]
+        const NOSIGNAL: u32 = libc::MSG_NOSIGNAL as u32;
+        self.msg.msg_iov = self.buf_vec.read_iovec_ptr() as *mut _;
+        self.msg.msg_iovlen = self.buf_vec.read_iovec_len() as _;
+        opcode::SendMsg::new(types::Fd(self.fd.raw_fd()), &*self.msg)
+            .flags(NOSIGNAL | self.flags)
+            .build()
     }
 }
