@@ -15,6 +15,19 @@
 //! the statistics), and is freed (group unregistered, memory unmapped) by whichever drops last.
 //! So it outlives every pointer to it, and a `SelectedBuf` costs no reference count of its own.
 //! Everything is `!Send`: the counters are plain `Cell`s.
+//!
+//! # Bundles
+//! A bundle completion (`IORING_RECVSEND_BUNDLE`) names only its first buffer; the others are
+//! the buffers of the ring slots that followed it when the kernel consumed them, which after
+//! out-of-order recycling are not consecutive bids. The ring slots cannot be read back for that:
+//! once the kernel consumed a slot, recycling may overwrite it before the completion is taken
+//! (when several operations share the ring and their completions are taken in another order).
+//! So every fill links the previously filled buffer to the new one (`BufState::next`): the
+//! buffers of a bundle are the first one and its successors in fill order. A link only changes
+//! when its buffer is filled again, which needs the buffer to be taken and dropped first.
+//! The kernel can also shorten the first buffer of a selection (it writes the slot `len`); that
+//! length is read from the slot, or from the copy a fill saves before it overwrites a slot whose
+//! buffer was consumed but not taken (`BufState::len_snap`).
 
 use std::{
     cell::{Cell, RefCell},
@@ -125,7 +138,7 @@ pub struct BufRingStats {
     pub in_use: usize,
     /// The highest `in_use` seen.
     pub high_water: usize,
-    /// [`SelectedBuf`]s handed out by [`BufRing::take`].
+    /// Buffers handed out by [`BufRing::take`] and [`BufRing::take_bundle`].
     pub taken: u64,
     /// Buffers given back to the ring.
     pub recycled: u64,
@@ -163,6 +176,8 @@ struct Shared {
     published: Cell<u16>,
     // In `PENDING`.
     queued: Cell<bool>,
+    // The buffer filled last, whose `next` the next fill sets.
+    last_filled: Cell<u16>,
     bufs: Box<[BufState]>,
     in_use: Cell<usize>,
     high_water: Cell<usize>,
@@ -181,6 +196,16 @@ struct BufState {
     views: Cell<u32>,
     // Incremental mode: bytes of the buffer already consumed by completions.
     offset: Cell<u32>,
+    // The tail value it was last filled at (its slot is `pos & mask`).
+    pos: Cell<u16>,
+    // The buffer filled right after it (see the module docs).
+    next: Cell<u16>,
+    // The slot `len` saved when its slot was overwritten while it was still in the kernel.
+    len_snap: Cell<u32>,
+    // Where the data of a taken bundle buffer starts and how long it is, until `Bundle`
+    // hands it out.
+    view_start: Cell<u32>,
+    view_len: Cell<u32>,
 }
 
 thread_local! {
@@ -327,6 +352,11 @@ impl BufRing {
                 in_kernel: Cell::new(true),
                 views: Cell::new(0),
                 offset: Cell::new(0),
+                pos: Cell::new(0),
+                next: Cell::new(0),
+                len_snap: Cell::new(0),
+                view_start: Cell::new(0),
+                view_len: Cell::new(0),
             })
             .collect();
         let shared = Shared {
@@ -343,6 +373,7 @@ impl BufRing {
             tail: Cell::new(0),
             published: Cell::new(0),
             queued: Cell::new(false),
+            last_filled: Cell::new(0),
             bufs,
             in_use: Cell::new(0),
             high_water: Cell::new(0),
@@ -410,6 +441,8 @@ impl BufRing {
     ///
     /// Passing a completion that is not of this group, or a stale one (whose buffer has been
     /// recycled since), is a logic error: the returned bytes may be overwritten by the kernel.
+    /// Completions of bundle receives (`IORING_RECVSEND_BUNDLE`) go to
+    /// [`take_bundle`](Self::take_bundle) instead.
     pub fn take(&self, cqe: Cqe) -> Option<SelectedBuf> {
         self.take_parts(cqe.res(), cqe.flags())
     }
@@ -444,15 +477,7 @@ impl BufRing {
             (0, res.min(s.buf_size))
         };
 
-        let views = state.views.get();
-        state.views.set(views + 1);
-        if views == 0 {
-            let in_use = s.in_use.get() + 1;
-            s.in_use.set(in_use);
-            s.high_water.set(s.high_water.get().max(in_use));
-        }
-        s.views.set(s.views.get() + 1);
-        s.taken.set(s.taken.get() + 1);
+        s.add_view(state);
 
         Some(SelectedBuf {
             shared: self.0,
@@ -461,6 +486,109 @@ impl BufRing {
             len,
             bid,
         })
+    }
+}
+
+impl BufRing {
+    /// Whether the kernel supports bundle receives (`IORING_FEAT_RECVSEND_BUNDLE`, Linux 6.10+),
+    /// for [`take_bundle`](Self::take_bundle) and `recv_multi_bundle`.
+    pub fn supports_bundles(&self) -> bool {
+        self.shared()
+            .driver
+            .with_ring(|ring| ring.params().is_feature_recvsend_bundle())
+    }
+
+    /// Take the buffers of a bundle receive completion (`IORING_RECVSEND_BUNDLE`, Linux 6.10+):
+    /// one completion whose `res` bytes fill several buffers, in order.
+    ///
+    /// The returned [`Bundle`] yields one [`SelectedBuf`] per buffer; concatenated, they are the
+    /// received bytes. It allocates nothing. Buffers it still holds go back to the ring when it
+    /// is dropped.
+    ///
+    /// The bundle is empty if the completion carries no data (EOF, an error, `ENOBUFS`, which
+    /// is counted in [`stats`](Self::stats)): the kernel then consumed no buffer. Call it for
+    /// every bundle completion of the group, and [`take`](Self::take) for every other one; the
+    /// two mix freely on one ring, in any order, also across operations. Works in incremental
+    /// mode too ([`BufRingOptions::incremental`]): the first buffer continues at its offset and
+    /// the last one may stay with the kernel.
+    ///
+    /// Passing a completion that is not a bundle of this group, or a stale one, is a logic
+    /// error, as for `take`.
+    pub fn take_bundle(&self, cqe: Cqe) -> Bundle {
+        self.take_bundle_parts(cqe.res(), cqe.flags())
+    }
+
+    fn take_bundle_parts(&self, res: i32, flags: u32) -> Bundle {
+        let s = self.shared();
+        let mut bundle = Bundle {
+            shared: self.0,
+            next: 0,
+            count: 0,
+            bytes: 0,
+        };
+        if res == -libc::ENOBUFS {
+            s.enobufs.set(s.enobufs.get() + 1);
+            return bundle;
+        }
+        // No data: the kernel consumed nothing (a 0-byte bundle commits no buffer), even if the
+        // completion names one.
+        let Ok(res) = usize::try_from(res) else {
+            return bundle;
+        };
+        let Some(first) = cqueue::buffer_select(flags) else {
+            return bundle;
+        };
+        if res == 0 || s.bufs.get(first as usize).map(|b| b.in_kernel.get()) != Some(true) {
+            return bundle;
+        }
+
+        // The kernel fills the buffers in the order it consumed their slots, each up to the
+        // length it mapped: the slot `len` (non-incremental), or what is left of the buffer
+        // (incremental, the same walk as the kernel's `io_kbuf_inc_commit`).
+        let entries = s.bufs.len();
+        let mut rem = res;
+        let mut bid = first;
+        loop {
+            let state = &s.bufs[bid as usize];
+            if !state.in_kernel.get() {
+                // Only a stale or foreign completion gets here.
+                debug_assert!(
+                    false,
+                    "bundle walk reached a buffer that is not in the kernel"
+                );
+                break;
+            }
+            let (start, avail) = if s.incremental {
+                let offset = state.offset.get() as usize;
+                (offset, s.buf_size - offset)
+            } else {
+                (0, s.slot_len(bid))
+            };
+            let len = rem.min(avail);
+            rem -= len;
+            state.view_start.set(start as u32);
+            state.view_len.set(len as u32);
+            if s.incremental {
+                state.offset.set((start + len) as u32);
+                // Only the last buffer can be left partially consumed; it then stays in the
+                // kernel, as with `take`.
+                if rem > 0 || !cqueue::buffer_more(flags) {
+                    state.in_kernel.set(false);
+                }
+            } else {
+                state.in_kernel.set(false);
+            }
+            s.add_view(state);
+            bundle.count += 1;
+            bundle.bytes += len;
+            if rem == 0 || bundle.count as usize == entries {
+                break;
+            }
+            bid = state.next.get();
+        }
+        debug_assert_eq!(rem, 0, "bundle longer than the ring");
+        bundle.next = first;
+        bundle
     }
 }
 
@@ -501,19 +629,75 @@ impl Shared {
         unsafe { self.pool.as_ptr().add(bid as usize * self.buf_size) }
     }
 
+    // A view of `state` is handed out.
+    fn add_view(&self, state: &BufState) {
+        let views = state.views.get();
+        state.views.set(views + 1);
+        if views == 0 {
+            let in_use = self.in_use.get() + 1;
+            self.in_use.set(in_use);
+            self.high_water.set(self.high_water.get().max(in_use));
+        }
+        self.views.set(self.views.get() + 1);
+        self.taken.set(self.taken.get() + 1);
+    }
+
+    fn slot(&self, pos: u16) -> *mut RawEntry {
+        // SAFETY: the index is masked, so inside the ring.
+        unsafe { self.ring.as_ptr().add((pos & self.mask) as usize) }
+    }
+
+    // The length the kernel mapped for buffer `bid`, which it consumed: its slot `len` (the
+    // kernel shortens the first buffer of a selection to what it wants to read), or the copy
+    // saved when the slot was overwritten. Non-incremental mode only.
+    fn slot_len(&self, bid: u16) -> usize {
+        let state = &self.bufs[bid as usize];
+        let slot = self.slot(state.pos.get());
+        // SAFETY: inside the ring; read by field, like the kernel's READ_ONCE. The slot holds
+        // `bid` until a fill overwrites it (the kernel never writes `bid`), and `bid` itself is
+        // not filled again while it is in the kernel, so a matching `bid` means the slot is ours.
+        let len = unsafe {
+            if ptr::addr_of!((*slot).bid).read_volatile() == bid {
+                ptr::addr_of!((*slot).len).read_volatile()
+            } else {
+                state.len_snap.get()
+            }
+        } as usize;
+        if len == 0 || len > self.buf_size {
+            self.buf_size
+        } else {
+            len
+        }
+    }
+
     // Write buffer `bid`, whole, into the next free slot. The slot is free: each buffer is in at
     // most one slot, and there are as many slots as buffers.
     fn fill_slot(&self, bid: u16) {
         let tail = self.tail.get();
-        // SAFETY: the index is masked, so inside the ring. The kernel does not read slots past
-        // the published tail, and only fields are written, never a reference to the entry (whose
+        let slot = self.slot(tail);
+        // SAFETY: the slot is inside the ring. The kernel does not read slots past the
+        // published tail, and only fields are accessed, never a reference to the entry (whose
         // `resv` may be the tail the kernel reads).
         unsafe {
-            let slot = self.ring.as_ptr().add((tail & self.mask) as usize);
+            // The previous occupant, filled one lap ago: if the kernel consumed it but it was not
+            // taken yet, save the length the kernel used for a later `take_bundle`.
+            let old = ptr::addr_of!((*slot).bid).read();
+            if let Some(state) = self.bufs.get(old as usize) {
+                let lap_ago = tail.wrapping_sub(self.mask).wrapping_sub(1);
+                if state.in_kernel.get() && state.pos.get() == lap_ago {
+                    state
+                        .len_snap
+                        .set(ptr::addr_of!((*slot).len).read_volatile());
+                }
+            }
             ptr::addr_of_mut!((*slot).addr).write(self.buf_ptr(bid) as u64);
             ptr::addr_of_mut!((*slot).len).write(self.buf_size as u32);
             ptr::addr_of_mut!((*slot).bid).write(bid);
         }
+        let state = &self.bufs[bid as usize];
+        state.pos.set(tail);
+        self.bufs[self.last_filled.get() as usize].next.set(bid);
+        self.last_filled.set(bid);
         self.tail.set(tail.wrapping_add(1));
     }
 
@@ -767,6 +951,101 @@ impl Drop for SelectedBuf {
     }
 }
 
+/// The buffers of one bundle receive completion, see [`BufRing::take_bundle`].
+///
+/// An iterator of [`SelectedBuf`]s, in data order; concatenated they are the received bytes.
+/// [`len`](ExactSizeIterator::len) is the number of buffers left, [`bytes`](Self::bytes) their
+/// total length. Buffers not yet yielded are held by the bundle and go back to the ring when it
+/// is dropped. Allocation free: the buffers are linked through the ring's own bookkeeping.
+#[must_use = "dropping a bundle gives its buffers back unread"]
+pub struct Bundle {
+    shared: NonNull<Shared>,
+    // The next buffer to yield; valid while `count > 0`.
+    next: u16,
+    count: u32,
+    bytes: usize,
+}
+
+impl Bundle {
+    /// Bytes in the buffers not yielded yet.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// No buffer left (also: the completion carried no data).
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Copy the data out and give the buffers back to the ring at once.
+    pub fn detach(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.bytes);
+        for buf in self {
+            out.extend_from_slice(&buf);
+        }
+        out
+    }
+
+    /// Like [`detach`](Self::detach), as [`bytes::Bytes`].
+    #[cfg(feature = "bytes")]
+    pub fn into_bytes(self) -> bytes::Bytes {
+        bytes::Bytes::from(self.detach())
+    }
+}
+
+impl Iterator for Bundle {
+    type Item = SelectedBuf;
+
+    fn next(&mut self) -> Option<SelectedBuf> {
+        if self.count == 0 {
+            return None;
+        }
+        // SAFETY: the bundle holds a view of each buffer not yielded, so `Shared` is alive.
+        let s = unsafe { self.shared.as_ref() };
+        let bid = self.next;
+        let state = &s.bufs[bid as usize];
+        let (start, len) = (
+            state.view_start.get() as usize,
+            state.view_len.get() as usize,
+        );
+        self.count -= 1;
+        self.bytes -= len;
+        // Read the link before the buffer can be dropped and filled again.
+        self.next = state.next.get();
+        // The bundle's view moves into the `SelectedBuf`.
+        Some(SelectedBuf {
+            shared: self.shared,
+            // SAFETY: `start + len <= buf_size`, inside buffer `bid` of the pool.
+            ptr: unsafe { s.buf_ptr(bid).add(start) },
+            len,
+            bid,
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.count as usize, Some(self.count as usize))
+    }
+}
+
+impl ExactSizeIterator for Bundle {}
+
+impl std::iter::FusedIterator for Bundle {}
+
+impl Drop for Bundle {
+    fn drop(&mut self) {
+        self.by_ref().for_each(drop);
+    }
+}
+
+impl std::fmt::Debug for Bundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bundle")
+            .field("buffers", &self.count)
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,5 +1120,92 @@ mod tests {
         drop((a, b));
         assert_eq!(c.len(), 7);
         drop(c); // frees the ring
+    }
+
+    // What the kernel does when it shortens the first buffer of a selection.
+    fn set_slot_len(ring: &BufRing, pos: u16, len: u32) {
+        let s = ring.shared();
+        unsafe { ptr::addr_of_mut!((*s.slot(pos)).len).write(len) };
+    }
+
+    fn parts(bundle: Bundle) -> Vec<(u16, usize, usize)> {
+        bundle.map(|b| (b.bid(), b.offset(), b.len())).collect()
+    }
+
+    #[test]
+    fn bundle_follows_fill_order_after_out_of_order_recycling() {
+        let rt = RuntimeBuilder::<IoUringDriver>::new().build().unwrap();
+        let Ok(ring) = BufRing::new_in(rt.driver(), 42, 4, 64) else {
+            return;
+        };
+        // Slots 0, 1 (bids 0, 1) go to single receives; recycled in reverse order they fill
+        // slots 4 and 5 (ring slots 0 and 1) as bids 1, 0.
+        let a = ring.take_parts(5, flags(0, false)).unwrap();
+        let b = ring.take_parts(5, flags(1, false)).unwrap();
+        drop(b);
+        drop(a);
+        // The kernel shortened the slot of bid 3 when it once picked it first.
+        set_slot_len(&ring, 3, 20);
+        // One bundle over slots 2..6: bids 2, 3, 1, 0.
+        let bundle = ring.take_bundle_parts(64 + 20 + 64 + 10, flags(2, false));
+        assert_eq!((bundle.len(), bundle.bytes()), (4, 158));
+        assert_eq!(ring.stats().in_use, 4);
+        assert_eq!(
+            parts(bundle),
+            [(2, 0, 64), (3, 0, 20), (1, 0, 64), (0, 0, 10)]
+        );
+        assert_eq!(ring.stats().in_use, 0);
+        assert_eq!(ring.stats().taken, 6);
+
+        // Nothing received: nothing consumed, even if the completion names a buffer.
+        assert!(ring.take_bundle_parts(0, flags(2, false)).is_empty());
+        assert!(ring
+            .take_bundle_parts(-libc::ECONNRESET, flags(2, false))
+            .is_empty());
+        assert!(ring.take_bundle_parts(-libc::ENOBUFS, 0).is_empty());
+        assert_eq!(ring.stats().enobufs, 1);
+        assert_eq!(ring.stats().in_use, 0);
+    }
+
+    #[test]
+    fn bundle_lengths_survive_slot_reuse() {
+        let rt = RuntimeBuilder::<IoUringDriver>::new().build().unwrap();
+        let Ok(ring) = BufRing::new_in(rt.driver(), 43, 4, 64) else {
+            return;
+        };
+        // A bundle consumed slots 0, 1 (bids 0, 1; the first shortened to 30), but its
+        // completion is not taken yet. Single receives on slots 2, 3 are taken and recycled,
+        // which overwrites ring slots 0 and 1.
+        set_slot_len(&ring, 0, 30);
+        let c = ring.take_parts(5, flags(2, false)).unwrap();
+        let d = ring.take_parts(5, flags(3, false)).unwrap();
+        drop((c, d));
+        let s = ring.shared();
+        assert_eq!(s.bufs[0].len_snap.get(), 30);
+        let bundle = ring.take_bundle_parts(30 + 40, flags(0, false));
+        assert_eq!(parts(bundle), [(0, 0, 30), (1, 0, 40)]);
+        assert_eq!(ring.stats().in_use, 0);
+    }
+
+    #[test]
+    fn incremental_bundle_continues_and_keeps_the_last_buffer() {
+        let rt = RuntimeBuilder::<IoUringDriver>::new().build().unwrap();
+        let opts = BufRingOptions::new().incremental(true);
+        let Ok(ring) = BufRing::new_in_with_options(rt.driver(), 44, 4, 16, opts) else {
+            return;
+        };
+        let a = ring.take_parts(4, flags(0, true)).unwrap();
+        // Rest of bid 0, all of bid 1, the start of bid 2 (which the kernel keeps).
+        let mut bundle = ring.take_bundle_parts(12 + 16 + 5, flags(0, true));
+        assert_eq!(bundle.len(), 3);
+        let first = bundle.next().unwrap();
+        assert_eq!((first.bid(), first.offset(), first.len()), (0, 4, 12));
+        assert_eq!(parts(bundle), [(1, 0, 16), (2, 0, 5)]);
+        // Bid 2 continues.
+        let c = ring.take_parts(3, flags(2, false)).unwrap();
+        assert_eq!((c.bid(), c.offset(), c.len()), (2, 5, 3));
+        drop((a, first, c));
+        assert_eq!(ring.stats().in_use, 0);
+        assert_eq!(ring.stats().recycled, 3);
     }
 }

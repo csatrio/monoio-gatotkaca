@@ -9,7 +9,10 @@ use std::{
 use super::{TcpListener, TcpStream};
 use crate::{
     driver::{
-        op::{accept_multi::AcceptMultiOp, recv_multi::RecvMultiOp},
+        op::{
+            accept_multi::AcceptMultiOp,
+            recv_multi::{self, Bundle, RecvBundleStream, RecvMultiOp},
+        },
         raw::{BufRing, SelectedBuf},
     },
     io::stream::Stream,
@@ -118,7 +121,27 @@ impl TcpStream {
     /// [`detach`](SelectedBuf::detach) it) to give the buffer back to the ring. Do not mix it
     /// with other reads on the same socket: data would be split between them in kernel order.
     pub fn recv_multi(&self, ring: &BufRing) -> io::Result<RecvStream> {
-        RecvMultiOp::new(&self.fd, ring).map(RecvStream::new)
+        RecvMultiOp::new(&self.fd, ring, false).map(RecvStream::new)
+    }
+
+    /// Like [`recv_multi`](Self::recv_multi), with bundles (`IORING_RECVSEND_BUNDLE`, Linux
+    /// 6.10+): each item is a [`Bundle`] of one or more buffers holding one received chunk, so a
+    /// large burst costs one completion instead of one per buffer.
+    ///
+    /// Fails with `Unsupported` if the kernel has no bundles
+    /// ([`BufRing::supports_bundles`]). Works with incremental rings too.
+    pub fn recv_multi_bundle(&self, ring: &BufRing) -> io::Result<RecvBundleStream> {
+        RecvMultiOp::new(&self.fd, ring, true).map(RecvBundleStream::new)
+    }
+
+    /// Receive once into one or more buffers of `ring` (single-shot bundle recv, Linux 6.10+).
+    /// An empty [`Bundle`] means EOF. `ENOBUFS` if the ring has no free buffer; `Unsupported`
+    /// if the kernel has no bundles.
+    ///
+    /// Await it to completion: dropping it midway can leak the buffers of a receive that
+    /// completes anyway.
+    pub async fn recv_bundle(&self, ring: &BufRing) -> io::Result<Bundle> {
+        recv_multi::recv_bundle(&self.fd, ring).await
     }
 }
 
@@ -131,6 +154,8 @@ impl TcpStream {
 ///   re-arm; no data is lost.
 /// - Chunks received while nobody polls are queued (without bound, but each holds a ring
 ///   buffer, so the ring size bounds them in practice).
+/// - If the kernel ends the multishot after a chunk without an error (a bundle recv does that
+///   whenever it used the last free buffer), the stream submits it again on the next poll.
 ///
 /// Dropping the stream cancels the recv and gives every buffer not taken back to the ring.
 #[must_use = "streams do nothing unless polled"]

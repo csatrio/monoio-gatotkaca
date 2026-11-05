@@ -9,7 +9,6 @@ use std::{
     io::Write,
     pin::Pin,
     task::{Context, Poll},
-    time::Duration,
 };
 
 use monoio::{
@@ -318,7 +317,7 @@ async fn drop_in_flight_then_reuse() {
         // Dropped in flight: async-cancel cancels it; the runtime keeps the buffer alive.
     }
     // Let the ring process the cancel before data arrives.
-    monoio::time::sleep(Duration::from_millis(20)).await;
+    monoio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     let (res, _) = a.send_op(b"after".to_vec()).await;
     assert_eq!(res.unwrap(), 5);
@@ -328,7 +327,7 @@ async fn drop_in_flight_then_reuse() {
 
     // A future dropped before it was ever polled is also fine.
     drop(b.recv_op(Vec::with_capacity(16)));
-    monoio::time::sleep(Duration::from_millis(20)).await;
+    monoio::time::sleep(std::time::Duration::from_millis(20)).await;
     let (res, _) = a.send_op(b"again".to_vec()).await;
     assert_eq!(res.unwrap(), 5);
     let (res, buf) = b.recv_op(Vec::with_capacity(16)).await;

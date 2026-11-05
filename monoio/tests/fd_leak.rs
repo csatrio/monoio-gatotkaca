@@ -1,3 +1,6 @@
+// Both tests need `async-cancel`.
+#![cfg(feature = "async-cancel")]
+
 use std::{
     io::{Read, Write},
     sync::mpsc::channel,
@@ -15,7 +18,6 @@ use monoio::io::AsyncReadRentExt;
 // 5. the other thread should be able to get a connection
 // 6. if the other thread can read eof, then it can prove the runtime close the fd correctly
 // 7. if the read blocked, then the runtime failed to close the fd
-#[cfg(feature = "async-cancel")]
 #[monoio::test_all(timer_enabled = true)]
 async fn test_fd_leak_cancel_fail() {
     // step 1 and 2
@@ -76,7 +78,6 @@ async fn test_fd_leak_cancel_fail() {
 }
 
 // This test is used to prove the runtime try best to cancel pending op when op is dropped.
-#[cfg(feature = "async-cancel")]
 #[monoio::test_all(timer_enabled = true)]
 async fn test_fd_leak_try_cancel() {
     let listener = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();

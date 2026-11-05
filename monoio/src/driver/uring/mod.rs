@@ -30,6 +30,8 @@ pub(crate) use waker::UnparkHandle;
 pub(crate) const TIMEOUT_USERDATA: u64 = u64::MAX - 1;
 #[cfg(feature = "sync")]
 pub(crate) const EVENTFD_USERDATA: u64 = u64::MAX - 2;
+/// `user_data` of the driver's own `LINK_TIMEOUT` SQEs: their CQEs are only counted.
+const LINK_TIMEOUT_USERDATA: u64 = u64::MAX - 16;
 
 // `IORING_SETUP_*` flags (the `io-uring` crate has no accessor for them).
 const SETUP_IOPOLL: u32 = 1 << 0;
@@ -97,6 +99,12 @@ pub struct DriverStats {
     pub multishot_cqes: u64,
     /// Longest per-op CQE queue of a multishot operation seen: how far a consumer fell behind.
     pub multishot_queue_high_water: u64,
+    /// Linked chains pushed by `uring::submit_chain` (each SQE is also counted in
+    /// `ops_by_opcode`).
+    pub chains_submitted: u64,
+    /// Link timeouts (`read_with_deadline`, `uring::submit_with_timeout`, ...) that fired and
+    /// cancelled their operation.
+    pub link_timeouts: u64,
 }
 
 impl Default for DriverStats {
@@ -116,6 +124,8 @@ impl Default for DriverStats {
             ops_by_opcode: [0; 64],
             multishot_cqes: 0,
             multishot_queue_high_water: 0,
+            chains_submitted: 0,
+            link_timeouts: 0,
         }
     }
 }
@@ -578,6 +588,11 @@ impl UringInner {
                 }
                 // Operations pushed by the user, see `uring::user_data`.
                 _ if index >> 62 == 0b10 => self.external.push(index, &cqe),
+                // A link timeout of the driver: `-ETIME` means it fired (and cancelled its op),
+                // `-ECANCELED` that the op completed first.
+                LINK_TIMEOUT_USERDATA if cqe.result() == -libc::ETIME => {
+                    self.stats.link_timeouts += 1
+                }
                 // Driver internal (cancel, timeout) or unknown: nothing waits for it.
                 _ => (),
             }
@@ -687,9 +702,26 @@ impl UringInner {
     }
 
     /// Make room for one SQE: flush the SQ (and reap CQEs) while it is full, a few times.
+    #[inline]
     fn reserve_sqe(&mut self) -> io::Result<()> {
+        self.reserve_sqes(1)
+    }
+
+    /// Make room for `n` SQEs pushed back to back: flush the SQ (and reap CQEs) while it has
+    /// less free space, a few times. `InvalidInput` if `n` is larger than the SQ.
+    fn reserve_sqes(&mut self, n: usize) -> io::Result<()> {
+        let free = |inner: &mut Self| {
+            let sq = inner.uring.submission();
+            sq.capacity() - sq.len()
+        };
+        if n > self.uring.submission().capacity() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "more SQEs than the submission queue holds",
+            ));
+        }
         for _ in 0..PUSH_RETRIES {
-            if !self.uring.submission().is_full() {
+            if free(self) >= n {
                 return Ok(());
             }
             self.stats.sq_full_flushes += 1;
@@ -701,7 +733,7 @@ impl UringInner {
             }
             self.tick()?;
         }
-        if self.uring.submission().is_full() {
+        if free(self) < n {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
         Ok(())
@@ -777,6 +809,98 @@ impl UringInner {
         // The SQE is visible to the kernel once the tail is published. We don't enter now: the
         // runtime submits on `park` (or `submit`) when it waits for IO.
         Ok(index)
+    }
+
+    /// Push `sqes` back to back (nothing is submitted in between, so a linked chain stays
+    /// whole), each with a new single-shot slab slot. Returns the slot indices. On failure
+    /// nothing is left behind.
+    fn push_chain<const N: usize>(&mut self, sqes: [squeue::Entry; N]) -> io::Result<[usize; N]> {
+        self.reserve_sqes(N)?;
+        let mut slots = [usize::MAX; N];
+        let mut i = 0;
+        let sqes = sqes.map(|sqe| {
+            let index = self.ops.insert(false, OpKind::Single);
+            slots[i] = index;
+            i += 1;
+            sqe.user_data(index as _)
+        });
+        // Can't fail after `reserve_sqes`; if it does, free the slots again.
+        if unsafe { self.uring.submission().push_multiple(&sqes) }.is_err() {
+            for index in slots {
+                if let Some(slot) = self.ops.slab.get(index) {
+                    slot.remove();
+                }
+            }
+            return Err(io::Error::from_raw_os_error(libc::EBUSY));
+        }
+        for sqe in &sqes {
+            self.stats.ops_by_opcode[(sqe.get_opcode() as usize).min(63)] += 1;
+        }
+        self.stats.chains_submitted += 1;
+        Ok(slots)
+    }
+
+    /// Push the SQE of `data` with `IO_LINK`, directly followed by a `LINK_TIMEOUT` SQE for
+    /// `ts` (one reservation, so the pair is never split). Returns the slot index of `data`.
+    ///
+    /// `ts` must stay valid until the kernel consumed the SQEs (it copies the timespec when it
+    /// prepares the timeout); the callers keep it with the op data until the op completed.
+    fn push_op_with_timeout<T: OpAble>(
+        &mut self,
+        data: &mut T,
+        ts: *const Timespec,
+    ) -> io::Result<usize> {
+        debug_assert!(T::KIND != OpKind::Multishot);
+        self.reserve_sqes(2)?;
+
+        let index = self.ops.insert(T::RET_IS_FD, T::KIND);
+        let sqe = data
+            .uring_op()
+            .user_data(index as _)
+            .flags(squeue::Flags::IO_LINK);
+        let timeout = opcode::LinkTimeout::new(ts)
+            .build()
+            .user_data(LINK_TIMEOUT_USERDATA);
+
+        let opcode = (sqe.get_opcode() as usize).min(63);
+
+        // Can't fail after `reserve_sqes`; if it does, free the slot again.
+        if unsafe { self.uring.submission().push_multiple(&[sqe, timeout]) }.is_err() {
+            if let Some(slot) = self.ops.slab.get(index) {
+                slot.remove();
+            }
+            return Err(io::Error::from_raw_os_error(libc::EBUSY));
+        }
+        self.stats.ops_by_opcode[opcode] += 1;
+        Ok(index)
+    }
+
+    /// Submit a chain of raw SQEs, see `uring::submit_chain`.
+    pub(crate) fn submit_chain<const N: usize>(
+        this: &Rc<UnsafeCell<UringInner>>,
+        sqes: [squeue::Entry; N],
+    ) -> io::Result<[usize; N]> {
+        let inner = unsafe { &mut *this.get() };
+        inner.push_chain(sqes)
+    }
+
+    /// Submit `data` as a new operation, cancelled by a link timeout `ts` (see
+    /// [`push_op_with_timeout`](Self::push_op_with_timeout) for how long `ts` must live). Hands
+    /// `data` back on failure.
+    pub(crate) fn try_submit_with_timeout<T: OpAble>(
+        this: &Rc<UnsafeCell<UringInner>>,
+        mut data: T,
+        ts: *const Timespec,
+    ) -> Result<Op<T>, (io::Error, T)> {
+        let inner = unsafe { &mut *this.get() };
+        match inner.push_op_with_timeout(&mut data, ts) {
+            Ok(index) => Ok(Op {
+                driver: Inner(this.clone()),
+                index,
+                data: Some(data),
+            }),
+            Err(e) => Err((e, data)),
+        }
     }
 
     /// Submit `data` as a new operation.

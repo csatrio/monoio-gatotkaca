@@ -8,7 +8,10 @@ use std::{
 use super::{SocketAddr, UnixListener, UnixStream};
 use crate::{
     driver::{
-        op::{accept_multi::AcceptMultiOp, recv_multi::RecvMultiOp},
+        op::{
+            accept_multi::AcceptMultiOp,
+            recv_multi::{self, Bundle, RecvBundleStream, RecvMultiOp},
+        },
         raw::BufRing,
     },
     io::stream::Stream,
@@ -97,6 +100,18 @@ impl UnixStream {
     /// Start a multishot recv (Linux 6.0+) into buffers of `ring`, see
     /// [`TcpStream::recv_multi`](crate::net::TcpStream::recv_multi).
     pub fn recv_multi(&self, ring: &BufRing) -> io::Result<RecvStream> {
-        RecvMultiOp::new(&self.fd, ring).map(RecvStream::new)
+        RecvMultiOp::new(&self.fd, ring, false).map(RecvStream::new)
+    }
+
+    /// Start a multishot bundle recv (Linux 6.10+) into buffers of `ring`, see
+    /// [`TcpStream::recv_multi_bundle`](crate::net::TcpStream::recv_multi_bundle).
+    pub fn recv_multi_bundle(&self, ring: &BufRing) -> io::Result<RecvBundleStream> {
+        RecvMultiOp::new(&self.fd, ring, true).map(RecvBundleStream::new)
+    }
+
+    /// Receive once into one or more buffers of `ring` (Linux 6.10+), see
+    /// [`TcpStream::recv_bundle`](crate::net::TcpStream::recv_bundle).
+    pub async fn recv_bundle(&self, ring: &BufRing) -> io::Result<Bundle> {
+        recv_multi::recv_bundle(&self.fd, ring).await
     }
 }

@@ -12,6 +12,8 @@ use crate::{
 };
 
 pub(crate) mod advise;
+mod chain;
+mod fixed;
 mod unix;
 use unix as file_impl;
 

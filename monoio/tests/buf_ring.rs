@@ -516,3 +516,61 @@ async fn selected_buf_keeps_the_pool_alive() {
     // The group was unregistered with the last view.
     assert!(BufRing::new(29, 2, 16).is_ok());
 }
+
+/// Single receives (`take`) and single-shot bundle receives (`take_bundle`) on one ring, with
+/// the buffers given back in a scrambled order: the bundle walk must follow the slots the kernel
+/// consumed, which are no longer consecutive bids.
+#[monoio::test(timer_enabled = true)]
+async fn mixed_single_and_bundle_receives_with_scrambled_recycling() {
+    let Some(ring) = ring(60, 8, 32) else { return };
+    if !ring.supports_bundles() {
+        eprintln!("skipped: recv bundles unsupported");
+        return;
+    }
+    let (a, mut b) = UnixStream::pair().unwrap();
+    let a_rt = monoio::net::UnixStream::from_std(a.try_clone().unwrap()).unwrap();
+
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut rand = move |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % n as u64) as usize
+    };
+    let mut sent = Vec::new();
+    let mut got = Vec::new();
+    let mut held: Vec<SelectedBuf> = Vec::new();
+    let mut bundles_seen = 0;
+    for round in 0..400usize {
+        let len = 1 + rand(5 * 32);
+        let msg: Vec<u8> = (0..len).map(|i| (i * 7 + round) as u8).collect();
+        b.write_all(&msg).unwrap();
+        sent.extend_from_slice(&msg);
+        while got.len() < sent.len() {
+            if rand(3) == 0 {
+                let buf = ring.take(recv_one(&a, &ring).await).unwrap();
+                got.extend_from_slice(&buf);
+                held.push(buf);
+            } else {
+                let bundle = a_rt.recv_bundle(&ring).await.unwrap();
+                if bundle.len() > 1 {
+                    bundles_seen += 1;
+                }
+                for buf in bundle {
+                    got.extend_from_slice(&buf);
+                    held.push(buf);
+                }
+            }
+            // Keep at most 3 buffers, dropping random ones.
+            while held.len() > 3 {
+                let i = rand(held.len());
+                held.swap_remove(i);
+            }
+        }
+    }
+    drop(held);
+    assert!(got == sent, "data corrupted");
+    assert!(bundles_seen > 0);
+    assert_eq!(ring.stats().in_use, 0);
+    assert_eq!(ring.stats().taken, ring.stats().recycled);
+}

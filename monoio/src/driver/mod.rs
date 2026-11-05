@@ -5,6 +5,9 @@ pub(crate) mod shared_fd;
 pub(crate) mod thread;
 
 mod buf_ring;
+mod chain;
+mod fixed_buf;
+mod msg_ring;
 pub mod raw;
 mod uring;
 mod util;

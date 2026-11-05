@@ -5,7 +5,9 @@
 //! underlying [`IoUring`] to register files and buffers, probe opcodes, and so on.
 //!
 //! Multishot SQEs (several CQEs per SQE) go through [`submit_multishot`], which queues their
-//! completions per operation and hands them out through a [`MultiOp`].
+//! completions per operation and hands them out through a [`MultiOp`]. Linked SQEs go through
+//! [`submit_chain`], which queues them as one unit; [`submit_with_timeout`] bounds one SQE with a
+//! link timeout.
 //!
 //! All of these are available on the driver handle ([`IoUringDriver`], see [`Runtime::driver`])
 //! and, from inside a running runtime, as the free functions [`submit`], [`submit_multishot`]
@@ -18,19 +20,30 @@ use std::{
     io,
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
 // The io_uring items needed to build SQEs and use the ring, so callers need no direct dependency
 // (and cannot end up with a mismatching `io_uring` version).
 pub use io_uring::{cqueue, opcode, squeue, types, IoUring, Probe};
 
-pub use super::buf_ring::{BufRing, BufRingOptions, BufRingStats, SelectedBuf};
+pub use super::buf_ring::{BufRing, BufRingOptions, BufRingStats, Bundle, SelectedBuf};
+pub use super::chain::{link, ChainOp};
+pub use super::fixed_buf::{
+    FixedBuf, FixedBufPool, FixedBufStats, FixedIoBuf, FrozenFixedBuf, ReadFixedFuture,
+    WriteFixedFuture,
+};
+pub use super::msg_ring::{
+    event_channel, msg_receiver, msg_ring, msg_ring_nowait, ring_handle, EventReceiver,
+    EventSender, Mailbox, RingHandle,
+};
 // errno and poll constants for SQEs and completions (`libc::ENOBUFS`, `libc::POLLIN`, ...).
 pub use libc;
 
 use super::{
     op::{multishot::MultishotOp, Completion, Op, OpAble, OpKind},
     uring::{IoUringDriver, UringInner},
+    util::timespec,
     Inner, CURRENT,
 };
 use crate::io::stream::Stream;
@@ -89,6 +102,9 @@ impl Cqe {
 struct RawSqe<T> {
     entry: squeue::Entry,
     data: T,
+    /// The timespec of the link timeout, for [`submit_with_timeout`]. Boxed: the kernel reads
+    /// it when it prepares the timeout SQE.
+    _timeout: Option<Box<types::Timespec>>,
 }
 
 impl<T: 'static> OpAble for RawSqe<T> {
@@ -136,13 +152,78 @@ impl<T: Unpin + 'static> Future for RawOp<T> {
 ///   several CQEs); here, only the first CQE's result would be returned and the others dropped;
 /// - if the operation returns a file descriptor, the caller takes ownership of it and closes it.
 ///   If the [`RawOp`] is dropped first, the descriptor leaks;
-/// - if the SQE sets `IO_LINK` or `IO_HARDLINK`, the whole chain is queued without anything
-///   submitted in between (the driver flushes a full queue and may split the chain).
+/// - the SQE does not set `IO_LINK` or `IO_HARDLINK`: it would link to whatever SQE is queued
+///   next, and the driver may flush a full queue in between, splitting the chain. Use
+///   [`submit_chain`] for linked SQEs, and [`submit_with_timeout`] for a link timeout.
 ///
 /// # Panics
 /// Panics if called outside of a monoio runtime.
 pub unsafe fn submit<T: Unpin + 'static>(entry: squeue::Entry, data: T) -> io::Result<RawOp<T>> {
     CURRENT.with(|inner| inner.submit_raw(entry, data))
+}
+
+/// Submit a raw SQE bounded by a link timeout: the SQE is pushed with `IO_LINK`, directly
+/// followed by an `IORING_OP_LINK_TIMEOUT` SQE (both in one reservation, so they are never
+/// split).
+///
+/// If the operation did not complete within `timeout`, the kernel cancels it and its CQE carries
+/// `-ECANCELED` (some operations that cannot be interrupted complete normally instead). The
+/// timeout's own CQE is handled by the driver (counted in
+/// [`DriverStats::link_timeouts`](crate::DriverStats::link_timeouts) when it fired). This needs
+/// no timer: it works without `enable_timer`.
+///
+/// # Safety
+/// Same as [`submit`](fn@submit). Also, the SQE must not set `IO_LINK`, `IO_HARDLINK` or
+/// `CQE_SKIP_SUCCESS` itself.
+///
+/// # Panics
+/// Panics if called outside of a monoio runtime.
+pub unsafe fn submit_with_timeout<T: Unpin + 'static>(
+    entry: squeue::Entry,
+    data: T,
+    timeout: Duration,
+) -> io::Result<RawOp<T>> {
+    CURRENT.with(|inner| inner.submit_raw_with_timeout(entry, data, timeout))
+}
+
+/// Submit a chain of linked SQEs as one unit, and get every completion through the returned
+/// [`ChainOp`].
+///
+/// The driver first makes room for all `N` SQEs (flushing the queue if needed), then pushes them
+/// back to back with nothing submitted in between, so the kernel sees the whole chain in one
+/// submission and a link is never split. Their `user_data` is overwritten.
+///
+/// **Link flags are the caller's**: set `IO_LINK` (or `IO_HARDLINK`) on every SQE but the last,
+/// e.g. with [`link`]. SQEs without a link flag are still queued together but run independently.
+/// With `IO_LINK`, an SQE that fails (or a short read/write) cancels the rest of the chain, which
+/// then completes with `-ECANCELED`. To bound an SQE with a timeout, put an `opcode::LinkTimeout`
+/// right after it (its timespec in heap memory owned by `data`); its CQE is part of the result.
+///
+/// The [`ChainOp`] resolves to `([Cqe; N], data)` once all `N` SQEs completed (each posts exactly
+/// one CQE). Dropping it first keeps `data` alive until then.
+///
+/// # Errors
+/// `InvalidInput` if `N` is 0 or larger than the submission queue, if the last SQE sets
+/// `IO_LINK`/`IO_HARDLINK` (it would link into the next, unrelated SQE) or if an SQE sets
+/// `CQE_SKIP_SUCCESS`. `EBUSY` if the queue stayed full. Nothing is queued on error, and `data`
+/// is dropped.
+///
+/// # Safety
+/// The caller must ensure that every SQE is valid for its opcode and single-shot, that every
+/// pointer they hold points into heap memory owned by `data` (never into its inline fields, which
+/// move), and that file descriptors returned in completions are closed by the caller (those of a
+/// dropped chain leak). Different SQEs may point to the same memory (e.g. a read into a buffer
+/// linked to a send from it).
+///
+/// # Panics
+/// Panics if called outside of a monoio runtime.
+pub unsafe fn submit_chain<T: Unpin + 'static, const N: usize>(
+    sqes: [squeue::Entry; N],
+    data: T,
+) -> io::Result<ChainOp<T, N>> {
+    CURRENT
+        .with(|inner| ChainOp::submit_in(inner, sqes, data))
+        .map_err(|(e, _)| e)
 }
 
 struct RawMultiSqe<T> {
@@ -391,6 +472,37 @@ impl IoUringDriver {
         self.handle().submit_raw(entry, data)
     }
 
+    /// Submit a linked chain of SQEs to this driver's ring. See [`submit_chain`] for the
+    /// contract.
+    ///
+    /// Like [`submit_raw`](Self::submit_raw), this works outside of the runtime.
+    ///
+    /// # Safety
+    /// Same as [`submit_chain`].
+    pub unsafe fn submit_chain_raw<T: Unpin + 'static, const N: usize>(
+        &self,
+        sqes: [squeue::Entry; N],
+        data: T,
+    ) -> io::Result<ChainOp<T, N>> {
+        ChainOp::submit_in(&self.handle(), sqes, data).map_err(|(e, _)| e)
+    }
+
+    /// Submit a raw SQE bounded by a link timeout to this driver's ring. See
+    /// [`submit_with_timeout`] for the contract.
+    ///
+    /// Like [`submit_raw`](Self::submit_raw), this works outside of the runtime.
+    ///
+    /// # Safety
+    /// Same as [`submit_with_timeout`].
+    pub unsafe fn submit_with_timeout_raw<T: Unpin + 'static>(
+        &self,
+        entry: squeue::Entry,
+        data: T,
+        timeout: Duration,
+    ) -> io::Result<RawOp<T>> {
+        self.handle().submit_raw_with_timeout(entry, data, timeout)
+    }
+
     /// Submit a multishot SQE to this driver's ring. See [`submit_multishot`] for the contract.
     ///
     /// Like [`submit_raw`](Self::submit_raw), this works outside of the runtime.
@@ -430,7 +542,30 @@ impl Inner {
         entry: squeue::Entry,
         data: T,
     ) -> io::Result<RawOp<T>> {
-        self.submit_with(RawSqe { entry, data }).map(RawOp)
+        self.submit_with(RawSqe {
+            entry,
+            data,
+            _timeout: None,
+        })
+        .map(RawOp)
+    }
+
+    fn submit_raw_with_timeout<T: Unpin + 'static>(
+        &self,
+        entry: squeue::Entry,
+        data: T,
+        timeout: Duration,
+    ) -> io::Result<RawOp<T>> {
+        let ts = Box::new(timespec(timeout));
+        let ptr: *const types::Timespec = &*ts;
+        let sqe = RawSqe {
+            entry,
+            data,
+            _timeout: Some(ts),
+        };
+        UringInner::try_submit_with_timeout(&self.0, sqe, ptr)
+            .map(RawOp)
+            .map_err(|(e, _)| e)
     }
 
     fn submit_multishot_raw<T: Unpin + 'static>(
