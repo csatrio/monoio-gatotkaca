@@ -282,6 +282,7 @@ impl Ref<'_, MaybeFdLifecycle> {
                             slot,
                             Lifecycle::Completed(Self::result(res, is_fd), flags),
                         );
+                        metric!(crate::runtime_stats::note_op_completed());
                         waker.wake();
                         return Completed::default();
                     }
@@ -414,6 +415,7 @@ impl Ref<'_, MaybeFdLifecycle> {
             Some(next) => {
                 *lifecycle = next;
                 if let Some(waker) = wake {
+                    metric!(crate::runtime_stats::note_op_completed());
                     waker.wake();
                 }
                 Completed::default()

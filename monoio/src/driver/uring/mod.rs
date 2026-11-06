@@ -99,6 +99,13 @@ pub struct DriverStats {
     pub enter_wait: u64,
     /// `io_uring_enter` calls skipped because there was nothing to do (see `skip_empty_enter`).
     pub enter_skipped: u64,
+    /// Waiting `io_uring_enter` calls (a park that slept; counted in `enter_wait`) after which
+    /// the SQ ring's `IORING_SQ_TASKRUN` flag was set once the CQEs of that enter were reaped:
+    /// the kernel still (or again) had task work for this ring although the wait had just
+    /// returned, and its completions wait for the next enter. Always 0 on a ring without
+    /// `taskrun_flag` (which `defer_taskrun()` sets), since the kernel never raises the flag
+    /// there.
+    pub enter_left_taskrun: u64,
     /// SQEs the kernel consumed (sum of the `io_uring_enter` results).
     pub sqes_submitted: u64,
     /// CQEs reaped.
@@ -161,7 +168,7 @@ pub struct DriverStats {
 
 /// `DriverStats` is all `u64`s: this many. Checked against the struct in metrics builds, so the
 /// `metrics_off` test can tell without the type that the driver holds no counters.
-const DRIVER_STATS_U64S: usize = 19 + 7 + 64 + 4 * 64;
+const DRIVER_STATS_U64S: usize = 20 + 7 + 64 + 4 * 64;
 #[cfg(feature = "metrics")]
 const _: () = assert!(lifecycle::OP_TICK_BUCKETS == 4);
 #[cfg(feature = "metrics")]
@@ -185,6 +192,7 @@ impl Default for DriverStats {
             enter_submit: 0,
             enter_wait: 0,
             enter_skipped: 0,
+            enter_left_taskrun: 0,
             sqes_submitted: 0,
             cqes_reaped: 0,
             cqes_per_tick: [0; 7],
@@ -622,6 +630,10 @@ impl IoUringDriver {
 
         // Process CQ
         inner.tick()?;
+        // Task work the kernel queued after (or left over from) the wait we just returned from.
+        metric!(if need_wait && inner.uring.submission().taskrun() {
+            inner.stats.enter_left_taskrun += 1;
+        });
         drop_deferred(&self.inner);
         super::raw::deliver(&self.inner);
 

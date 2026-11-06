@@ -40,6 +40,19 @@ pub struct RuntimeStats {
     /// Histogram of tasks polled per round. Buckets: 0, 1, 2–3, 4–7, 8–15, 16–31, 32–63, 64–127,
     /// 128–255, 256–511, 512+.
     pub polls_per_round: [u64; POLL_BUCKETS],
+    /// CQEs of single-shot operations that woke a waiting waker: the op's future had been
+    /// polled and was `Pending` when the driver reaped the completion. Not counted: a CQE that
+    /// arrives before the first poll of its future (it wakes nobody), the CQE of a dropped op,
+    /// and every CQE of a multishot op (`uring::submit_multishot`, `accept_multi`,
+    /// `recv_multi`, ...). Each SQE of a `uring::submit_chain` is an op of its own. A
+    /// zero-copy send counts once per wake: `write_zc` once (at the notification),
+    /// `send_zc_early` once for the result and once more if its `pending` is waiting when the
+    /// notification arrives.
+    ///
+    /// `tasks_polled / ops_completed` is the number of task polls per op completion, for ops
+    /// awaited in spawned tasks (see `tasks_polled`). It is below 1 when tasks wait for several
+    /// ops that complete in the same driver tick: the task is woken by each and polled once.
+    pub ops_completed: u64,
     /// Rounds that ended because the task budget ran out while tasks were still queued.
     pub budget_exhausted_rounds: u64,
     /// Ready-queue length sampled at the start of the latest round (not cleared by a reset).
@@ -115,6 +128,18 @@ pub(crate) fn note_remote_wakes(n: u64) {
     CURRENT.try_with(|ctx| {
         if let Some(ctx) = ctx {
             ctx.stats.with(|s| s.remote_wakes += n);
+        }
+    });
+}
+
+/// Count one CQE of a single-shot op that woke a waiting waker
+/// ([`RuntimeStats::ops_completed`]). Hook for the driver's completion path
+/// (`Ref::complete`); does nothing outside a runtime.
+#[inline]
+pub(crate) fn note_op_completed() {
+    CURRENT.try_with(|ctx| {
+        if let Some(ctx) = ctx {
+            ctx.stats.with(|s| s.ops_completed += 1);
         }
     });
 }
