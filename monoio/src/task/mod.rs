@@ -55,6 +55,15 @@ impl<S: 'static> Task<S> {
         self.raw.poll();
     }
 
+    /// Prefetch the start of the task (header and the first part of the future), which a poll
+    /// reads first. A hint only.
+    #[inline]
+    pub(crate) fn prefetch(&self) {
+        let p = self.raw.header() as *const Header as *const u8;
+        crate::utils::slab::prefetch_read(p);
+        crate::utils::slab::prefetch_read(p.wrapping_add(64));
+    }
+
     #[cfg(feature = "sync")]
     pub(crate) unsafe fn finish(&mut self, val_slot: *mut ()) {
         self.raw.finish(val_slot);

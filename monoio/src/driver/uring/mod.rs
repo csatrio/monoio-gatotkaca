@@ -3,7 +3,7 @@
 use std::{
     cell::UnsafeCell,
     io,
-    mem::ManuallyDrop,
+    mem::{ManuallyDrop, MaybeUninit},
     os::unix::prelude::{AsRawFd, RawFd},
     rc::Rc,
     task::{Context, Poll},
@@ -53,6 +53,13 @@ const CQE_F_NOTIF: u32 = 1 << 3;
 
 /// How often a full SQ is flushed before pushing an SQE gives up.
 const PUSH_RETRIES: usize = 8;
+
+/// CQEs `tick` copies out of the ring at a time.
+const CQE_BATCH: usize = 32;
+/// How many CQEs ahead `tick` prefetches op slots.
+const PREFETCH_AHEAD: usize = 4;
+/// How many CQEs ahead `tick` prefetches the task an op will wake (its slot must be in cache).
+const PREFETCH_TASK_AHEAD: usize = 2;
 
 /// The file a cancel-by-fd targets.
 #[derive(Clone, Copy, Debug)]
@@ -692,14 +699,55 @@ impl UringInner {
 
     fn tick(&mut self) -> io::Result<()> {
         metric!(self.tick = self.tick.wrapping_add(1));
-        let cq = self.uring.completion();
-
         #[cfg(feature = "metrics")]
         let mut n = 0_u64;
+        // CQEs are taken in batches so that the op slots of the next CQEs can be prefetched
+        // while one is handled: with thousands of ops in flight the slots are cold, and handling
+        // them one by one stalls on each miss in turn. Like a single pass over the queue, only
+        // the CQEs present on entry are handled.
+        let mut buf = [const { MaybeUninit::<io_uring::cqueue::Entry>::uninit() }; CQE_BATCH];
         // `RuntimeBuilder::small_io_priority` (0: off).
         let small_io_max = crate::scheduler::small_io_max();
-        for cqe in cq {
-            metric!(n += 1);
+        let mut left = self.uring.completion().len();
+        while left > 0 {
+            // Taking the batch publishes the new CQ head (the kernel may reuse those entries).
+            let batch = self
+                .uring
+                .completion()
+                .fill(&mut buf[..left.min(CQE_BATCH)]);
+            if batch.is_empty() {
+                break;
+            }
+            left -= batch.len();
+            for cqe in batch.iter().take(PREFETCH_AHEAD) {
+                self.ops.prefetch(cqe.user_data());
+            }
+            for i in 0..batch.len() {
+                if let Some(ahead) = batch.get(i + PREFETCH_AHEAD) {
+                    self.ops.prefetch(ahead.user_data());
+                }
+                // Its slot was prefetched a few CQEs ago: prefetch the task it will wake.
+                if let Some(ahead) = batch.get(i + PREFETCH_TASK_AHEAD) {
+                    self.ops.prefetch_task(ahead.user_data());
+                }
+                let cqe = &batch[i];
+                self.handle_cqe(cqe, small_io_max);
+                metric!(n += 1);
+            }
+        }
+        metric!(
+            self.stats.cqes_reaped += n;
+            // Buckets 0, 1, 2-3, 4-7, ...: the bit length of `n`.
+            let bucket = (u64::BITS - n.leading_zeros()).min(6) as usize;
+            self.stats.cqes_per_tick[bucket] += 1;
+        );
+        Ok(())
+    }
+
+    /// Dispatch one CQE by its `user_data`.
+    #[inline(always)]
+    fn handle_cqe(&mut self, cqe: &io_uring::cqueue::Entry, small_io_max: u32) {
+        {
             let index = cqe.user_data();
             match index {
                 #[cfg(feature = "sync")]
@@ -732,7 +780,7 @@ impl UringInner {
                     }
                 }
                 // Operations pushed by the user, see `uring::user_data`.
-                _ if index >> 62 == 0b10 => self.external.push(index, &cqe),
+                _ if index >> 62 == 0b10 => self.external.push(index, cqe),
                 // Doorbells: a bell rung by another ring, or our own bell message completing.
                 _ if matches!(index >> 60, 0b1101 | 0b1110) => {
                     self.doorbells.complete(index, cqe.result())
@@ -747,13 +795,6 @@ impl UringInner {
                 _ => (),
             }
         }
-        metric!(
-            self.stats.cqes_reaped += n;
-            // Buckets 0, 1, 2-3, 4-7, ...: the bit length of `n`.
-            let bucket = (u64::BITS - n.leading_zeros()).min(6) as usize;
-            self.stats.cqes_per_tick[bucket] += 1;
-        );
-        Ok(())
     }
 
     /// Whether `Driver::submit` can skip `io_uring_enter`: opted in, nothing queued, and the
@@ -1360,6 +1401,28 @@ impl Drop for UringInner {
 impl Ops {
     const fn new() -> Self {
         Ops { slab: Slab::new() }
+    }
+
+    /// Prefetch the slot of a driver op CQE (`user_data` is a slab index below 2^62).
+    #[inline]
+    fn prefetch(&self, user_data: u64) {
+        if user_data >> 62 == 0 {
+            self.slab.prefetch(user_data as usize);
+        }
+    }
+
+    /// Prefetch the task (header) the waker of a driver op CQE would wake.
+    #[inline]
+    fn prefetch_task(&self, user_data: u64) {
+        if user_data >> 62 == 0 {
+            if let Some(waker) = self
+                .slab
+                .peek(user_data as usize)
+                .and_then(MaybeFdLifecycle::waiting_waker)
+            {
+                crate::utils::slab::prefetch_read(waker.data());
+            }
+        }
     }
 
     // Insert a new operation

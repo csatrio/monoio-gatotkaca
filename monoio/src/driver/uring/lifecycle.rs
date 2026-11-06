@@ -225,6 +225,15 @@ impl MaybeFdLifecycle {
         }
     }
 
+    /// The waker of a single-shot op whose future waits for it, if any.
+    #[inline]
+    pub(crate) fn waiting_waker(&self) -> Option<&Waker> {
+        match &self.lifecycle {
+            Lifecycle::Waiting(waker) => Some(waker),
+            _ => None,
+        }
+    }
+
     /// Record the opcode and the driver's tick counter at submit (`metrics` only).
     #[cfg(feature = "metrics")]
     #[inline]
@@ -253,9 +262,57 @@ impl Ref<'_, MaybeFdLifecycle> {
     ///
     /// # Safety
     /// `res` must come from the kernel for this operation, since it may be a fd.
+    #[inline]
     pub(crate) unsafe fn complete(mut self, res: i32, flags: u32) -> Completed {
         let more = flags & IORING_CQE_F_MORE != 0;
 
+        // Fast path: the final (only) CQE of a single-shot op, whose future is waiting or was
+        // not polled yet. Writes the result in place: no move of the whole slot, no drop glue.
+        if !more {
+            let is_fd = self.is_fd;
+            let slot: *mut Lifecycle = &mut self.lifecycle;
+            // SAFETY: `slot` points to the live state of this occupied slot. The shared borrow
+            // ends before the state is overwritten; a moved-out waker is not dropped again, and
+            // `Waiting`/`Submitted` own nothing else.
+            unsafe {
+                match &*slot {
+                    Lifecycle::Waiting(waker) => {
+                        let waker = std::ptr::read(waker);
+                        std::ptr::write(
+                            slot,
+                            Lifecycle::Completed(Self::result(res, is_fd), flags),
+                        );
+                        waker.wake();
+                        return Completed::default();
+                    }
+                    Lifecycle::Submitted => {
+                        std::ptr::write(
+                            slot,
+                            Lifecycle::Completed(Self::result(res, is_fd), flags),
+                        );
+                        return Completed::default();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.complete_slow(res, flags, more)
+    }
+
+    #[inline]
+    fn result(res: i32, is_fd: bool) -> io::Result<MaybeFd> {
+        if res >= 0 {
+            // SAFETY: `res` is the result of the op, a fd if `is_fd`.
+            unsafe { MaybeFd::new_result(Ok(res as u32), is_fd) }
+        } else {
+            Err(io::Error::from_raw_os_error(-res))
+        }
+    }
+
+    /// [`complete`](Self::complete) for everything but the fast path: multishot ops, CQEs with
+    /// `F_MORE`, zero-copy and dropped ops.
+    #[inline(never)]
+    unsafe fn complete_slow(mut self, res: i32, flags: u32, more: bool) -> Completed {
         if let Lifecycle::Multi(state) = &mut self.lifecycle {
             let cqe = Cqe::new(res, flags);
             if let Some(ignored) = state.ignored.as_mut() {
@@ -288,11 +345,7 @@ impl Ref<'_, MaybeFdLifecycle> {
             };
         }
 
-        let result = if res >= 0 {
-            MaybeFd::new_result(Ok(res as u32), self.is_fd)
-        } else {
-            Err(io::Error::from_raw_os_error(-res))
-        };
+        let result = Self::result(res, self.is_fd);
         if more && self.kind == OpKind::Single {
             trace!(
                 "MONOIO DEBUG[lifecycle]: F_MORE on a single-shot op, flags {}",
@@ -374,18 +427,19 @@ impl Ref<'_, MaybeFdLifecycle> {
     }
 
     #[allow(clippy::needless_pass_by_ref_mut)]
+    #[inline]
     pub(crate) fn poll_op(mut self, cx: &mut Context<'_>) -> Poll<CompletionMeta> {
         let ref_mut = &mut self.lifecycle;
         match ref_mut {
             Lifecycle::Submitted => {
                 *ref_mut = Lifecycle::Waiting(cx.waker().clone());
-                return Poll::Pending;
+                Poll::Pending
             }
             Lifecycle::Waiting(waker) | Lifecycle::WaitingMore(waker, _, _) => {
                 if !waker.will_wake(cx.waker()) {
                     *waker = cx.waker().clone();
                 }
-                return Poll::Pending;
+                Poll::Pending
             }
             // Multi-CQE: first CQE arrived but still waiting for notification
             Lifecycle::CompletedMore(_, _) => {
@@ -394,9 +448,19 @@ impl Ref<'_, MaybeFdLifecycle> {
                 {
                     *ref_mut = Lifecycle::WaitingMore(cx.waker().clone(), result, flags);
                 }
-                return Poll::Pending;
+                Poll::Pending
             }
-            Lifecycle::Completed(..) => {}
+            Lifecycle::Completed(result, flags) => {
+                let meta = CompletionMeta {
+                    // SAFETY: the result is moved out here and the slot is freed right below
+                    // without dropping it; nothing else in the slot needs a drop.
+                    result: unsafe { std::ptr::read(result) },
+                    flags: *flags,
+                };
+                // SAFETY: see above, only plain data is left in the slot.
+                unsafe { self.remove_forget() };
+                Poll::Ready(meta)
+            }
             // Not reachable through `Op` (dropped ops are not polled, multishot ops are not
             // `Op`s, two-step zero-copy sends use `poll_zc_*`).
             Lifecycle::Ignored(_)
@@ -404,12 +468,7 @@ impl Ref<'_, MaybeFdLifecycle> {
             | Lifecycle::Multi(_)
             | Lifecycle::WaitingFirst(_)
             | Lifecycle::AwaitNotif(_)
-            | Lifecycle::Notified => return Poll::Pending,
-        }
-
-        match self.remove().lifecycle {
-            Lifecycle::Completed(result, flags) => Poll::Ready(CompletionMeta { result, flags }),
-            _ => Poll::Pending,
+            | Lifecycle::Notified => Poll::Pending,
         }
     }
 

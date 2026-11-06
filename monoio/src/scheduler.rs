@@ -186,6 +186,14 @@ impl TaskQueue {
         self.prio_on.set(on);
     }
 
+    /// Prefetch the task at the front of the queue (the next one to run after the current).
+    #[inline]
+    pub(crate) fn prefetch_next(&self) {
+        if let Some(t) = unsafe { (*self.queue.get()).front() } {
+            t.prefetch();
+        }
+    }
+
     /// A task woken by a waker: into the LIFO slot while a task runs with `lifo_slot` on (the
     /// previous occupant goes to the back of the queue), else to the back of the queue.
     #[inline]
