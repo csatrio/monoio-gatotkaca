@@ -1,4 +1,4 @@
-//! `RuntimeBuilder::drain_taskrun` (and its pre-tick variant) and `uring::set_min_wait`.
+//! `RuntimeBuilder::drain_taskrun` and `uring::set_min_wait`.
 //!
 //! Kernel behaviour the tests rely on (Linux 6.13+, `docs/performance-improvement/round3/`
 //! `r3-probe.md`, KV1): a DEFER_TASKRUN ring runs completions only inside an `io_uring_enter`
@@ -187,8 +187,7 @@ fn burst_on(what: &'static str, rb: Builder) -> Option<Outcome> {
     Some(out)
 }
 
-// (a) With the drain, one park delivers more of the ready receives to the tasks, and the
-// pre-tick variant more than the documented one for the same number of enters.
+// (a) With the drain, one park delivers more of the ready receives to the tasks.
 #[test]
 fn drain_delivers_more_per_park() {
     let Some(plain) = burst_on("defer", Builder::new().defer_taskrun()) else {
@@ -204,19 +203,9 @@ fn drain_delivers_more_per_park() {
         Builder::new().defer_taskrun().drain_taskrun(4),
     )
     .unwrap();
-    let b1 = burst_on(
-        "defer, pre-tick drain 1",
-        Builder::new().defer_taskrun().drain_taskrun_pre_tick(1),
-    )
-    .unwrap();
-    let b4 = burst_on(
-        "defer, pre-tick drain 4",
-        Builder::new().defer_taskrun().drain_taskrun_pre_tick(4),
-    )
-    .unwrap();
 
     // Never less than without it, on any kernel.
-    for (name, out) in [("a1", &a1), ("a4", &a4), ("b1", &b1), ("b4", &b4)] {
+    for (name, out) in [("a1", &a1), ("a4", &a4)] {
         assert!(out.first_park >= plain.first_park, "{name}");
     }
     #[cfg(feature = "metrics")]
@@ -233,22 +222,15 @@ fn drain_delivers_more_per_park() {
     );
     assert!(a1.first_park < a4.first_park, "four add more");
     assert!(a4.first_park < BURST, "but the drain is bounded");
-    // The pre-tick variant asks for max(20, CQEs in the CQ) per enter: 20, 40, 80, 160.
-    assert!(b1.first_park >= a1.first_park);
-    assert_eq!(b4.first_park, BURST, "four doubling enters take all");
 
     #[cfg(feature = "metrics")]
     {
         // Fewer parks (rounds) for the same completions.
         assert!(a4.stats.enter_wait < plain.stats.enter_wait);
-        assert!(b4.stats.enter_wait <= a4.stats.enter_wait);
         assert!(a1.stats.drain_enters >= 1);
         // The first park alone makes 4; later parks drain what is left.
         assert!(a4.stats.drain_enters >= 4, "{:?}", a4.stats.drain_enters);
-        // All of it came in with the first park's 4 enters: nothing was left for later ones.
-        assert_eq!(b4.stats.drain_enters, 4);
-        assert!(b4.stats.drain_enters < a4.stats.drain_enters);
-        for out in [&a1, &a4, &b1, &b4] {
+        for out in [&a1, &a4] {
             let s = &out.stats;
             // Drain enters are not waits, and there is at most `max` of them per wait.
             assert!(s.drain_enters <= s.enter_submit, "{s:?}");
@@ -288,29 +270,18 @@ fn drain_is_off_where_it_does_not_apply() {
         Builder::new().defer_taskrun().drain_taskrun(0),
         Builder::new().defer_taskrun(),
     );
-    check(
-        "defer, pre-tick drain 0",
-        Builder::new().defer_taskrun().drain_taskrun_pre_tick(0),
-        Builder::new().defer_taskrun(),
-    );
     // The later call wins, also when it turns the drain off.
     check(
         "defer, drain 4 then 0",
         Builder::new()
             .defer_taskrun()
             .drain_taskrun(4)
-            .drain_taskrun_pre_tick(4)
             .drain_taskrun(0),
         Builder::new().defer_taskrun(),
     );
     check(
         "default ring, drain 4",
         Builder::new().drain_taskrun(4),
-        Builder::new(),
-    );
-    check(
-        "default ring, pre-tick drain 4",
-        Builder::new().drain_taskrun_pre_tick(4),
         Builder::new(),
     );
     check(
@@ -324,14 +295,6 @@ fn drain_is_off_where_it_does_not_apply() {
             .coop_taskrun()
             .taskrun_flag()
             .drain_taskrun(4),
-        Builder::new().coop_taskrun().taskrun_flag(),
-    );
-    check(
-        "coop_taskrun + taskrun_flag, pre-tick drain 4",
-        Builder::new()
-            .coop_taskrun()
-            .taskrun_flag()
-            .drain_taskrun_pre_tick(4),
         Builder::new().coop_taskrun().taskrun_flag(),
     );
 }
@@ -452,22 +415,15 @@ fn drain_enter_does_not_wait_for_completions() {
     let defer = || Builder::new().defer_taskrun();
     let (a1, _) = silent_burst("defer, drain 1", defer().drain_taskrun(1)).unwrap();
     let (a8, a_took) = silent_burst("defer, drain 8", defer().drain_taskrun(8)).unwrap();
-    let (b1, _) =
-        silent_burst("defer, pre-tick drain 1", defer().drain_taskrun_pre_tick(1)).unwrap();
-    let (b8, b_took) =
-        silent_burst("defer, pre-tick drain 8", defer().drain_taskrun_pre_tick(8)).unwrap();
     // Nothing else can end such a park: a blocked enter is stopped by the watchdog. A park
     // that slept would also show here.
     assert!(a_took < Duration::from_secs(2), "{a_took:?}");
-    assert!(b_took < Duration::from_secs(2), "{b_took:?}");
-    assert!(a1 >= plain && b1 >= plain);
+    assert!(a1 >= plain);
     // One enter without a CQE and the drain is over, whatever the bound.
     assert_eq!(a1, a8);
-    assert_eq!(b1, b8);
     if limited_kernel() {
         // The drain enter did run: more of the silent items are done after one park.
         assert!(a1 > plain, "drain: {a1}, plain: {plain}");
-        assert!(b1 > plain, "pre-tick drain: {b1}, plain: {plain}");
     }
 }
 
@@ -520,13 +476,7 @@ fn drained_completion_counts_for_the_tick_of_its_park() {
         Builder::new().defer_taskrun().drain_taskrun(1),
     )
     .unwrap();
-    let b = late_receive_ticks(
-        "defer, pre-tick drain 1",
-        Builder::new().defer_taskrun().drain_taskrun_pre_tick(1),
-    )
-    .unwrap();
     assert_eq!(a, [1, 0, 0, 0]);
-    assert_eq!(b, [1, 0, 0, 0]);
     if limited_kernel() {
         assert_eq!(plain, [0, 1, 0, 0]);
     } else {
@@ -538,22 +488,13 @@ fn drained_completion_counts_for_the_tick_of_its_park() {
 #[test]
 fn parks_with_a_timeout_return_on_time() {
     type TimedBuilder = RuntimeBuilder<TimeDriver<IoUringDriver>>;
-    let variants: [(&'static str, TimedBuilder); 2] = [
-        (
-            "defer, drain 4, timer",
-            Builder::new()
-                .defer_taskrun()
-                .drain_taskrun(4)
-                .enable_timer(),
-        ),
-        (
-            "defer, pre-tick drain 4, timer",
-            Builder::new()
-                .defer_taskrun()
-                .drain_taskrun_pre_tick(4)
-                .enable_timer(),
-        ),
-    ];
+    let variants: [(&'static str, TimedBuilder); 1] = [(
+        "defer, drain 4, timer",
+        Builder::new()
+            .defer_taskrun()
+            .drain_taskrun(4)
+            .enable_timer(),
+    )];
     for (what, builder) in variants {
         let mut rt = match builder.build() {
             Ok(rt) => rt,
@@ -643,16 +584,10 @@ fn parks_with_a_timeout_return_on_time() {
 #[test]
 fn drain_enter_ignores_min_wait() {
     const WAIT: Duration = Duration::from_millis(400);
-    for (what, rb) in [
-        (
-            "defer, drain 4",
-            Builder::new().defer_taskrun().drain_taskrun(4),
-        ),
-        (
-            "defer, pre-tick drain 4",
-            Builder::new().defer_taskrun().drain_taskrun_pre_tick(4),
-        ),
-    ] {
+    for (what, rb) in [(
+        "defer, drain 4",
+        Builder::new().defer_taskrun().drain_taskrun(4),
+    )] {
         let Some(mut rt) = build(what, rb) else {
             return;
         };
@@ -765,16 +700,10 @@ fn set_min_wait_round_trip() {
 // own (no runtime loop around it).
 #[test]
 fn bare_park_timeout() {
-    for (what, rb) in [
-        (
-            "defer, drain 4",
-            Builder::new().defer_taskrun().drain_taskrun(4),
-        ),
-        (
-            "defer, pre-tick drain 4",
-            Builder::new().defer_taskrun().drain_taskrun_pre_tick(4),
-        ),
-    ] {
+    for (what, rb) in [(
+        "defer, drain 4",
+        Builder::new().defer_taskrun().drain_taskrun(4),
+    )] {
         let Some(rt) = build(what, rb) else {
             return;
         };

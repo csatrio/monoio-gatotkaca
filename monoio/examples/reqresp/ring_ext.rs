@@ -9,11 +9,8 @@ pub fn apply(
     rb: RuntimeBuilder<IoUringDriver>,
     item: &str,
 ) -> Result<RuntimeBuilder<IoUringDriver>, RuntimeBuilder<IoUringDriver>> {
-    // `draincq<N>`: the pre-tick variant (`drain_taskrun_pre_tick`), `drain<N>`: `drain_taskrun`.
-    // Both need `defer` in the same `--ring` list; on any other ring they do nothing.
-    if let Some(n) = item.strip_prefix("draincq").and_then(|n| n.parse().ok()) {
-        return Ok(rb.drain_taskrun_pre_tick(n));
-    }
+    // `drain<N>`: `drain_taskrun(N)`. Needs `defer` in the same `--ring` list; on any other
+    // ring it does nothing.
     if let Some(n) = item.strip_prefix("drain").and_then(|n| n.parse().ok()) {
         return Ok(rb.drain_taskrun(n));
     }

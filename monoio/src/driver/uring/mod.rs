@@ -94,19 +94,17 @@ impl DriverOptions {
             max => TaskrunDrain::AfterTick(max),
         };
     }
-
-    /// `RuntimeBuilder::drain_taskrun_pre_tick`.
-    pub(crate) fn drain_taskrun_pre_tick(&mut self, max: u32) {
-        self.drain = match max {
-            0 => TaskrunDrain::Off,
-            max => TaskrunDrain::BeforeTick(max),
-        };
-    }
 }
 
 /// What `inner_park` does after its waiting enter when the kernel still flags task work
 /// (`IORING_SQ_TASKRUN`). Only ever on on a `DEFER_TASKRUN` ring with `TASKRUN_FLAG`, see
-/// [`EnterConfig::new`]. Both bounds are a number of extra `io_uring_enter` calls per park.
+/// [`EnterConfig::new`]. The bound is a number of extra `io_uring_enter` calls per park.
+///
+/// A second variant (a drain before the first tick, each enter with `min_complete` = the
+/// unreaped CQEs so that the kernel's per-run cap grows with the backlog) was built and measured
+/// in round 3 (r3-drain.md, G1.md): it drains everything at once and turns a `defer_taskrun`
+/// ring with many connections into the one-round-per-sweep regime of `coop_taskrun` (−13% at
+/// 2000 connections). It was removed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum TaskrunDrain {
     /// One enter per park (the default).
@@ -115,9 +113,6 @@ enum TaskrunDrain {
     /// After the first tick: `enter(GETEVENTS, min_complete = 0)` then `tick()`, while the flag
     /// is set. Each enter runs at most 20 task-work items (Linux 6.13+).
     AfterTick(u32),
-    /// Before the first tick: `enter(GETEVENTS, min_complete = unreaped CQEs)` while the flag is
-    /// set, then the one tick. Each enter runs at most max(20, unreaped CQEs) items.
-    BeforeTick(u32),
 }
 
 /// Counters of an [`IoUringDriver`], see [`IoUringDriver::stats`]. Needs the `metrics` feature.
@@ -724,23 +719,14 @@ impl IoUringDriver {
         } else {
             TaskrunDrain::Off
         };
-        // Variant B: collect more completions into the CQ before it is reaped.
-        #[allow(unused_variables)]
-        let pre_drained = match drain {
-            TaskrunDrain::BeforeTick(max) => inner.drain_before_tick(max),
-            _ => 0,
-        };
 
         // Process CQ
         inner.tick()?;
         // Task work the kernel queued after (or left over from) the wait we just returned from.
-        // (A pre-tick drain ran only because the wait left some.)
-        metric!(
-            if need_wait && (pre_drained > 0 || inner.uring.submission().taskrun()) {
-                inner.stats.enter_left_taskrun += 1;
-            }
-        );
-        // Variant A: fetch what the wait left behind, so the tasks see it in this round.
+        metric!(if need_wait && inner.uring.submission().taskrun() {
+            inner.stats.enter_left_taskrun += 1;
+        });
+        // Fetch what the wait left behind, so the tasks see it in this round.
         if let TaskrunDrain::AfterTick(max) = drain {
             inner.drain_after_tick(max);
         }
@@ -969,48 +955,6 @@ impl UringInner {
             self.reap();
             n += 1;
         }
-    }
-
-    /// `drain_taskrun_pre_tick` (variant B), between the waiting enter of a park and its tick:
-    /// while the kernel flags task work, enter with `min_complete` = the CQEs that are in the
-    /// CQ, at most `max` times. Returns the number of enters made.
-    ///
-    /// Why this never sleeps (KV1 of r3-probe.md, probe lines [A], [D], [E]): the kernel runs
-    /// task work when the wait begins and then returns at once if the CQ holds at least
-    /// `min_complete` CQEs. It holds at least as many as we just counted: only this thread reaps
-    /// the CQ (and does not between the count and the enter), and the kernel only adds. No
-    /// timeout and no batching wait are passed (`enter_with(.., drain = true)`).
-    ///
-    /// Why the count: one run handles at most max(20, `min_complete`) items, so the backlog
-    /// taken per syscall doubles (20, 40, 80, ...) instead of staying at 20. Up to 20 CQEs the
-    /// count changes nothing, so 0 is passed (variant A's enter): a run that is asked for more
-    /// events than it handles can leave the flag set with nothing pending, see
-    /// [`drain_after_tick`](Self::drain_after_tick).
-    ///
-    /// The drain stops when an enter brought no CQE (a stale flag, see there), and when the
-    /// next run could overflow the CQ (it adds up to max(20, len) CQEs, one per item as a
-    /// rule): the tick that follows empties it. Best effort like `drain_after_tick`.
-    fn drain_before_tick(&mut self, max: u32) -> u32 {
-        /// `IO_LOCAL_TW_DEFAULT_MAX`: what a run handles whatever `min_complete` is.
-        const RUN: usize = 20;
-        let mut n = 0;
-        while n < max && self.uring.submission().taskrun() {
-            let cq = self.uring.completion();
-            let (len, capacity) = (cq.len(), cq.capacity());
-            drop(cq);
-            if len + len.max(RUN) > capacity {
-                break;
-            }
-            let min_complete = if len > RUN { len as u32 } else { 0 };
-            if self.enter_with(min_complete, None, true).is_err() {
-                break;
-            }
-            n += 1;
-            if self.uring.completion().len() == len {
-                break;
-            }
-        }
-        n
     }
 
     /// One `io_uring_enter`: submit the queued SQEs and wait for `want` CQEs, at most until `ts`.

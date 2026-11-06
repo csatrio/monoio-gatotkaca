@@ -313,19 +313,6 @@ impl<D> RuntimeBuilder<D> {
         self
     }
 
-    /// Experimental variant of [`drain_taskrun`](Self::drain_taskrun), kept for comparison: the
-    /// drain enters are made *before* the completions of the wait are reaped, each with
-    /// `min_complete` = the completions already in the CQ. That never sleeps (that many exist)
-    /// and raises the kernel's limit per enter to max(20, that number), so the backlog taken
-    /// per syscall doubles: 20, 40, 80, ... The CQ is reaped once, after the last enter. The
-    /// later of the two calls wins. Same conditions as `drain_taskrun`.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn drain_taskrun_pre_tick(mut self, max: u32) -> Self {
-        self.opts.drain_taskrun_pre_tick(max);
-        self
-    }
-
     /// Skip `io_uring_enter` between task rounds when no SQE is queued and the kernel flags no
     /// pending task work or CQ overflow. Completions are still reaped.
     ///

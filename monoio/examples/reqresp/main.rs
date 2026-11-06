@@ -60,7 +60,7 @@ one server core
   --think US           client pause between a reply and its next frame, microseconds (default 0)
   --path P             plain | pipe | mshot | eager | pair (default pipe)
   --deadline D         none | timeout | coarse | timeoutpin | deadline | nonepin (default none)
-  --ring a,b,..        coop, defer, skipenter, ringfd, fixedfd, minwait<us>, drain<N>, draincq<N>
+  --ring a,b,..        coop, defer, skipenter, ringfd, fixedfd, minwait<us>, drain<N>
                        (default: none)
   --entries N          server ring entries (default 4096)
   --cq N               server completion queue size (default: 2 x entries)
