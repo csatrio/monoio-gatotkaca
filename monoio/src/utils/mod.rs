@@ -19,3 +19,8 @@ pub use self::ctrlc::{CtrlC, Error as CtrlCError};
 mod bind_to_cpu_set;
 #[cfg(feature = "utils")]
 pub use bind_to_cpu_set::{bind_to_cpu_set, BindError};
+
+#[cfg(feature = "utils")]
+mod thread_per_core;
+#[cfg(feature = "utils")]
+pub use thread_per_core::{CoreInfo, ThreadPerCore, TpcHandle};

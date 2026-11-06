@@ -101,3 +101,8 @@ required-features = ["bytes", "utils"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+# thread-per-core echo server (docs/performance-improvement/round2/W1-tpc.md)
+[[example]]
+name = "thread_per_core"
+required-features = ["utils"]
