@@ -81,6 +81,7 @@ use std::{
     fmt,
     future::Future,
     io,
+    mem::ManuallyDrop,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -121,7 +122,33 @@ enum State<D: BufOp> {
 
 /// The shared implementation behind every named future.
 pub(crate) struct OpFuture<D: BufOp> {
-    state: State<D>,
+    /// Dropped by [`Drop`], and only while it owns something: a future that returned its
+    /// output (the usual case) is `Done`, and dropping it is one inline test instead of a call
+    /// to the drop glue of the whole enum.
+    state: ManuallyDrop<State<D>>,
+}
+
+impl<D: BufOp> Drop for OpFuture<D> {
+    #[inline]
+    fn drop(&mut self) {
+        if !matches!(*self.state, State::Done) {
+            drop_unfinished(&mut self.state);
+        }
+    }
+}
+
+/// Drop the state of a future that was not polled to completion: an op in flight (the driver
+/// keeps its buffer until the kernel is done) or a result nobody took.
+#[inline(never)]
+fn drop_unfinished<D: BufOp>(state: &mut ManuallyDrop<State<D>>) {
+    // SAFETY: called once, from `OpFuture::drop`; the state is not used afterwards.
+    unsafe { ManuallyDrop::drop(state) }
+}
+
+#[cold]
+#[inline(never)]
+fn polled_after_completion() -> ! {
+    panic!("op future polled after completion")
 }
 
 impl<D: BufOp> OpFuture<D> {
@@ -131,7 +158,9 @@ impl<D: BufOp> OpFuture<D> {
             Ok(op) => State::Running(op),
             Err((e, buf)) => State::Ready(Err(e), buf),
         };
-        Self { state }
+        Self {
+            state: ManuallyDrop::new(state),
+        }
     }
 
     /// A future that is already resolved: `(res, buf)` on its first poll, no op, no SQE.
@@ -139,35 +168,43 @@ impl<D: BufOp> OpFuture<D> {
     #[allow(dead_code)]
     fn ready(res: io::Result<usize>, buf: D::Buf) -> Self {
         Self {
-            state: State::Ready(res, buf),
+            state: ManuallyDrop::new(State::Ready(res, buf)),
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn poll_result(&mut self, cx: &mut Context<'_>) -> Poll<BufResult<usize, D::Buf>> {
-        match &mut self.state {
+        let state: &mut State<D> = &mut self.state;
+        match state {
             State::Running(op) => {
-                let completion = ready!(Pin::new(op).poll(cx));
-                // The op is finished (its slot is released), so dropping it does nothing.
-                self.state = State::Done;
-                Poll::Ready(D::complete(completion))
+                let meta = ready!(op.poll_meta(cx));
+                // The op is finished (its slot is released). Take it apart where it is: no
+                // drop glue runs for the op shell, nothing but the data is moved, and `Done`
+                // owns nothing.
+                // SAFETY: `poll_meta` returned `Ready`; the op is not touched again and its
+                // place is overwritten right below without dropping what is left of it.
+                // Nothing in between can panic.
+                let data = unsafe { op.take_finished() };
+                unsafe { std::ptr::write(state, State::Done) };
+                Poll::Ready(D::complete(Completion { data, meta }))
             }
-            State::Ready(..) => match std::mem::replace(&mut self.state, State::Done) {
+            State::Ready(..) => match std::mem::replace(state, State::Done) {
                 State::Ready(res, buf) => Poll::Ready((res, buf)),
-                _ => unreachable!(),
+                // SAFETY: matched as `Ready` just above.
+                _ => unsafe { std::hint::unreachable_unchecked() },
             },
-            State::Done => panic!("op future polled after completion"),
+            State::Done => polled_after_completion(),
         }
     }
 
     #[inline]
     fn is_terminated(&self) -> bool {
-        matches!(self.state, State::Done)
+        matches!(*self.state, State::Done)
     }
 
     #[inline]
     fn cancel(&self) {
-        if let State::Running(op) = &self.state {
+        if let State::Running(op) = &*self.state {
             // Safety: `op` is alive and unfinished, so its slab slot (the index the cancel
             // targets) still belongs to it.
             unsafe { op.op_canceller().cancel() }
@@ -175,7 +212,7 @@ impl<D: BufOp> OpFuture<D> {
     }
 
     fn state_name(&self) -> &'static str {
-        match self.state {
+        match *self.state {
             State::Running(_) => "Running",
             State::Ready(..) => "Ready",
             State::Done => "Done",
@@ -212,7 +249,7 @@ macro_rules! named_future {
             /// # Panics
             ///
             /// If called again after it returned `Ready`.
-            #[inline]
+            #[inline(always)]
             pub fn poll_result(&mut self, cx: &mut Context<'_>) -> Poll<BufResult<usize, $T>> {
                 self.0.poll_result(cx)
             }
@@ -236,7 +273,7 @@ macro_rules! named_future {
         impl<$T: $Bound> Future for $name<$T> {
             type Output = BufResult<usize, $T>;
 
-            #[inline]
+            #[inline(always)]
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 self.0.poll_result(cx)
             }

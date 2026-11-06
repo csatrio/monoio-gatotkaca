@@ -335,6 +335,120 @@ async fn drop_in_flight_then_reuse() {
     assert_eq!(&buf, b"again");
 }
 
+/// A future whose op completed in the kernel but whose result was never taken: dropping it
+/// frees the op slot and the buffer (the path next to the inline "already `Done`" drop).
+#[monoio::test(timer_enabled = true)]
+async fn drop_completed_before_result_was_taken() {
+    let (a, b) = tcp_pair().await;
+
+    // Never polled: the CQE finds the op in its submitted state.
+    let (res, _) = a.send_op(b"lost1".to_vec()).await;
+    assert_eq!(res.unwrap(), 5);
+    let tok = b.recv_op(Vec::with_capacity(16));
+    monoio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(!tok.is_terminated());
+    drop(tok);
+
+    // Polled once (pending), completed afterwards, then dropped.
+    let mut tok = b.recv_op(Vec::with_capacity(16));
+    let pending = std::future::poll_fn(|cx| Poll::Ready(tok.poll_result(cx).is_pending())).await;
+    assert!(pending);
+    let (res, _) = a.send_op(b"lost2".to_vec()).await;
+    assert_eq!(res.unwrap(), 5);
+    monoio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(!tok.is_terminated());
+    drop(tok);
+
+    // Both receives took their data; the stream goes on with what comes next.
+    let (res, _) = a.send_op(b"kept".to_vec()).await;
+    assert_eq!(res.unwrap(), 4);
+    let mut tok = b.recv_op(Vec::with_capacity(16));
+    let (res, buf) = std::future::poll_fn(|cx| tok.poll_result(cx)).await;
+    assert_eq!(res.unwrap(), 4);
+    assert_eq!(&buf, b"kept");
+    // Returned its output: nothing is left in it, dropping it is a no-op.
+    assert!(tok.is_terminated());
+    drop(tok);
+
+    let (res, _) = a.send_op(b"more".to_vec()).await;
+    assert_eq!(res.unwrap(), 4);
+    let (res, buf) = b.recv_op(Vec::with_capacity(16)).await;
+    assert_eq!(res.unwrap(), 4);
+    assert_eq!(&buf, b"more");
+}
+
+/// An op future may leave `block_on` and outlive its runtime: the op keeps the driver alive, so
+/// polling and dropping it stay safe when no runtime is current. (This is what a cheaper driver
+/// handle in `Op` would have to keep, see round 3, E4.)
+#[test]
+fn op_future_outlives_block_on_and_runtime() {
+    fn noop_waker() -> std::task::Waker {
+        use std::task::{RawWaker, RawWakerVTable};
+        fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        fn noop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        // SAFETY: the vtable functions do nothing and the data pointer is never used.
+        unsafe { std::task::Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        .build()
+        .unwrap();
+    // In flight (polled once), in flight (never polled), and completed but not taken.
+    let (mut polled, unpolled, mut completed, streams) = rt.block_on(async {
+        let (a, b) = tcp_pair().await;
+        let (c, d) = tcp_pair().await;
+        let mut polled = b.recv_op(Vec::with_capacity(16));
+        let pending =
+            std::future::poll_fn(|cx| Poll::Ready(polled.poll_result(cx).is_pending())).await;
+        assert!(pending);
+        let unpolled = a.recv_op(Vec::with_capacity(16));
+        let (res, _) = c.send_op(b"done".to_vec()).await;
+        assert_eq!(res.unwrap(), 4);
+        let completed = d.recv_op(Vec::with_capacity(16));
+        (polled, unpolled, completed, (a, b, c, d))
+    });
+
+    // After `block_on` returned, with the runtime alive.
+    assert!(polled.poll_result(&mut cx).is_pending());
+    drop(unpolled);
+
+    // After the runtime was dropped.
+    drop(rt);
+    assert!(polled.poll_result(&mut cx).is_pending());
+    assert!(!polled.is_terminated());
+    drop(polled);
+    // Its CQE was never reaped (the runtime did not run again), so it is pending or done;
+    // both must be fine to poll and to drop.
+    if let Poll::Ready((res, buf)) = completed.poll_result(&mut cx) {
+        assert_eq!(res.unwrap(), 4);
+        assert_eq!(&buf, b"done");
+        assert!(completed.is_terminated());
+    }
+    drop(completed);
+    drop(streams);
+}
+
+#[test]
+#[should_panic(expected = "op future polled after completion")]
+fn poll_after_completion_panics() {
+    let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (a, _b) = tcp_pair().await;
+        let mut tok = a.send_op(b"x".to_vec());
+        let (res, _) = std::future::poll_fn(|cx| tok.poll_result(cx)).await;
+        assert_eq!(res.unwrap(), 1);
+        assert!(tok.is_terminated());
+        let _ = std::future::poll_fn(|cx| tok.poll_result(cx)).await;
+    });
+}
+
 // ---- allocation count ----
 
 /// One request/response round trip with reused buffers.

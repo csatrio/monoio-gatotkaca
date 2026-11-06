@@ -910,11 +910,19 @@ impl UringInner {
     /// Make room for one SQE: flush the SQ (and reap CQEs) while it is full, a few times.
     #[inline]
     pub(crate) fn reserve_sqe(&mut self) -> io::Result<()> {
+        if !self.uring.submission().is_full() {
+            return Ok(());
+        }
         self.reserve_sqes(1)
     }
 
     /// Make room for `n` SQEs pushed back to back: flush the SQ (and reap CQEs) while it has
     /// less free space, a few times. `InvalidInput` if `n` is larger than the SQ.
+    ///
+    /// The slow path of the push functions, which check for room themselves on the SQ view they
+    /// push through.
+    #[cold]
+    #[inline(never)]
     fn reserve_sqes(&mut self, n: usize) -> io::Result<()> {
         let free = |inner: &mut Self| {
             let sq = inner.uring.submission();
@@ -993,21 +1001,43 @@ impl UringInner {
         }
     }
 
-    /// Reserve SQ space, allocate a slab slot for `data` and push its SQE. Returns the slot
-    /// index. On failure nothing is left behind and `data` is untouched.
-    fn push_op<T: OpAble>(&mut self, data: &mut T) -> io::Result<usize> {
-        // If the submission queue is full, flush it to the kernel
-        self.reserve_sqe()?;
-
-        let index = self.ops.insert(T::RET_IS_FD, T::KIND);
-        let sqe: squeue::Entry = data.uring_op().user_data(index as _);
-
-        // Can't fail after `reserve_sqe`; if it does, free the slot again.
-        if unsafe { self.uring.submission().push(&sqe) }.is_err() {
+    /// A push failed although the SQ had room (not reachable): free the slots taken for it.
+    #[cold]
+    #[inline(never)]
+    fn push_failed(&mut self, slots: &[usize]) -> io::Error {
+        for &index in slots {
             if let Some(slot) = self.ops.slab.get(index) {
                 slot.remove();
             }
-            return Err(io::Error::from_raw_os_error(libc::EBUSY));
+        }
+        io::Error::from_raw_os_error(libc::EBUSY)
+    }
+
+    /// Reserve SQ space, allocate a slab slot for `data` and push its SQE. Returns the slot
+    /// index. On failure nothing is left behind (the SQE of `data` was built, nothing else).
+    fn push_op<T: OpAble>(&mut self, data: &mut T) -> io::Result<usize> {
+        // Built before the SQ is looked at: `uring_op` runs buffer methods (user code), so no SQ
+        // view is alive across it.
+        let sqe: squeue::Entry = data.uring_op();
+
+        // One SQ view for the room check and the push: every view loads the kernel's head when
+        // it is made and stores the tail when it is dropped.
+        let mut sq = self.uring.submission();
+        if sq.is_full() {
+            // Flush the queue to the kernel (and reap CQEs), a few times.
+            drop(sq);
+            self.reserve_sqes(1)?;
+            sq = self.uring.submission();
+        }
+
+        let index = self.ops.insert(T::RET_IS_FD, T::KIND);
+        let sqe = sqe.user_data(index as _);
+
+        // Can't fail: there is room; if it does, free the slot again.
+        let pushed = unsafe { sq.push(&sqe) };
+        drop(sq);
+        if pushed.is_err() {
+            return Err(self.push_failed(&[index]));
         }
         metric!(
             let opcode = (sqe.get_opcode() as usize).min(63);
@@ -1029,23 +1059,27 @@ impl UringInner {
     /// whole), each with a new single-shot slab slot. Returns the slot indices. On failure
     /// nothing is left behind.
     fn push_chain<const N: usize>(&mut self, sqes: [squeue::Entry; N]) -> io::Result<[usize; N]> {
-        self.reserve_sqes(N)?;
+        // One SQ view for the room check and the push, see `push_op`.
+        let mut sq = self.uring.submission();
+        if sq.capacity() - sq.len() < N {
+            drop(sq);
+            self.reserve_sqes(N)?;
+            sq = self.uring.submission();
+        }
         let mut slots = [usize::MAX; N];
         let mut i = 0;
+        let ops = &mut self.ops;
         let sqes = sqes.map(|sqe| {
-            let index = self.ops.insert(false, OpKind::Single);
+            let index = ops.insert(false, OpKind::Single);
             slots[i] = index;
             i += 1;
             sqe.user_data(index as _)
         });
-        // Can't fail after `reserve_sqes`; if it does, free the slots again.
-        if unsafe { self.uring.submission().push_multiple(&sqes) }.is_err() {
-            for index in slots {
-                if let Some(slot) = self.ops.slab.get(index) {
-                    slot.remove();
-                }
-            }
-            return Err(io::Error::from_raw_os_error(libc::EBUSY));
+        // Can't fail: there is room for all; if it does, free the slots again.
+        let pushed = unsafe { sq.push_multiple(&sqes) };
+        drop(sq);
+        if pushed.is_err() {
+            return Err(self.push_failed(&slots));
         }
         metric!(
             for (sqe, index) in sqes.iter().zip(slots) {
@@ -1070,26 +1104,31 @@ impl UringInner {
         ts: *const Timespec,
     ) -> io::Result<usize> {
         debug_assert!(T::KIND != OpKind::Multishot);
-        self.reserve_sqes(2)?;
-
-        let index = self.ops.insert(T::RET_IS_FD, T::KIND);
-        let sqe = data
-            .uring_op()
-            .user_data(index as _)
-            .flags(squeue::Flags::IO_LINK);
+        // Built before the SQ is looked at, see `push_op`.
+        let sqe = data.uring_op().flags(squeue::Flags::IO_LINK);
         let timeout = opcode::LinkTimeout::new(ts)
             .build()
             .user_data(LINK_TIMEOUT_USERDATA);
 
+        // One SQ view for the room check and the push, see `push_op`.
+        let mut sq = self.uring.submission();
+        if sq.capacity() - sq.len() < 2 {
+            drop(sq);
+            self.reserve_sqes(2)?;
+            sq = self.uring.submission();
+        }
+
+        let index = self.ops.insert(T::RET_IS_FD, T::KIND);
+        let sqe = sqe.user_data(index as _);
+
         #[cfg(feature = "metrics")]
         let opcode = (sqe.get_opcode() as usize).min(63);
 
-        // Can't fail after `reserve_sqes`; if it does, free the slot again.
-        if unsafe { self.uring.submission().push_multiple(&[sqe, timeout]) }.is_err() {
-            if let Some(slot) = self.ops.slab.get(index) {
-                slot.remove();
-            }
-            return Err(io::Error::from_raw_os_error(libc::EBUSY));
+        // Can't fail: there is room for both; if it does, free the slot again.
+        let pushed = unsafe { sq.push_multiple(&[sqe, timeout]) };
+        drop(sq);
+        if pushed.is_err() {
+            return Err(self.push_failed(&[index]));
         }
         metric!(
             self.stats.ops_by_opcode[opcode] += 1;
