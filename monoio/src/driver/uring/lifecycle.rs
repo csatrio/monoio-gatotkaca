@@ -26,7 +26,7 @@ use crate::{
         op::{CompletionMeta, MaybeFd, OpAble, OpKind},
         raw::Cqe,
     },
-    utils::slab::Ref,
+    utils::slab::{Ref, Slab},
 };
 
 /// Flag indicating more CQEs will follow for this SQE (SEND_ZC, multishot).
@@ -297,7 +297,10 @@ impl Ref<'_, MaybeFdLifecycle> {
                 }
             }
         }
-        self.complete_slow(res, flags, more)
+        let (slab, key) = self.into_parts();
+        // SAFETY: as for this function; `key` is the occupied slot of the `Ref` just taken
+        // apart.
+        unsafe { Self::complete_slow(slab, key, res, flags) }
     }
 
     #[inline]
@@ -312,9 +315,23 @@ impl Ref<'_, MaybeFdLifecycle> {
 
     /// [`complete`](Self::complete) for everything but the fast path: multishot ops, CQEs with
     /// `F_MORE`, zero-copy and dropped ops.
+    ///
+    /// Takes the slot as slab and key, which travel in registers. A `Ref` is passed in memory,
+    /// and those stores would sit before the branch to the fast path, on every CQE.
+    ///
+    /// # Safety
+    /// As for [`complete`](Self::complete), and the slot of `key` must be occupied.
     #[inline(never)]
-    unsafe fn complete_slow(mut self, res: i32, flags: u32, more: bool) -> Completed {
-        if let Lifecycle::Multi(state) = &mut self.lifecycle {
+    unsafe fn complete_slow(
+        slab: &mut Slab<MaybeFdLifecycle>,
+        key: usize,
+        res: i32,
+        flags: u32,
+    ) -> Completed {
+        // SAFETY: the slot is occupied (caller).
+        let mut this = unsafe { slab.get_unchecked(key) };
+        let more = flags & IORING_CQE_F_MORE != 0;
+        if let Lifecycle::Multi(state) = &mut this.lifecycle {
             let cqe = Cqe::new(res, flags);
             if let Some(ignored) = state.ignored.as_mut() {
                 ignored.discard(cqe);
@@ -326,7 +343,7 @@ impl Ref<'_, MaybeFdLifecycle> {
                     };
                 }
                 return Completed {
-                    deferred: Some(self.remove()),
+                    deferred: Some(this.remove()),
                     #[cfg(any(test, feature = "metrics"))]
                     queued: Some(0),
                 };
@@ -346,8 +363,8 @@ impl Ref<'_, MaybeFdLifecycle> {
             };
         }
 
-        let result = Self::result(res, self.is_fd);
-        if more && self.kind == OpKind::Single {
+        let result = Self::result(res, this.is_fd);
+        if more && this.kind == OpKind::Single {
             trace!(
                 "MONOIO DEBUG[lifecycle]: F_MORE on a single-shot op, flags {}",
                 flags
@@ -357,7 +374,7 @@ impl Ref<'_, MaybeFdLifecycle> {
         // A first CQE with F_MORE is kept until the final CQE (without F_MORE: the SEND_ZC
         // notification, or the last CQE of an unexpected multishot); results of the CQEs in
         // between are dropped, which closes a fd they carry.
-        let lifecycle = &mut self.lifecycle;
+        let lifecycle = &mut this.lifecycle;
         let mut wake = None;
         let next = match std::mem::replace(lifecycle, Lifecycle::Submitted) {
             Lifecycle::WaitingFirst(waker) => {
@@ -421,17 +438,66 @@ impl Ref<'_, MaybeFdLifecycle> {
                 Completed::default()
             }
             None => Completed {
-                deferred: Some(self.remove()),
+                deferred: Some(this.remove()),
                 #[cfg(any(test, feature = "metrics"))]
                 queued: None,
             },
         }
     }
 
+    /// Poll the op of this slot: its result once the final CQE is in (which frees the slot).
+    ///
+    /// The three states an op is normally polled in are handled here, with compares instead
+    /// of a jump table and nothing that needs more than a scratch register or two; the other
+    /// states are out of line ([`poll_op_slow`](Self::poll_op_slow)), so that the common polls
+    /// do not pay for their register saves.
     #[allow(clippy::needless_pass_by_ref_mut)]
     #[inline]
     pub(crate) fn poll_op(mut self, cx: &mut Context<'_>) -> Poll<CompletionMeta> {
-        let ref_mut = &mut self.lifecycle;
+        match &mut self.lifecycle {
+            Lifecycle::Completed(result, flags) => {
+                let meta = CompletionMeta {
+                    // SAFETY: the result is moved out here and the slot is freed right below
+                    // without dropping it; nothing else in the slot needs a drop.
+                    result: unsafe { std::ptr::read(result) },
+                    flags: *flags,
+                };
+                // SAFETY: see above, only plain data is left in the slot.
+                unsafe { self.remove_forget() };
+                Poll::Ready(meta)
+            }
+            ref_mut @ Lifecycle::Submitted => {
+                let waker = cx.waker().clone();
+                // SAFETY: `Submitted` owns nothing, so the old state needs no drop. A plain
+                // assignment calls the drop glue of `Lifecycle`: after the clone (a call
+                // through the waker's vtable) the compiler no longer knows the state.
+                unsafe { std::ptr::write(ref_mut, Lifecycle::Waiting(waker)) };
+                Poll::Pending
+            }
+            // Polled again before the CQE, by the task that already waits.
+            Lifecycle::Waiting(waker) if waker.will_wake(cx.waker()) => Poll::Pending,
+            _ => {
+                let (slab, key) = self.into_parts();
+                // SAFETY: `key` is the occupied slot of the `Ref` just taken apart.
+                unsafe { Self::poll_op_slow(slab, key, cx) }
+            }
+        }
+    }
+
+    /// [`poll_op`](Self::poll_op) for the states it leaves out: a new waker, the states of a
+    /// zero-copy send, and the states an `Op` is never polled in.
+    ///
+    /// # Safety
+    /// The slot of `key` must be occupied.
+    #[inline(never)]
+    unsafe fn poll_op_slow(
+        slab: &mut Slab<MaybeFdLifecycle>,
+        key: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<CompletionMeta> {
+        // SAFETY: the slot is occupied (caller).
+        let mut this = unsafe { slab.get_unchecked(key) };
+        let ref_mut = &mut this.lifecycle;
         match ref_mut {
             Lifecycle::Submitted => {
                 *ref_mut = Lifecycle::Waiting(cx.waker().clone());
@@ -460,7 +526,7 @@ impl Ref<'_, MaybeFdLifecycle> {
                     flags: *flags,
                 };
                 // SAFETY: see above, only plain data is left in the slot.
-                unsafe { self.remove_forget() };
+                unsafe { this.remove_forget() };
                 Poll::Ready(meta)
             }
             // Not reachable through `Op` (dropped ops are not polled, multishot ops are not
@@ -721,7 +787,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::utils::slab::Slab;
 
     const IORING_CQE_F_NOTIF: u32 = 8;
 
