@@ -1,59 +1,45 @@
 //! Timer state structures.
 //!
-//! This module contains the heart of the intrusive timer implementation, and as
-//! such the structures inside are full of tricky concurrency and unsafe code.
+//! This module contains the heart of the intrusive timer implementation.
 //!
 //! # Ground rules
 //!
-//! The heart of the timer implementation here is the `TimerShared` structure,
-//! shared between the `TimerEntry` and the driver. Generally, we permit access
-//! to `TimerShared` ONLY via either 1) a mutable reference to `TimerEntry` or
-//! 2) a held driver lock.
+//! A timer is a [`TimerShared`] that lives inside its owner's [`TimerEntry`] (which is inside a
+//! `Sleep`). While it is registered, the driver's wheel links it into one of its lists through a
+//! raw pointer, so the entry must stay pinned and must unlink itself before it goes away.
 //!
-//! It follows from this that any changes made while holding BOTH 1 and 2 will
-//! be reliably visible, regardless of ordering. This is because of the acq/rel
-//! fences on the driver lock ensuring ordering with 2, and rust mutable
-//! reference rules for 1 (a mutable reference to an object can't be passed
-//! between threads without an acq/rel barrier, and same-thread we have local
-//! happens-before ordering).
+//! The runtime is single-threaded: the owner and the driver never run at the same time, and the
+//! whole state is plain `Cell`s. (The code came from tokio, where both sides were separated by a
+//! lock and by cache-line padding; neither exists here.)
 //!
 //! # State field
 //!
-//! Each timer has a state field associated with it. This field contains either
-//! the current scheduled time, or a special flag value indicating its state.
-//! This state can either indicate that the timer is on the 'pending' queue (and
-//! thus will be fired with an `Ok(())` result soon) or that it has already been
-//! fired/deregistered.
+//! `state` holds either the tick at which the timer expires (its *true* expiration), or one of
+//! the flag values below: never registered, on the wheel's pending list, or fired.
 //!
-//! This single state field allows for code that is firing the timer to
-//! synchronize with any racing `reset` calls reliably.
+//! # Cached vs true expiration
 //!
-//! # Cached vs true timeouts
+//! `cached_when` is the tick of the wheel slot the entry is linked into (the wheel needs it to
+//! find the list when the entry is removed). The *true* expiration in `state` may be any tick
+//! that is not earlier than it:
 //!
-//! To allow for the use case of a timeout that is periodically reset before
-//! expiration to be as lightweight as possible, we support optimistically
-//! lock-free timer resets, in the case where a timer is rescheduled to a later
-//! point than it was originally scheduled for.
+//! - Moving a registered timer to a tick `>= cached_when` is one store (`move_expiration`). The
+//!   entry stays where it is. When the driver reaches the slot, it compares against the true
+//!   expiration and puts the entry into the slot it now belongs to (`mark_pending` fails with
+//!   the new tick).
+//! - Only a tick before `cached_when` needs the wheel at once: remove and insert.
 //!
-//! This is accomplished by lazily rescheduling timers. That is, we update the
-//! state field field with the true expiration of the timer from the holder of
-//! the [`TimerEntry`]. When the driver services timers (ie, whenever it's
-//! walking lists of timers), it checks this "true when" value, and reschedules
-//! based on it.
+//! # Disarmed entries (`Deadline`)
 //!
-//! We do, however, also need to track what the expiration time was when we
-//! originally registered the timer; this is used to locate the right linked
-//! list when the timer is being cancelled. This is referred to as the "cached
-//! when" internally.
-//!
-//! There is of course a race condition between timer reset and timer
-//! expiration. If the driver fails to observe the updated expiration time, it
-//! could trigger expiration of the timer too early. However, because
-//! `mark_pending` performs a compare-and-swap, it will identify this race and
-//! refuse to mark the timer as pending.
+//! A [`Deadline`](crate::time::Deadline) that is disarmed while registered gets the true
+//! expiration `STATE_NEVER`, again one store. If it is armed again before the wheel reaches its
+//! slot, that is a third store. Otherwise the wheel finds `STATE_NEVER` in the slot, puts the
+//! entry on the pending list as `STATE_PENDING_SILENT`, and the driver deregisters it without
+//! waking anybody (its state becomes `STATE_INIT`, "not registered, not fired").
 
 use std::{
-    cell::{Cell, RefCell, UnsafeCell},
+    cell::{Cell, UnsafeCell},
+    fmt,
     marker::PhantomPinned,
     pin::Pin,
     ptr::NonNull,
@@ -63,187 +49,20 @@ use std::{
 use super::Handle;
 use crate::{time::Instant, utils::linked_list};
 
-type TimerResult = Result<(), crate::time::error::Error>;
-
+/// Not in the wheel, and fired: a `Sleep` that completed, a `Deadline` that expired while armed.
 const STATE_DEREGISTERED: u64 = u64::MAX;
-const STATE_PENDING_FIRE: u64 = STATE_DEREGISTERED - 1;
-const STATE_MIN_VALUE: u64 = STATE_PENDING_FIRE;
-
-/// This structure holds the current shared state of the timer - its scheduled
-/// time (if registered), or otherwise the result of the timer completing, as
-/// well as the registered waker.
-///
-/// Generally, the StateCell is only permitted to be accessed from two contexts:
-/// Either a thread holding the corresponding &mut TimerEntry, or a thread
-/// holding the timer driver lock. The write actions on the StateCell amount to
-/// passing "ownership" of the StateCell between these contexts; moving a timer
-/// from the TimerEntry to the driver requires _both_ holding the &mut
-/// TimerEntry and the driver lock, while moving it back (firing the timer)
-/// requires only the driver lock.
-pub(super) struct StateCell {
-    /// Holds either the scheduled expiration time for this timer, or (if the
-    /// timer has been fired and is unregistered), `u64::MAX`.
-    state: Cell<u64>,
-    /// If the timer is fired (an Acquire order read on state shows
-    /// `u64::MAX`), holds the result that should be returned from
-    /// polling the timer. Otherwise, the contents are unspecified and reading
-    /// without holding the driver lock is undefined behavior.
-    result: UnsafeCell<TimerResult>,
-    /// The currently-registered waker
-    waker: CachePadded<RefCell<Option<Waker>>>,
-}
-
-impl Default for StateCell {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Debug for StateCell {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "StateCell({:?})", self.read_state())
-    }
-}
-
-impl StateCell {
-    fn new() -> Self {
-        Self {
-            state: Cell::new(STATE_DEREGISTERED),
-            result: UnsafeCell::new(Ok(())),
-            waker: CachePadded(RefCell::new(None)),
-        }
-    }
-
-    /// Returns the current expiration time, or None if not currently scheduled.
-    fn when(&self) -> Option<u64> {
-        let cur_state = self.state.get();
-
-        if cur_state == u64::MAX {
-            None
-        } else {
-            Some(cur_state)
-        }
-    }
-
-    /// If the timer is completed, returns the result of the timer. Otherwise,
-    /// returns None and registers the waker.
-    fn poll(&self, waker: &Waker) -> Poll<TimerResult> {
-        // We must register first. This ensures that either `fire` will
-        // observe the new waker, or we will observe a racing fire to have set
-        // the state, or both.
-        let mut w = self.waker.0.borrow_mut();
-        if w.is_none() {
-            let _ = w.insert(waker.clone());
-        }
-
-        self.read_state()
-    }
-
-    fn read_state(&self) -> Poll<TimerResult> {
-        let cur_state = self.state.get();
-
-        if cur_state == STATE_DEREGISTERED {
-            // SAFETY: The driver has fired this timer; this involves writing
-            // the result, and then writing (with release ordering) the state
-            // field.
-            Poll::Ready(unsafe { *self.result.get() })
-        } else {
-            Poll::Pending
-        }
-    }
-
-    /// Marks this timer as being moved to the pending list, if its scheduled
-    /// time is not after `not_after`.
-    ///
-    /// If the timer is scheduled for a time after not_after, returns an Err
-    /// containing the current scheduled time.
-    ///
-    /// SAFETY: Must hold the driver lock.
-    unsafe fn mark_pending(&self, not_after: u64) -> Result<(), u64> {
-        // Quick initial debug check to see if the timer is already fired. Since
-        // firing the timer can only happen with the driver lock held, we know
-        // we shouldn't be able to "miss" a transition to a fired state, even
-        // with relaxed ordering.
-        let cur_state = self.state.get();
-
-        debug_assert!(cur_state < STATE_MIN_VALUE);
-
-        if cur_state > not_after {
-            return Err(cur_state);
-        }
-
-        self.state.set(STATE_PENDING_FIRE);
-        Ok(())
-    }
-
-    /// Fires the timer, setting the result to the provided result.
-    ///
-    /// Returns:
-    /// * `Some(waker) - if fired and a waker needs to be invoked once the driver lock is released
-    /// * `None` - if fired and a waker does not need to be invoked, or if already fired
-    ///
-    /// SAFETY: The driver lock must be held.
-    unsafe fn fire(&self, result: TimerResult) -> Option<Waker> {
-        // Quick initial check to see if the timer is already fired. Since
-        // firing the timer can only happen with the driver lock held, we know
-        // we shouldn't be able to "miss" a transition to a fired state, even
-        // with relaxed ordering.
-        let cur_state = self.state.get();
-        if cur_state == STATE_DEREGISTERED {
-            return None;
-        }
-
-        // SAFETY: We assume the driver lock is held and the timer is not
-        // fired, so only the driver is accessing this field.
-        //
-        // We perform a release-ordered store to state below, to ensure this
-        // write is visible before the state update is visible.
-        unsafe {
-            let p = self.result.get();
-            *p = result;
-        }
-
-        self.state.set(STATE_DEREGISTERED);
-
-        self.waker.0.take()
-    }
-
-    /// Marks the timer as registered (poll will return None) and sets the
-    /// expiration time.
-    ///
-    /// While this function is memory-safe, it should only be called from a
-    /// context holding both `&mut TimerEntry` and the driver lock.
-    fn set_expiration(&self, timestamp: u64) {
-        debug_assert!(timestamp < STATE_MIN_VALUE);
-
-        // We can use relaxed ordering because we hold the driver lock and will
-        // fence when we release the lock.
-        self.state.set(timestamp);
-    }
-
-    /// Attempts to adjust the timer to a new timestamp.
-    ///
-    /// If the timer has already been fired, is pending firing, or the new
-    /// timestamp is earlier than the old timestamp, (or occasionally
-    /// spuriously) returns Err without changing the timer's state. In this
-    /// case, the timer must be deregistered and re-registered.
-    fn extend_expiration(&self, new_timestamp: u64) -> Result<(), ()> {
-        let state = self.state.get();
-        if new_timestamp < state || state >= STATE_MIN_VALUE {
-            return Err(());
-        }
-        self.state.set(new_timestamp);
-        Ok(())
-    }
-
-    /// Returns true if the state of this timer indicates that the timer might
-    /// be registered with the driver. This check is performed with relaxed
-    /// ordering, but is conservative - if it returns false, the timer is
-    /// definitely _not_ registered.
-    pub(super) fn might_be_registered(&self) -> bool {
-        self.state.get() != u64::MAX
-    }
-}
+/// Not in the wheel, and not fired: a `Sleep` before its first poll, a disarmed `Deadline`.
+const STATE_INIT: u64 = u64::MAX - 1;
+/// On the wheel's pending list: it fires in the driver's current pass.
+const STATE_PENDING_FIRE: u64 = u64::MAX - 2;
+/// On the wheel's pending list, disarmed: the driver's current pass deregisters it silently.
+const STATE_PENDING_SILENT: u64 = u64::MAX - 3;
+/// Every state below this value is an expiration tick.
+const STATE_MIN_VALUE: u64 = STATE_PENDING_SILENT;
+/// The expiration tick of a registered, disarmed entry: later than every real tick.
+const STATE_NEVER: u64 = u64::MAX - 4;
+/// The latest tick a timer can be set to.
+pub(super) const MAX_TICK: u64 = STATE_NEVER - 1;
 
 /// A timer entry.
 ///
@@ -251,22 +70,15 @@ impl StateCell {
 /// timer. As this participates in intrusive data structures, it must be pinned
 /// before polling.
 #[derive(Debug)]
-pub(super) struct TimerEntry {
-    /// Arc reference to the driver. We can only free the driver after
-    /// deregistering everything from their respective timer wheels.
+pub(crate) struct TimerEntry {
+    /// The driver. The reference keeps the wheel alive for as long as this entry may be linked
+    /// into it, also when the entry outlives the runtime.
     driver: Handle,
-    /// Shared inner structure; this is part of an intrusive linked list, and
-    /// therefore other references can exist to it while mutable references to
-    /// Entry exist.
-    ///
-    /// This is manipulated only under the inner mutex. TODO: Can we use loom
-    /// cells for this?
+    /// The state the driver sees. It is part of an intrusive linked list, so the driver holds
+    /// pointers to it while this entry is registered.
     inner: UnsafeCell<TimerShared>,
-    /// Initial deadline for the timer. This is used to register on the first
-    /// poll, as we can't register prior to being pinned.
-    initial_deadline: Option<Instant>,
     /// Ensure the type is !Unpin
-    _m: std::marker::PhantomPinned,
+    _m: PhantomPinned,
 }
 
 /// An TimerHandle is the (non-enforced) "unique" pointer from the driver to the
@@ -286,77 +98,120 @@ pub(crate) struct TimerHandle {
 
 pub(super) type EntryList = crate::utils::linked_list::LinkedList<TimerShared, TimerShared>;
 
-/// The shared state structure of a timer. This structure is shared between the
-/// frontend (`Entry`) and driver backend.
+/// The state of a timer, shared between its owner (`TimerEntry`) and the driver.
 ///
-/// Note that this structure is located inside the `TimerEntry` structure.
-#[derive(Debug)]
+/// 48 bytes, alignment 8: everything `poll`, `fire` and the wheel touch is within one cache
+/// line's worth of memory.
 pub(crate) struct TimerShared {
-    /// Current state. This records whether the timer entry is currently under
-    /// the ownership of the driver, and if not, its current state (not
-    /// complete, fired, error, etc).
-    state: StateCell,
+    /// The true expiration tick, or one of the `STATE_*` flags. Written by the owner (register,
+    /// lazy reset) and by the driver (pending, fired).
+    state: Cell<u64>,
 
-    /// Data manipulated by the driver thread itself, only.
-    driver_state: CachePadded<TimerSharedPadded>,
+    /// The tick of the wheel slot this entry is linked into (`u64::MAX`: the pending list). Valid
+    /// only while registered; owned by the driver.
+    cached_when: Cell<u64>,
+
+    /// A link within the doubly-linked list of timers on a particular level and
+    /// slot. Valid only while registered.
+    pointers: UnsafeCell<linked_list::Pointers<TimerShared>>,
+
+    /// The waker of the task that last got `Pending` from this timer.
+    waker: Cell<Option<Waker>>,
 
     _p: PhantomPinned,
 }
 
+impl fmt::Debug for TimerShared {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TimerShared")
+            .field("state", &self.state.get())
+            .field("cached_when", &self.cached_when.get())
+            .finish()
+    }
+}
+
 impl TimerShared {
-    pub(super) fn new() -> Self {
+    fn new(state: u64) -> Self {
         Self {
-            state: StateCell::default(),
-            driver_state: CachePadded(TimerSharedPadded::new()),
+            state: Cell::new(state),
+            cached_when: Cell::new(0),
+            pointers: UnsafeCell::new(linked_list::Pointers::new()),
+            waker: Cell::new(None),
             _p: PhantomPinned,
         }
     }
 
     /// Gets the cached time-of-expiration value
     pub(super) fn cached_when(&self) -> u64 {
-        // Cached-when is only accessed under the driver lock, so we can use relaxed
-        self.driver_state.0.cached_when.get()
+        self.cached_when.get()
     }
 
     /// Gets the true time-of-expiration value, and copies it into the cached
     /// time-of-expiration value.
     ///
-    /// SAFETY: Must be called with the driver lock held, and when this entry is
-    /// not in any timer wheel lists.
+    /// SAFETY: Must be called when this entry is not in any timer wheel lists.
     pub(super) unsafe fn sync_when(&self) -> u64 {
         let true_when = self.true_when();
 
-        self.driver_state.0.cached_when.set(true_when);
+        self.cached_when.set(true_when);
 
         true_when
     }
 
-    /// Sets the cached time-of-expiration value.
-    ///
-    /// SAFETY: Must be called with the driver lock held, and when this entry is
-    /// not in any timer wheel lists.
-    unsafe fn set_cached_when(&self, when: u64) {
-        self.driver_state.0.cached_when.set(when);
-    }
-
-    /// Returns the true time-of-expiration value, with relaxed memory ordering.
+    /// Returns the true time-of-expiration value. Only for an entry whose state is a tick.
     pub(super) fn true_when(&self) -> u64 {
-        self.state.when().expect("Timer already fired")
+        let state = self.state.get();
+        debug_assert!(state < STATE_MIN_VALUE, "timer is not scheduled");
+        state
     }
 
     /// Sets the true time-of-expiration value, even if it is less than the
     /// current expiration or the timer is deregistered.
     ///
-    /// SAFETY: Must only be called with the driver lock held and the entry not
-    /// in the timer wheel.
+    /// SAFETY: Must only be called with the entry not in the timer wheel.
     pub(super) unsafe fn set_expiration(&self, t: u64) {
-        self.state.set_expiration(t);
-        self.driver_state.0.cached_when.set(t);
+        debug_assert!(t < STATE_MIN_VALUE);
+        self.state.set(t);
+        self.cached_when.set(t);
     }
 
-    /// Sets the true time-of-expiration only if it is after the current.
-    pub(super) fn extend_expiration(&self, t: u64) -> Result<(), ()> {
-        self.state.extend_expiration(t)
+    /// Moves the true time-of-expiration to `t` if the entry can stay in its wheel slot: it is
+    /// in one, and `t` is not before the slot's tick.
+    ///
+    /// Returns `false` without changing anything otherwise (not registered, on the pending list,
+    /// or `t` is earlier than the slot). The entry must be re-registered then.
+    #[inline]
+    fn move_expiration(&self, t: u64) -> bool {
+        debug_assert!(t <= MAX_TICK);
+        if self.state.get() >= STATE_MIN_VALUE || t < self.cached_when.get() {
+            return false;
+        }
+        self.state.set(t);
+        true
+    }
+
+    /// Disarms the entry: it will not fire, and nobody is woken, until its expiration is set
+    /// again.
+    #[inline]
+    fn disarm(&self) {
+        let state = self.state.get();
+        if state < STATE_MIN_VALUE {
+            // In a wheel slot. It stays there (`STATE_NEVER` is later than the slot's tick).
+            self.state.set(STATE_NEVER);
+        } else if state == STATE_DEREGISTERED {
+            // Expired: forget that.
+            self.state.set(STATE_INIT);
+        } else if state == STATE_PENDING_FIRE {
+            // Only from a waker that runs inside the driver's pass.
+            self.state.set(STATE_PENDING_SILENT);
+        }
+    }
+
+    /// Whether a fire would be reported: the entry is scheduled (or about to fire) and not
+    /// disarmed, or it already fired.
+    fn is_armed(&self) -> bool {
+        let state = self.state.get();
+        state < STATE_NEVER || state == STATE_PENDING_FIRE || state == STATE_DEREGISTERED
     }
 
     /// Returns a TimerHandle for this timer.
@@ -366,52 +221,103 @@ impl TimerShared {
         }
     }
 
-    /// Returns true if the state of this timer indicates that the timer might
-    /// be registered with the driver. This check is performed with relaxed
-    /// ordering, but is conservative - if it returns false, the timer is
-    /// definitely _not_ registered.
-    pub(super) fn might_be_registered(&self) -> bool {
-        self.state.might_be_registered()
+    /// Whether the entry is linked into the wheel (a slot or the pending list).
+    pub(super) fn is_registered(&self) -> bool {
+        self.state.get() <= STATE_PENDING_FIRE
     }
-}
 
-/// Additional shared state between the driver and the timer which is cache
-/// padded. This contains the information that the driver thread accesses most
-/// frequently to minimize contention. In particular, we move it away from the
-/// waker, as the waker is updated on every poll.
-struct TimerSharedPadded {
-    /// The expiration time for which this entry is currently registered.
-    /// Generally owned by the driver, but is accessed by the entry when not
-    /// registered.
-    cached_when: Cell<u64>,
-
-    /// The true expiration time. Set by the timer future, read by the driver.
-    true_when: Cell<u64>,
-
-    /// A link within the doubly-linked list of timers on a particular level and
-    /// slot. Valid only if state is equal to Registered.
-    ///
-    /// Only accessed under the entry lock.
-    pointers: UnsafeCell<linked_list::Pointers<TimerShared>>,
-}
-
-impl std::fmt::Debug for TimerSharedPadded {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TimerSharedPadded")
-            .field("when", &self.true_when)
-            .field("cached_when", &self.cached_when)
-            .finish()
+    /// `Ready` once the timer fired. Otherwise remembers the waker for `fire`, unless the entry
+    /// is disarmed: nothing will fire then.
+    #[inline]
+    fn poll(&self, waker: &Waker) -> Poll<()> {
+        let state = self.state.get();
+        if state == STATE_DEREGISTERED {
+            return Poll::Ready(());
+        }
+        if state < STATE_NEVER || state == STATE_PENDING_FIRE {
+            self.register_waker(waker);
+        }
+        Poll::Pending
     }
-}
 
-impl TimerSharedPadded {
-    fn new() -> Self {
-        Self {
-            cached_when: Cell::new(0),
-            true_when: Cell::new(0),
-            pointers: UnsafeCell::new(linked_list::Pointers::new()),
+    /// Stores `waker` unless the stored one already wakes the same task.
+    #[inline]
+    fn register_waker(&self, waker: &Waker) {
+        // SAFETY: the reference to the cell's content ends before anything else touches the cell,
+        // and `same_waker` only compares pointers (it calls nothing).
+        match unsafe { (*self.waker.as_ptr()).as_ref() } {
+            // A timer made for one request: its first `Pending`.
+            None => self.waker.set(Some(waker.clone())),
+            Some(old) if same_waker(old, waker) => {}
+            Some(_) => self.replace_waker(waker),
         }
     }
+
+    /// Another task polls the timer now.
+    #[cold]
+    fn replace_waker(&self, waker: &Waker) {
+        // The clone and the drop of the old waker are calls into the waker's vtable; neither
+        // happens while the cell is borrowed.
+        let old = self.waker.replace(Some(waker.clone()));
+        drop(old);
+    }
+
+    /// Marks this timer as being moved to the pending list, if its scheduled
+    /// time is not after `not_after`, or if it is disarmed.
+    ///
+    /// If the timer is scheduled for a time after `not_after`, returns an Err
+    /// containing the current scheduled time.
+    fn mark_pending(&self, not_after: u64) -> Result<(), u64> {
+        let cur_state = self.state.get();
+
+        debug_assert!(cur_state < STATE_MIN_VALUE);
+
+        if cur_state > not_after {
+            if cur_state == STATE_NEVER {
+                // Disarmed and not armed again in time: it leaves the wheel.
+                self.state.set(STATE_PENDING_SILENT);
+                return Ok(());
+            }
+            return Err(cur_state);
+        }
+
+        self.state.set(STATE_PENDING_FIRE);
+        Ok(())
+    }
+
+    /// Takes the entry out of the driver's hands: it is fired (`STATE_DEREGISTERED`), or, if it
+    /// was disarmed, silently deregistered (`STATE_INIT`). Does nothing if it is not registered.
+    ///
+    /// Returns the waker and whether to wake it. Either way the caller lets go of it only after
+    /// it is done with the entry and with the wheel: waking, and also dropping the last waker of
+    /// a task, may run code that uses timers or frees this entry.
+    fn fire(&self) -> (Option<Waker>, bool) {
+        let state = self.state.get();
+        if state >= STATE_INIT {
+            return (None, false);
+        }
+        if state == STATE_PENDING_SILENT {
+            self.state.set(STATE_INIT);
+            return (self.waker.take(), false);
+        }
+
+        self.state.set(STATE_DEREGISTERED);
+
+        (self.waker.take(), true)
+    }
+}
+
+/// Whether `a` and `b` wake the same task.
+///
+/// `Waker::will_wake` alone says "no" far too often here: it compares the vtable *addresses*, and
+/// this runtime's task wakers take their vtable from a promoted constant (`task/waker.rs`,
+/// `raw_waker`), which the compiler emits once per place it is inlined into. The waker a task is
+/// polled with and a clone of it then differ in that address, and a timer polled once per
+/// request would clone a waker and drop one on every poll. So when the addresses differ, the
+/// vtables' contents (four function pointers) decide.
+#[inline]
+fn same_waker(a: &Waker, b: &Waker) -> bool {
+    a.data() == b.data() && (std::ptr::eq(a.vtable(), b.vtable()) || a.vtable() == b.vtable())
 }
 
 unsafe impl linked_list::Link for TimerShared {
@@ -430,21 +336,19 @@ unsafe impl linked_list::Link for TimerShared {
     unsafe fn pointers(
         target: NonNull<Self::Target>,
     ) -> NonNull<linked_list::Pointers<Self::Target>> {
-        unsafe { NonNull::new(target.as_ref().driver_state.0.pointers.get()).unwrap() }
+        unsafe { NonNull::new_unchecked(target.as_ref().pointers.get()) }
     }
 }
 
 // ===== impl Entry =====
 
 impl TimerEntry {
-    pub(crate) fn new(handle: &Handle, deadline: Instant) -> Self {
-        let driver = handle.clone();
-
+    /// An entry that is not registered yet. The first `poll_elapsed` (or `reset`) registers it.
+    pub(crate) fn new(driver: Handle) -> Self {
         Self {
             driver,
-            inner: UnsafeCell::new(TimerShared::new()),
-            initial_deadline: Some(deadline),
-            _m: std::marker::PhantomPinned,
+            inner: UnsafeCell::new(TimerShared::new(STATE_INIT)),
+            _m: PhantomPinned,
         }
     }
 
@@ -452,63 +356,90 @@ impl TimerEntry {
         unsafe { &*self.inner.get() }
     }
 
+    /// Whether the timer fired (and was not reset since).
     pub(crate) fn is_elapsed(&self) -> bool {
-        !self.inner().state.might_be_registered() && self.initial_deadline.is_none()
+        self.inner().state.get() == STATE_DEREGISTERED
     }
 
-    /// Cancels and deregisters the timer. This operation is irreversible.
-    pub(crate) fn cancel(self: Pin<&mut Self>) {
-        // We need to perform an acq/rel fence with the driver thread, and the
-        // simplest way to do so is to grab the driver lock.
-        //
-        // Why is this necessary? We're about to release this timer's memory for
-        // some other non-timer use. However, we've been doing a bunch of
-        // relaxed (or even non-atomic) writes from the driver thread, and we'll
-        // be doing more from _this thread_ (as this memory is interpreted as
-        // something else).
-        //
-        // It is critical to ensure that, from the point of view of the driver,
-        // those future non-timer writes happen-after the timer is fully fired,
-        // and from the purpose of this thread, the driver's writes all
-        // happen-before we drop the timer. This in turn requires us to perform
-        // an acquire-release barrier in _both_ directions between the driver
-        // and dropping thread.
-        //
-        // The lock acquisition in clear_entry serves this purpose. All of the
-        // driver manipulations happen with the lock held, so we can just take
-        // the lock and be sure that this drop happens-after everything the
-        // driver did so far and happens-before everything the driver does in
-        // the future. While we have the lock held, we also go ahead and
-        // deregister the entry if necessary.
-        unsafe { self.driver.clear_entry(NonNull::from(self.inner())) };
+    /// An entry that is not registered yet and knows its expiration already: the tick
+    /// `ticks_from_recent` after the coarse clock. The first `poll_elapsed` registers it there.
+    pub(crate) fn new_coarse(driver: Handle, ticks_from_recent: u64) -> Self {
+        let tick = driver.recent_tick().saturating_add(ticks_from_recent);
+        let this = Self::new(driver);
+        // Not registered, so `cached_when` is free to carry the tick (never 0: `recent_tick` is
+        // at least 1).
+        this.inner().cached_when.set(tick.min(MAX_TICK));
+        this
     }
 
-    pub(crate) fn reset(mut self: Pin<&mut Self>, new_time: Instant) {
-        unsafe { self.as_mut().get_unchecked_mut() }.initial_deadline = None;
-
+    /// Moves the timer to `new_time`, registering it if it is not in the wheel.
+    pub(crate) fn reset(self: Pin<&mut Self>, new_time: Instant) {
         let tick = self.driver.time_source().deadline_to_tick(new_time);
+        self.set_tick(tick.min(MAX_TICK));
+    }
 
-        if self.inner().extend_expiration(tick).is_ok() {
+    /// Moves the timer to the tick `ticks_from_recent` after the coarse clock
+    /// ([`Instant::recent`]), registering it if it is not in the wheel. Never earlier than
+    /// `recent() + ticks`, at most one tick later (both parts are rounded up).
+    #[inline]
+    pub(crate) fn reset_coarse(self: Pin<&mut Self>, ticks_from_recent: u64) {
+        let tick = self.driver.recent_tick().saturating_add(ticks_from_recent);
+        self.set_tick(tick.min(MAX_TICK));
+    }
+
+    /// Moves the timer to `tick`: one store if the entry can stay in its wheel slot, else it is
+    /// (re)registered.
+    #[inline]
+    fn set_tick(self: Pin<&mut Self>, tick: u64) {
+        if self.inner().move_expiration(tick) {
             return;
         }
 
         unsafe {
-            self.driver.reregister(tick, self.inner().into());
+            self.driver.reregister(tick, NonNull::from(self.inner()));
         }
     }
 
-    #[allow(clippy::needless_pass_by_ref_mut)]
+    /// See [`TimerShared::disarm`].
+    #[inline]
+    pub(crate) fn disarm(self: Pin<&mut Self>) {
+        self.inner().disarm();
+    }
+
+    /// See [`TimerShared::is_armed`].
+    pub(crate) fn is_armed(&self) -> bool {
+        self.inner().is_armed()
+    }
+
+    /// `Ready` once the timer fired. `deadline` is used to register the timer on its first poll
+    /// (it cannot be registered before it is pinned), unless a `reset` already did or the entry
+    /// was made by `new_coarse`.
     pub(crate) fn poll_elapsed(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<(), super::Error>> {
-        if let Some(deadline) = self.initial_deadline {
-            self.as_mut().reset(deadline);
+        deadline: Instant,
+    ) -> Poll<()> {
+        if self.inner().state.get() == STATE_INIT {
+            match self.inner().cached_when.get() {
+                0 => self.as_mut().reset(deadline),
+                tick => self.as_mut().set_tick(tick),
+            }
         }
 
-        let this = unsafe { self.get_unchecked_mut() };
+        self.inner().poll(cx.waker())
+    }
 
-        this.inner().state.poll(cx.waker())
+    /// `Ready` once the timer fired while armed. Never registers the entry: that is `reset`'s
+    /// and `reset_coarse`'s job (a `Deadline` is armed explicitly).
+    #[inline]
+    pub(crate) fn poll_fired(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.inner().poll(cx.waker())
+    }
+
+    /// The tick of the wheel slot the entry sits in (valid while registered).
+    #[cfg(test)]
+    pub(crate) fn slot_tick(&self) -> u64 {
+        self.inner().cached_when()
     }
 }
 
@@ -523,8 +454,8 @@ impl TimerHandle {
 
     /// Forcibly sets the true and cached expiration times to the given tick.
     ///
-    /// SAFETY: The caller must ensure that the handle remains valid, the driver
-    /// lock is held, and that the timer is not in any wheel linked lists.
+    /// SAFETY: The caller must ensure that the handle remains valid and that the timer is not in
+    /// any wheel linked lists.
     pub(super) unsafe fn set_expiration(&self, tick: u64) {
         self.inner.as_ref().set_expiration(tick);
     }
@@ -535,46 +466,68 @@ impl TimerHandle {
     /// If an `Err` is returned, the `cached_when` value will be updated to this
     /// new expiration time.
     ///
-    /// SAFETY: The caller must ensure that the handle remains valid, the driver
-    /// lock is held, and that the timer is not in any wheel linked lists.
-    /// After returning Ok, the entry must be added to the pending list.
+    /// SAFETY: The caller must ensure that the handle remains valid and that the timer is not in
+    /// any wheel linked lists. After returning Ok, the entry must be added to the pending list.
     pub(super) unsafe fn mark_pending(&self, not_after: u64) -> Result<(), u64> {
-        match self.inner.as_ref().state.mark_pending(not_after) {
+        let shared = self.inner.as_ref();
+        match shared.mark_pending(not_after) {
             Ok(()) => {
                 // mark this as being on the pending queue in cached_when
-                self.inner.as_ref().set_cached_when(u64::MAX);
+                shared.cached_when.set(u64::MAX);
                 Ok(())
             }
             Err(tick) => {
-                self.inner.as_ref().set_cached_when(tick);
+                shared.cached_when.set(tick);
                 Err(tick)
             }
         }
     }
 
-    /// Attempts to transition to a terminal state. If the state is already a
-    /// terminal state, does nothing.
+    /// Fires the timer if it is registered (or deregisters it silently if it is disarmed), see
+    /// [`TimerShared::fire`].
     ///
-    /// Because the entry might be dropped after the state is moved to a
-    /// terminal state, this function consumes the handle to ensure we don't
-    /// access the entry afterwards.
+    /// Because the entry might be dropped once it fired, this function consumes the handle to
+    /// ensure we don't access the entry afterwards.
     ///
-    /// Returns the last-registered waker, if any.
+    /// Returns the last-registered waker, if any, and whether to wake it. Wake or drop it only
+    /// after the wheel is released.
     ///
-    /// SAFETY: The driver lock must be held while invoking this function, and
-    /// the entry must not be in any wheel linked lists.
-    pub(super) unsafe fn fire(self, completed_state: TimerResult) -> Option<Waker> {
-        self.inner.as_ref().state.fire(completed_state)
+    /// SAFETY: The handle must be valid and the entry must not be in any wheel linked lists.
+    pub(super) unsafe fn fire(self) -> (Option<Waker>, bool) {
+        self.inner.as_ref().fire()
     }
 }
 
 impl Drop for TimerEntry {
     fn drop(&mut self) {
-        unsafe { Pin::new_unchecked(self) }.as_mut().cancel()
+        // The memory is about to be reused, so the wheel must not keep a pointer to it. A timer
+        // that fired or was never registered is in no list, and its waker (if any) goes with the
+        // field.
+        if self.inner().is_registered() {
+            unsafe { self.driver.remove(NonNull::from(self.inner())) };
+        }
     }
 }
 
-#[cfg_attr(target_arch = "x86_64", repr(align(128)))]
-#[cfg_attr(not(target_arch = "x86_64"), repr(align(64)))]
-#[derive(Debug, Default)]
-struct CachePadded<T>(T);
+#[cfg(test)]
+mod tests {
+    use std::mem::{align_of, size_of};
+
+    use super::*;
+    use crate::time::{Sleep, Timeout};
+
+    /// A timer carries no cache-line padding (r3-timer, E1): one runtime thread cannot
+    /// false-share. Before: `TimerShared` 384, `TimerEntry` 512, `Sleep` 640, `Timeout<()>` 768
+    /// bytes, all aligned to 128, an alignment every future holding a `timeout()` inherited.
+    #[test]
+    fn timer_sizes() {
+        assert_eq!(size_of::<TimerShared>(), 48);
+        assert_eq!(align_of::<TimerShared>(), 8);
+        assert_eq!(size_of::<TimerEntry>(), 56);
+        assert_eq!(align_of::<TimerEntry>(), 8);
+        assert_eq!(size_of::<Sleep>(), 72);
+        assert_eq!(align_of::<Sleep>(), 8);
+        assert_eq!(size_of::<Timeout<std::future::Ready<()>>>(), 80);
+        assert_eq!(align_of::<Timeout<std::future::Ready<()>>>(), 8);
+    }
+}

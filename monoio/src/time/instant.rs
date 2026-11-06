@@ -47,6 +47,49 @@ impl Instant {
         variant::now()
     }
 
+    /// A coarse "now": the time of the latest clock read on this runtime thread.
+    ///
+    /// The time driver keeps the value of each clock read it makes anyway (when it checks for due
+    /// timers after a park or a cold-path submit) and marks it stale once per park and once per
+    /// cold-path submit. `recent()` returns the kept value while it is fresh; otherwise it reads
+    /// the clock once and keeps that value. So:
+    ///
+    /// - it costs at most one clock read per round of tasks, however often it is called, and
+    ///   nothing when it is not called;
+    /// - it is never ahead of [`Instant::now`] and lags it by less than one round of tasks (the
+    ///   time since the runtime last returned from a park or a submit). A task that computes for
+    ///   long without yielding sees the same value all the time;
+    /// - it never goes backwards.
+    ///
+    /// Use it for deadlines that are long compared to a round of tasks (request timeouts in
+    /// seconds): [`Deadline::arm`](crate::time::Deadline::arm) and
+    /// [`timeout_coarse`](crate::time::timeout_coarse) do. A deadline computed from it can come
+    /// early by the lag. Use [`Instant::now`] to measure durations.
+    ///
+    /// Outside a runtime, and in a runtime built without `enable_timer`, there is no kept value:
+    /// this is [`Instant::now`] then (one clock read per call). It never panics.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use monoio::time::Instant;
+    ///
+    /// #[monoio::main(timer_enabled = true)]
+    /// async fn main() {
+    ///     let a = Instant::recent();
+    ///     let b = Instant::recent();
+    ///     // No park in between: the same clock read.
+    ///     assert_eq!(a, b);
+    ///     assert!(a <= Instant::now());
+    /// }
+    /// ```
+    pub fn recent() -> Instant {
+        crate::runtime::CURRENT.try_with(|ctx| match ctx.and_then(|ctx| ctx.time_handle.as_ref()) {
+            Some(handle) => handle.recent(),
+            None => Instant::now(),
+        })
+    }
+
     /// Create a `monoio::time::Instant` from a `std::time::Instant`.
     pub fn from_std(std: std::time::Instant) -> Instant {
         Instant { std }

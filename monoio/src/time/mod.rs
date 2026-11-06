@@ -12,6 +12,10 @@
 //!   allowed to execute. If the future or stream does not complete in time, then it is canceled and
 //!   an error is returned.
 //!
+//! * [`Deadline`]: one timer that is armed and disarmed many times, for a deadline around every
+//!   request of a connection. Arming and disarming it are single stores; it uses the coarse clock
+//!   [`Instant::recent`]. [`timeout_coarse`] is [`timeout`] with that clock.
+//!
 //! These types are sufficient for handling a large number of scenarios
 //! involving time.
 //!
@@ -90,6 +94,7 @@ mod clock;
 pub(crate) use self::clock::Clock;
 
 mod deadline;
+pub use deadline::{with_deadline, Deadline, WithDeadline};
 
 pub(crate) mod driver;
 
@@ -113,4 +118,4 @@ mod timeout;
 pub use std::time::Duration;
 
 #[doc(inline)]
-pub use timeout::{timeout, timeout_at, Timeout};
+pub use timeout::{timeout, timeout_at, timeout_coarse, Timeout};
