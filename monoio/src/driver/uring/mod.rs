@@ -696,6 +696,8 @@ impl UringInner {
 
         #[cfg(feature = "metrics")]
         let mut n = 0_u64;
+        // `RuntimeBuilder::small_io_priority` (0: off).
+        let small_io_max = crate::scheduler::small_io_max();
         for cqe in cq {
             metric!(n += 1);
             let index = cqe.user_data();
@@ -712,8 +714,14 @@ impl UringInner {
                             self.stats.op_ticks_by_opcode[op][bucket] += 1;
                         }
                     });
+                    if small_io_max != 0 {
+                        crate::scheduler::set_cqe_hint(cqe.result(), small_io_max);
+                    }
                     // SAFETY: the CQE comes from the kernel for the op at `index`.
                     let done = unsafe { self.ops.complete(index as _, cqe.result(), cqe.flags()) };
+                    if small_io_max != 0 {
+                        crate::scheduler::clear_cqe_hint();
+                    }
                     metric!(if let Some(queued) = done.queued {
                         self.stats.multishot_cqes += 1;
                         let hw = &mut self.stats.multishot_queue_high_water;

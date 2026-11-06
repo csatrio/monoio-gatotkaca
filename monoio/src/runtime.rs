@@ -22,6 +22,7 @@ thread_local! {
         task_budget: None,
         coop_budget: None,
         lifo_slot: false,
+        small_io_max: 0,
         #[cfg(feature = "metrics")]
         stats: Default::default(),
     };
@@ -56,6 +57,10 @@ pub(crate) struct Context {
     /// Run a task woken by the running task right after it, see `RuntimeBuilder::lifo_slot`.
     pub(crate) lifo_slot: bool,
 
+    /// Tasks woken by a completion below this many bytes run first, see
+    /// `RuntimeBuilder::small_io_priority` (0: off).
+    pub(crate) small_io_max: u32,
+
     /// Scheduler counters, see [`crate::RuntimeStats`].
     #[cfg(feature = "metrics")]
     pub(crate) stats: crate::runtime_stats::StatsCell,
@@ -75,6 +80,7 @@ impl Context {
             task_budget: None,
             coop_budget: None,
             lifo_slot: false,
+            small_io_max: 0,
             #[cfg(feature = "metrics")]
             stats: Default::default(),
         }
@@ -91,6 +97,7 @@ impl Context {
             task_budget: None,
             coop_budget: None,
             lifo_slot: false,
+            small_io_max: 0,
             #[cfg(feature = "metrics")]
             stats: Default::default(),
         }
@@ -217,6 +224,9 @@ impl<D> Runtime<D> {
                 let lifo = self.context.lifo_slot;
                 // A runtime without coop must not inherit a budget left by an earlier one.
                 crate::task::coop::set(crate::task::coop::UNCONSTRAINED);
+                // Same for the small-I/O priority threshold the driver reads.
+                crate::scheduler::set_small_io_max(self.context.small_io_max);
+                self.context.tasks.set_prio(self.context.small_io_max != 0);
                 // End of the latest park (start of the busy period), for `busy_ns`.
                 #[cfg(feature = "metrics")]
                 let mut busy_since = std::time::Instant::now();
@@ -237,6 +247,15 @@ impl<D> Runtime<D> {
                             Some(n) => n.max(1),
                             None => self.context.tasks.len() * 2 + 1,
                         };
+                        // Polls from the priority queue left in this round (`small_io_priority`):
+                        // at most half of the round, so it can't starve the queue.
+                        let mut prio_left = if self.context.small_io_max != 0 {
+                            (remaining / 2).max(1)
+                        } else {
+                            0
+                        };
+                        #[cfg(feature = "metrics")]
+                        let prio_start = prio_left;
                         // Consecutive polls from the LIFO slot.
                         let mut streak = 0u32;
                         loop {
@@ -253,14 +272,14 @@ impl<D> Runtime<D> {
                                         if let Some(t) = slot {
                                             self.context.tasks.push(t);
                                         }
-                                        match self.context.tasks.pop() {
+                                        match self.context.tasks.pop_next(&mut prio_left) {
                                             Some(t) => t,
                                             None => break,
                                         }
                                     }
                                 }
                             } else {
-                                match self.context.tasks.pop() {
+                                match self.context.tasks.pop_next(&mut prio_left) {
                                     Some(t) => t,
                                     None => break,
                                 }
@@ -286,6 +305,7 @@ impl<D> Runtime<D> {
                             }
                         }
                         metric!(self.context.stats.with(|s| {
+                            s.prio_polls += (prio_start - prio_left) as u64;
                             s.tasks_polled += polled;
                             s.polls_per_round[crate::runtime_stats::poll_bucket(polled)] += 1;
                         }));

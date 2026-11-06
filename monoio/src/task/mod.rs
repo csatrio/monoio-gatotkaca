@@ -46,6 +46,11 @@ impl<S: 'static> Task<S> {
         self.raw.header()
     }
 
+    /// See [`Header::bulk`].
+    pub(crate) fn bulk(&self) -> &std::cell::Cell<u8> {
+        &self.header().bulk
+    }
+
     pub(crate) fn run(self) {
         self.raw.poll();
     }

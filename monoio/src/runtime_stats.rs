@@ -58,6 +58,9 @@ pub struct RuntimeStats {
     pub coop_yields: u64,
     /// Tasks polled from the LIFO slot (`RuntimeBuilder::lifo_slot`).
     pub lifo_polls: u64,
+    /// Tasks woken by a small completion and polled ahead of the ready queue
+    /// (`RuntimeBuilder::small_io_priority`).
+    pub prio_polls: u64,
 }
 
 /// Bucket of [`RuntimeStats::polls_per_round`] for `n` polls in a round.
