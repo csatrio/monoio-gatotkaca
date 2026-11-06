@@ -123,6 +123,21 @@ impl ClockTime {
         ms.try_into().expect("Duration too far into the future")
     }
 
+    /// `(instant_to_tick(t), deadline_to_tick(t))` with one subtraction: the tick rounded down
+    /// and rounded up.
+    pub(self) fn instant_to_ticks(&self, t: Instant) -> (u64, u64) {
+        let dur: Duration = t
+            .checked_duration_since(self.start_time)
+            .unwrap_or_else(|| Duration::from_secs(0));
+        let ms: u64 = dur
+            .as_millis()
+            .try_into()
+            .expect("Duration too far into the future");
+        let partial = dur.subsec_nanos() % 1_000_000 != 0;
+
+        (ms, ms + partial as u64)
+    }
+
     pub(self) fn tick_to_duration(&self, t: u64) -> Duration {
         Duration::from_millis(t)
     }
@@ -144,6 +159,15 @@ struct Inner {
     /// clock and looks at the wheel only when this tick is reached, so a park or a cold-path
     /// submit with nothing due costs one load (no timer) or one clock read (timers pending).
     next_wake: Cell<u64>,
+
+    /// The coarse clock behind [`Instant::recent`]: the latest clock value the driver or
+    /// `recent()` read. Valid while `recent_tick` is not 0.
+    recent: Cell<Instant>,
+
+    /// `deadline_to_tick(recent)`, at least 1; 0 marks `recent` as stale. The driver stores 0
+    /// once per park and once per cold-path submit, so a fresh value was read after the latest
+    /// of them: it lags the real clock by less than one round of tasks.
+    recent_tick: Cell<u64>,
 
     /// Timer wheel
     wheel: RefCell<wheel::Wheel>,
@@ -176,18 +200,19 @@ where
     fn park_internal(&self, limit: Option<Duration>) -> io::Result<()> {
         let inner = self.handle.get();
 
-        match inner.next_wake.get() {
+        let res = match inner.next_wake.get() {
             // No timer is registered: nothing to wake up for.
             0 => {
                 if let Some(duration) = limit {
-                    self.park.park_timeout(duration)?;
+                    self.park.park_timeout(duration)
                 } else {
-                    self.park.park()?;
+                    self.park.park()
                 }
             }
             // `when` may be earlier than the earliest timer (see `Inner::next_wake`). The wake-up
             // is then early once: `process_at_time` makes the bound exact.
             when => {
+                // Not kept for `recent()`: the value is stale as soon as the wait returns.
                 let now = inner.time_source.now();
                 // Note that we effectively round up to 1ms here - this avoids
                 // very short-duration microsecond-resolution sleeps that the OS
@@ -199,17 +224,18 @@ where
                         duration = std::cmp::min(limit, duration);
                     }
 
-                    self.park.park_timeout(duration)?;
+                    self.park.park_timeout(duration)
                 } else {
-                    self.park.park_timeout(Duration::from_secs(0))?;
+                    self.park.park_timeout(Duration::from_secs(0))
                 }
             }
-        }
+        };
 
-        // Fire the timers that are due after waking up
+        // Time passed in the wait. Then fire the timers that are due (also after a failed wait).
+        inner.mark_recent_stale();
         self.handle.process_if_due();
 
-        Ok(())
+        res
     }
 }
 
@@ -222,10 +248,20 @@ impl Handle {
         if next == 0 {
             return;
         }
-        let now = inner.time_source.now();
+        let now = inner.read_clock();
         if now >= next {
             self.process_at_time(now);
         }
+    }
+
+    /// The coarse clock, see [`Instant::recent`].
+    #[inline]
+    pub(crate) fn recent(&self) -> Instant {
+        let inner = self.get();
+        if inner.recent_tick.get() == 0 {
+            inner.read_clock();
+        }
+        inner.recent.get()
     }
 
     /// Advances the wheel to `now`, fires what is due and makes `next_wake` exact.
@@ -315,12 +351,14 @@ where
     }
 
     fn submit(&self) -> io::Result<()> {
-        self.park.submit()?;
+        let res = self.park.submit();
+        // A round of tasks ended: the coarse clock is read again by whoever needs it first.
+        self.handle.get().mark_recent_stale();
         // The runtime takes this path instead of `park` when ready tasks remain after a round (for
         // example with `task_budget`), and under saturation it may never park. Fire due timers here
         // too, or they would wait until the ready queue empties.
         self.handle.process_if_due();
-        Ok(())
+        res
     }
 
     fn park(&self) -> io::Result<()> {
@@ -351,10 +389,28 @@ impl<D: std::os::unix::io::AsRawFd> std::os::unix::io::AsRawFd for TimeDriver<D>
 impl Inner {
     pub(self) fn new(time_source: ClockTime) -> Self {
         Inner {
+            recent: Cell::new(time_source.start_time),
+            recent_tick: Cell::new(0),
             time_source,
             next_wake: Cell::new(0),
             wheel: RefCell::new(wheel::Wheel::new()),
         }
+    }
+
+    /// Reads the clock and keeps the value as the coarse clock. Returns its tick (rounded
+    /// down, as the wheel wants it).
+    fn read_clock(&self) -> u64 {
+        let now = self.time_source.clock.now();
+        let (tick, deadline_tick) = self.time_source.instant_to_ticks(now);
+        self.recent.set(now);
+        self.recent_tick.set(deadline_tick.max(1));
+        tick
+    }
+
+    /// One store; the next `recent()` (or the driver, if a timer is pending) reads the clock.
+    #[inline]
+    fn mark_recent_stale(&self) {
+        self.recent_tick.set(0);
     }
 }
 
