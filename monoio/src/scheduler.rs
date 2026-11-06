@@ -17,6 +17,9 @@ impl Schedule for LocalScheduler {
 pub(crate) struct TaskQueue {
     // Local queue.
     queue: UnsafeCell<VecDeque<Task<LocalScheduler>>>,
+    // Highest length seen after a push.
+    #[cfg(feature = "metrics")]
+    high_water: std::cell::Cell<usize>,
     // Make sure the type is `!Send` and `!Sync`.
     _marker: PhantomData<*const ()>,
 }
@@ -44,6 +47,8 @@ impl TaskQueue {
     pub(crate) fn new_with_capacity(capacity: usize) -> Self {
         Self {
             queue: UnsafeCell::new(VecDeque::with_capacity(capacity)),
+            #[cfg(feature = "metrics")]
+            high_water: std::cell::Cell::new(0),
             _marker: PhantomData,
         }
     }
@@ -60,9 +65,25 @@ impl TaskQueue {
         unsafe {
             (*self.queue.get()).push_back(runnable);
         }
+        metric!(
+            let len = self.len();
+            if len > self.high_water.get() {
+                self.high_water.set(len);
+            }
+        );
     }
 
     pub(crate) fn pop(&self) -> Option<Task<LocalScheduler>> {
         unsafe { (*self.queue.get()).pop_front() }
+    }
+
+    #[cfg(feature = "metrics")]
+    pub(crate) fn high_water(&self) -> usize {
+        self.high_water.get()
+    }
+
+    #[cfg(feature = "metrics")]
+    pub(crate) fn reset_high_water(&self) {
+        self.high_water.set(0);
     }
 }

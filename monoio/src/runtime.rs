@@ -20,6 +20,8 @@ thread_local! {
         time_handle: None,
         blocking_handle: crate::blocking::BlockingHandle::Empty(crate::blocking::BlockingStrategy::Panic),
         task_budget: None,
+        #[cfg(feature = "metrics")]
+        stats: Default::default(),
     };
 }
 
@@ -45,6 +47,10 @@ pub(crate) struct Context {
 
     /// Tasks run before the driver is checked again; `None`: about twice the queue length.
     pub(crate) task_budget: Option<usize>,
+
+    /// Scheduler counters, see [`crate::RuntimeStats`].
+    #[cfg(feature = "metrics")]
+    pub(crate) stats: crate::runtime_stats::StatsCell,
 }
 
 impl Context {
@@ -59,6 +65,8 @@ impl Context {
             time_handle: None,
             blocking_handle,
             task_budget: None,
+            #[cfg(feature = "metrics")]
+            stats: Default::default(),
         }
     }
 
@@ -71,6 +79,8 @@ impl Context {
             tasks: TaskQueue::default(),
             time_handle: None,
             task_budget: None,
+            #[cfg(feature = "metrics")]
+            stats: Default::default(),
         }
     }
 
@@ -150,6 +160,20 @@ impl<D> Runtime<D> {
         &self.driver
     }
 
+    /// Scheduler counters of this runtime, see [`crate::runtime_stats`].
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
+    pub fn stats(&self) -> crate::RuntimeStats {
+        self.context.runtime_stats()
+    }
+
+    /// Reset the scheduler counters of this runtime, see [`crate::reset_runtime_stats`].
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
+    pub fn reset_stats(&self) {
+        self.context.reset_runtime_stats()
+    }
+
     /// Block on
     pub fn block_on<F>(&mut self, future: F) -> F::Output
     where
@@ -173,8 +197,20 @@ impl<D> Runtime<D> {
 
                 let mut join = std::pin::pin!(join);
                 set_poll();
+                // End of the latest park (start of the busy period), for `busy_ns`.
+                #[cfg(feature = "metrics")]
+                let mut busy_since = std::time::Instant::now();
                 loop {
                     loop {
+                        metric!(
+                            let len = self.context.tasks.len() as u64;
+                            self.context.stats.with(|s| {
+                                s.rounds += 1;
+                                s.ready_queue_len = len;
+                            });
+                        );
+                        #[cfg(feature = "metrics")]
+                        let mut polled = 0u64;
                         // Consume all tasks(with max round to prevent io starvation)
                         // (with an explicit budget of `n`, exactly `n` tasks run)
                         let mut max_round = match self.context.task_budget {
@@ -183,13 +219,21 @@ impl<D> Runtime<D> {
                         };
                         while let Some(t) = self.context.tasks.pop() {
                             t.run();
+                            metric!(polled += 1);
                             if max_round == 0 {
                                 // maybe there's a looping task
+                                metric!(if !self.context.tasks.is_empty() {
+                                    self.context.stats.with(|s| s.budget_exhausted_rounds += 1);
+                                });
                                 break;
                             } else {
                                 max_round -= 1;
                             }
                         }
+                        metric!(self.context.stats.with(|s| {
+                            s.tasks_polled += polled;
+                            s.polls_per_round[crate::runtime_stats::poll_bucket(polled)] += 1;
+                        }));
 
                         // Check main future
                         while should_poll() {
@@ -206,8 +250,12 @@ impl<D> Runtime<D> {
                         }
 
                         // Cold path
+                        metric!(self.context.stats.with(|s| s.submits += 1));
                         let _ = self.driver.submit();
                     }
+
+                    #[cfg(feature = "metrics")]
+                    let park_start = std::time::Instant::now();
 
                     // Wait and Process CQ(the error is ignored for not debug mode)
                     #[cfg(not(all(debug_assertions, feature = "debug")))]
@@ -217,6 +265,18 @@ impl<D> Runtime<D> {
                     if let Err(e) = self.driver.park() {
                         trace!("park error: {:?}", e);
                     }
+
+                    metric!(
+                        let park_end = std::time::Instant::now();
+                        let busy = park_start.saturating_duration_since(busy_since);
+                        let park = park_end.saturating_duration_since(park_start);
+                        busy_since = park_end;
+                        self.context.stats.with(|s| {
+                            s.parks += 1;
+                            s.park_ns += park.as_nanos() as u64;
+                            s.busy_ns += busy.as_nanos() as u64;
+                        });
+                    );
                 }
             })
         })
@@ -262,6 +322,7 @@ where
 
     CURRENT.with(|ctx| {
         ctx.tasks.push(task);
+        metric!(ctx.stats.with(|s| s.tasks_spawned += 1));
     });
     join
 }
@@ -280,6 +341,7 @@ where
 
     CURRENT.with(|ctx| {
         ctx.tasks.push(task);
+        metric!(ctx.stats.with(|s| s.tasks_spawned += 1));
     });
     join
 }

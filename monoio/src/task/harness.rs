@@ -59,6 +59,11 @@ where
                 self.core().scheduler.yield_now(self.get_new_task());
             }
             PollFuture::Complete => {
+                metric!(crate::runtime::CURRENT.try_with(|ctx| {
+                    if let Some(ctx) = ctx {
+                        ctx.stats.with(|s| s.tasks_completed += 1);
+                    }
+                }));
                 self.complete();
             }
             PollFuture::Done => (),
