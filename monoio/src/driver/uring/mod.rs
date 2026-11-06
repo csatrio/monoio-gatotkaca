@@ -137,11 +137,25 @@ pub struct DriverStats {
     pub ignored_inline: u64,
     /// In-flight ops dropped whose data was too large for the slot and was boxed.
     pub ignored_boxed: u64,
+    /// Completion latency in driver ticks, per SQE opcode (indexed like `ops_by_opcode`), in
+    /// buckets: `[0]` reaped by the first tick after the enter that submitted the SQE, `[1]`
+    /// one tick later, `[2]` 2-3 ticks later, `[3]` 4 or more. Counts the first CQE of each op
+    /// pushed by the driver (`ops_by_opcode`'s ops; for zero-copy sends the send result, for
+    /// multishot ops the first CQE). No clock is read.
+    ///
+    /// An op the kernel completes inline (during `io_uring_enter`) lands in `[0]`. An op punted
+    /// to an io-wq worker, or waiting for a device or the network, usually lands in `[1]` or
+    /// later *when the loop keeps ticking meanwhile* (other tasks ready). A loop that parks
+    /// right after the submit waits in that same enter, so a slow op also lands in `[0]` then:
+    /// compare opcodes under load, not in an idle loop.
+    pub op_ticks_by_opcode: [[u64; lifecycle::OP_TICK_BUCKETS]; 64],
 }
 
 /// `DriverStats` is all `u64`s: this many. Checked against the struct in metrics builds, so the
 /// `metrics_off` test can tell without the type that the driver holds no counters.
-const DRIVER_STATS_U64S: usize = 19 + 7 + 64;
+const DRIVER_STATS_U64S: usize = 19 + 7 + 64 + 4 * 64;
+#[cfg(feature = "metrics")]
+const _: () = assert!(lifecycle::OP_TICK_BUCKETS == 4);
 #[cfg(feature = "metrics")]
 const _: () = assert!(std::mem::size_of::<DriverStats>() == DRIVER_STATS_U64S * 8);
 
@@ -181,6 +195,7 @@ impl Default for DriverStats {
             cancel_fd_pushed: 0,
             ignored_inline: 0,
             ignored_boxed: 0,
+            op_ticks_by_opcode: [[0; lifecycle::OP_TICK_BUCKETS]; 64],
         }
     }
 }
@@ -339,6 +354,10 @@ pub(crate) struct UringInner {
     #[cfg(feature = "metrics")]
     stats: DriverStats,
 
+    /// Ticks so far (wrapping), for `DriverStats::op_ticks_by_opcode`.
+    #[cfg(feature = "metrics")]
+    tick: u32,
+
     /// Finished slots of dropped ops, dropped by [`drop_deferred`] once the driver holds no
     /// state: dropping op data may call back into the driver.
     deferred: Vec<MaybeFdLifecycle>,
@@ -374,6 +393,8 @@ impl IoUringDriver {
             sqes_consumed: 0,
             #[cfg(feature = "metrics")]
             stats: DriverStats::default(),
+            #[cfg(feature = "metrics")]
+            tick: 0,
             deferred: Vec::new(),
             doorbells: Default::default(),
         }));
@@ -418,6 +439,8 @@ impl IoUringDriver {
             sqes_consumed: 0,
             #[cfg(feature = "metrics")]
             stats: DriverStats::default(),
+            #[cfg(feature = "metrics")]
+            tick: 0,
             deferred: Vec::new(),
             doorbells: Default::default(),
         }));
@@ -667,6 +690,7 @@ impl UringInner {
     }
 
     fn tick(&mut self) -> io::Result<()> {
+        metric!(self.tick = self.tick.wrapping_add(1));
         let cq = self.uring.completion();
 
         #[cfg(feature = "metrics")]
@@ -681,6 +705,11 @@ impl UringInner {
                 _ if index >> 62 == 0 => {
                     metric!(if cqe.flags() & CQE_F_NOTIF != 0 {
                         self.stats.zc_notifs += 1;
+                    });
+                    metric!(if let Some(mut slot) = self.ops.slab.get(index as _) {
+                        if let Some((op, bucket)) = slot.take_op_ticks(self.tick) {
+                            self.stats.op_ticks_by_opcode[op][bucket] += 1;
+                        }
                     });
                     // SAFETY: the CQE comes from the kernel for the op at `index`.
                     let done = unsafe { self.ops.complete(index as _, cqe.result(), cqe.flags()) };
@@ -924,6 +953,9 @@ impl UringInner {
             if T::KIND == OpKind::ZeroCopy {
                 self.stats.zc_sends += 1;
             }
+            if let Some(mut slot) = self.ops.slab.get(index) {
+                slot.set_submit_tick(sqe.get_opcode(), self.tick);
+            }
         );
 
         // The SQE is visible to the kernel once the tail is published. We don't enter now: the
@@ -954,8 +986,11 @@ impl UringInner {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
         metric!(
-            for sqe in &sqes {
+            for (sqe, index) in sqes.iter().zip(slots) {
                 self.stats.ops_by_opcode[(sqe.get_opcode() as usize).min(63)] += 1;
+                if let Some(mut slot) = self.ops.slab.get(index) {
+                    slot.set_submit_tick(sqe.get_opcode(), self.tick);
+                }
             }
             self.stats.chains_submitted += 1;
         );
@@ -994,7 +1029,12 @@ impl UringInner {
             }
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
-        metric!(self.stats.ops_by_opcode[opcode] += 1);
+        metric!(
+            self.stats.ops_by_opcode[opcode] += 1;
+            if let Some(mut slot) = self.ops.slab.get(index) {
+                slot.set_submit_tick(opcode as u32, self.tick);
+            }
+        );
         Ok(index)
     }
 

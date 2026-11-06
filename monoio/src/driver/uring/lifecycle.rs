@@ -110,11 +110,9 @@ pub(crate) struct MaybeFdLifecycle {
     /// The SQE opcode, recorded at submit for `op_ticks_by_opcode`; [`NO_TICKS`] once the first
     /// CQE was measured (or never recorded).
     #[cfg(feature = "metrics")]
-    #[allow(dead_code)] // read by the driver/uring/mod.rs hook (W1-file request)
     opcode: u8,
     /// The driver tick counter when the SQE was pushed.
     #[cfg(feature = "metrics")]
-    #[allow(dead_code)] // see `opcode`
     submit_tick: u32,
     lifecycle: Lifecycle,
 }
@@ -126,7 +124,6 @@ const NO_TICKS: u8 = u8::MAX;
 /// Buckets of [`op_ticks_bucket`]: completed in the first tick after the submitting enter, one
 /// tick later, 2-3 ticks later, 4 or more.
 #[cfg(feature = "metrics")]
-#[allow(dead_code)] // used by the driver/uring/mod.rs hook (W1-file request)
 pub(crate) const OP_TICK_BUCKETS: usize = 4;
 
 /// The bucket for an op pushed while the tick counter was `submit` and reaped in tick `now`
@@ -134,7 +131,6 @@ pub(crate) const OP_TICK_BUCKETS: usize = 4;
 /// an inline op is `submit + 1`). Wrapping-safe.
 #[cfg(feature = "metrics")]
 #[inline]
-#[allow(dead_code)] // see `OP_TICK_BUCKETS`
 pub(crate) fn op_ticks_bucket(submit: u32, now: u32) -> usize {
     match now.wrapping_sub(submit).saturating_sub(1) {
         0 => 0,
@@ -195,7 +191,6 @@ impl MaybeFdLifecycle {
     /// Record the opcode and the driver's tick counter at submit (`metrics` only).
     #[cfg(feature = "metrics")]
     #[inline]
-    #[allow(dead_code)] // called by the driver/uring/mod.rs hook (W1-file request)
     pub(crate) fn set_submit_tick(&mut self, opcode: u32, tick: u32) {
         // Opcodes from 63 up share the last slot, like `ops_by_opcode`.
         self.opcode = opcode.min(63) as u8;
@@ -207,7 +202,6 @@ impl MaybeFdLifecycle {
     /// CQEs) and for slots without a recorded submit. Call before `Ref::complete`.
     #[cfg(feature = "metrics")]
     #[inline]
-    #[allow(dead_code)] // see `set_submit_tick`
     pub(crate) fn take_op_ticks(&mut self, now: u32) -> Option<(usize, usize)> {
         if self.opcode == NO_TICKS {
             return None;
