@@ -12,6 +12,12 @@
 //!
 //! The data of a dropped op is kept in the slot ([`IgnoredData`]): inline when it fits, so
 //! dropping an in-flight op usually does not allocate.
+//!
+//! A slot is one cache line: 64 bytes, and the slab aligns its entries to 64. The largest
+//! state is the dropped one (48 bytes of inline data and its drop function), which leaves
+//! one word for everything else. So what a slot keeps for its whole life ([`Meta`]) is not a
+//! field next to the state but the first field of every state: there it shares the word of the
+//! state's tag.
 
 use std::{
     collections::VecDeque,
@@ -32,49 +38,108 @@ use crate::{
 /// Flag indicating more CQEs will follow for this SQE (SEND_ZC, multishot).
 const IORING_CQE_F_MORE: u32 = 2;
 
+/// What a slot keeps from submit to its last CQE, whatever its state.
+///
+/// Alignment 1 and at most 7 bytes: as the first field of every [`Lifecycle`] state it lies
+/// in the same word as the state's tag, so it costs the slot nothing.
+#[derive(Clone, Copy)]
+struct Meta {
+    /// The result of the op is a fd, to be closed if nobody takes it.
+    is_fd: bool,
+    kind: OpKind,
+    /// The SQE opcode, recorded at submit for `op_ticks_by_opcode`; [`NO_TICKS`] once the first
+    /// CQE was measured (or never recorded).
+    #[cfg(feature = "metrics")]
+    opcode: u8,
+    /// The driver tick counter (a `u32`) when the SQE was pushed, as bytes: `Meta` must keep
+    /// alignment 1.
+    #[cfg(feature = "metrics")]
+    submit_tick: [u8; 4],
+}
+
+/// The state of a slot. Every state starts with the slot's [`Meta`], which never changes: a
+/// transition copies it over.
 enum Lifecycle {
     /// The operation has been submitted to uring and is currently in-flight
-    Submitted,
+    Submitted(Meta),
 
     /// The submitter is waiting for the completion of the operation
-    Waiting(Waker),
+    Waiting(Meta, Waker),
 
     /// The submitter no longer has interest in the operation result. The state
     /// must be passed to the driver and held until the operation completes.
     // Holds the op data alive; never read, only dropped.
     #[allow(dead_code)]
-    Ignored(IgnoredData),
+    Ignored(Meta, IgnoredData),
 
     /// The operation has completed.
-    Completed(io::Result<MaybeFd>, u32),
+    Completed(Meta, io::Result<MaybeFd>, u32),
 
     /// First CQE with IORING_CQE_F_MORE received, waiting for the final CQE (the SEND_ZC
     /// notification). The future has not been polled yet (was in Submitted state).
-    CompletedMore(io::Result<MaybeFd>, u32),
+    CompletedMore(Meta, io::Result<MaybeFd>, u32),
 
     /// First CQE with IORING_CQE_F_MORE received, waiting for the final CQE.
     /// The future is actively polling (was in Waiting state).
-    WaitingMore(Waker, io::Result<MaybeFd>, u32),
+    WaitingMore(Meta, Waker, io::Result<MaybeFd>, u32),
 
     /// The future was dropped but the final CQE is still pending.
     // Holds the buffer alive; never read, only dropped.
     #[allow(dead_code)]
-    IgnoredMore(IgnoredData),
+    IgnoredMore(Meta, IgnoredData),
 
     /// Zero-copy, two-step: the submitter waits for the first CQE (the send result), not for
     /// the notification.
-    WaitingFirst(Waker),
+    WaitingFirst(Meta, Waker),
 
     /// Zero-copy, two-step: the send result was handed out; waiting for the notification CQE
     /// (the kernel releasing the buffer), with the waker of the `ZcPending` that polled.
-    AwaitNotif(Option<Waker>),
+    AwaitNotif(Meta, Option<Waker>),
 
     /// Zero-copy, two-step: the notification arrived after the result was handed out; the
     /// `ZcPending` has not seen it yet.
-    Notified,
+    Notified(Meta),
 
     /// A multishot operation.
-    Multi(Box<MultiState>),
+    Multi(Meta, Box<MultiState>),
+}
+
+impl Lifecycle {
+    /// The slot's [`Meta`]. It is at the same place in every state, so this is one load.
+    #[inline]
+    fn meta(&self) -> Meta {
+        match self {
+            Lifecycle::Submitted(meta)
+            | Lifecycle::Waiting(meta, _)
+            | Lifecycle::Ignored(meta, _)
+            | Lifecycle::Completed(meta, _, _)
+            | Lifecycle::CompletedMore(meta, _, _)
+            | Lifecycle::WaitingMore(meta, _, _, _)
+            | Lifecycle::IgnoredMore(meta, _)
+            | Lifecycle::WaitingFirst(meta, _)
+            | Lifecycle::AwaitNotif(meta, _)
+            | Lifecycle::Notified(meta)
+            | Lifecycle::Multi(meta, _) => *meta,
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    #[inline]
+    fn meta_mut(&mut self) -> &mut Meta {
+        match self {
+            Lifecycle::Submitted(meta)
+            | Lifecycle::Waiting(meta, _)
+            | Lifecycle::Ignored(meta, _)
+            | Lifecycle::Completed(meta, _, _)
+            | Lifecycle::CompletedMore(meta, _, _)
+            | Lifecycle::WaitingMore(meta, _, _, _)
+            | Lifecycle::IgnoredMore(meta, _)
+            | Lifecycle::WaitingFirst(meta, _)
+            | Lifecycle::AwaitNotif(meta, _)
+            | Lifecycle::Notified(meta)
+            | Lifecycle::Multi(meta, _) => meta,
+        }
+    }
 }
 
 /// Releases what a CQE carries, for a multishot op whose handle is gone.
@@ -141,20 +206,12 @@ struct MultiState {
     ignored: Option<Box<dyn Discard>>,
 }
 
+/// An op slot: 64 bytes, with and without `metrics` (see the module docs).
 pub(crate) struct MaybeFdLifecycle {
-    is_fd: bool,
-    kind: OpKind,
-    /// The SQE opcode, recorded at submit for `op_ticks_by_opcode`; [`NO_TICKS`] once the first
-    /// CQE was measured (or never recorded).
-    #[cfg(feature = "metrics")]
-    opcode: u8,
-    /// The driver tick counter when the SQE was pushed.
-    #[cfg(feature = "metrics")]
-    submit_tick: u32,
     lifecycle: Lifecycle,
 }
 
-/// `MaybeFdLifecycle::opcode` when there is nothing (more) to measure.
+/// `Meta::opcode` when there is nothing (more) to measure.
 #[cfg(feature = "metrics")]
 const NO_TICKS: u8 = u8::MAX;
 
@@ -210,26 +267,26 @@ pub(crate) struct Completed {
 impl MaybeFdLifecycle {
     #[inline]
     pub(crate) fn new(is_fd: bool, kind: OpKind) -> Self {
-        let lifecycle = match kind {
-            OpKind::Multishot => Lifecycle::Multi(Box::default()),
-            OpKind::Single | OpKind::ZeroCopy => Lifecycle::Submitted,
-        };
-        Self {
+        let meta = Meta {
             is_fd,
             kind,
             #[cfg(feature = "metrics")]
             opcode: NO_TICKS,
             #[cfg(feature = "metrics")]
-            submit_tick: 0,
-            lifecycle,
-        }
+            submit_tick: [0; 4],
+        };
+        let lifecycle = match kind {
+            OpKind::Multishot => Lifecycle::Multi(meta, Box::default()),
+            OpKind::Single | OpKind::ZeroCopy => Lifecycle::Submitted(meta),
+        };
+        Self { lifecycle }
     }
 
     /// The waker of a single-shot op whose future waits for it, if any.
     #[inline]
     pub(crate) fn waiting_waker(&self) -> Option<&Waker> {
         match &self.lifecycle {
-            Lifecycle::Waiting(waker) => Some(waker),
+            Lifecycle::Waiting(_, waker) => Some(waker),
             _ => None,
         }
     }
@@ -238,9 +295,10 @@ impl MaybeFdLifecycle {
     #[cfg(feature = "metrics")]
     #[inline]
     pub(crate) fn set_submit_tick(&mut self, opcode: u32, tick: u32) {
+        let meta = self.lifecycle.meta_mut();
         // Opcodes from 63 up share the last slot, like `ops_by_opcode`.
-        self.opcode = opcode.min(63) as u8;
-        self.submit_tick = tick;
+        meta.opcode = opcode.min(63) as u8;
+        meta.submit_tick = tick.to_ne_bytes();
     }
 
     /// For the first CQE of the op: `(opcode, bucket)` of its completion latency in ticks, see
@@ -249,11 +307,13 @@ impl MaybeFdLifecycle {
     #[cfg(feature = "metrics")]
     #[inline]
     pub(crate) fn take_op_ticks(&mut self, now: u32) -> Option<(usize, usize)> {
-        if self.opcode == NO_TICKS {
+        let meta = self.lifecycle.meta_mut();
+        if meta.opcode == NO_TICKS {
             return None;
         }
-        let opcode = std::mem::replace(&mut self.opcode, NO_TICKS) as usize;
-        Some((opcode, op_ticks_bucket(self.submit_tick, now)))
+        let opcode = std::mem::replace(&mut meta.opcode, NO_TICKS) as usize;
+        let submit_tick = u32::from_ne_bytes(meta.submit_tick);
+        Some((opcode, op_ticks_bucket(submit_tick, now)))
     }
 }
 
@@ -269,28 +329,29 @@ impl Ref<'_, MaybeFdLifecycle> {
         // Fast path: the final (only) CQE of a single-shot op, whose future is waiting or was
         // not polled yet. Writes the result in place: no move of the whole slot, no drop glue.
         if !more {
-            let is_fd = self.is_fd;
             let slot: *mut Lifecycle = &mut self.lifecycle;
             // SAFETY: `slot` points to the live state of this occupied slot. The shared borrow
             // ends before the state is overwritten; a moved-out waker is not dropped again, and
             // `Waiting`/`Submitted` own nothing else.
+            //
+            // The meta is copied last, right before the write, with nothing in between that
+            // could change memory (building an error result may call out): the compiler then
+            // sees that the copy stores what is already there and drops it.
             unsafe {
                 match &*slot {
-                    Lifecycle::Waiting(waker) => {
+                    Lifecycle::Waiting(meta, waker) => {
+                        let result = Self::result(res, meta.is_fd);
                         let waker = std::ptr::read(waker);
-                        std::ptr::write(
-                            slot,
-                            Lifecycle::Completed(Self::result(res, is_fd), flags),
-                        );
+                        let meta = *meta;
+                        std::ptr::write(slot, Lifecycle::Completed(meta, result, flags));
                         metric!(crate::runtime_stats::note_op_completed());
                         waker.wake();
                         return Completed::default();
                     }
-                    Lifecycle::Submitted => {
-                        std::ptr::write(
-                            slot,
-                            Lifecycle::Completed(Self::result(res, is_fd), flags),
-                        );
+                    Lifecycle::Submitted(meta) => {
+                        let result = Self::result(res, meta.is_fd);
+                        let meta = *meta;
+                        std::ptr::write(slot, Lifecycle::Completed(meta, result, flags));
                         return Completed::default();
                     }
                     _ => {}
@@ -331,7 +392,8 @@ impl Ref<'_, MaybeFdLifecycle> {
         // SAFETY: the slot is occupied (caller).
         let mut this = unsafe { slab.get_unchecked(key) };
         let more = flags & IORING_CQE_F_MORE != 0;
-        if let Lifecycle::Multi(state) = &mut this.lifecycle {
+        let meta = this.lifecycle.meta();
+        if let Lifecycle::Multi(_, state) = &mut this.lifecycle {
             let cqe = Cqe::new(res, flags);
             if let Some(ignored) = state.ignored.as_mut() {
                 ignored.discard(cqe);
@@ -363,8 +425,8 @@ impl Ref<'_, MaybeFdLifecycle> {
             };
         }
 
-        let result = Self::result(res, this.is_fd);
-        if more && this.kind == OpKind::Single {
+        let result = Self::result(res, meta.is_fd);
+        if more && meta.kind == OpKind::Single {
             trace!(
                 "MONOIO DEBUG[lifecycle]: F_MORE on a single-shot op, flags {}",
                 flags
@@ -376,45 +438,45 @@ impl Ref<'_, MaybeFdLifecycle> {
         // between are dropped, which closes a fd they carry.
         let lifecycle = &mut this.lifecycle;
         let mut wake = None;
-        let next = match std::mem::replace(lifecycle, Lifecycle::Submitted) {
-            Lifecycle::WaitingFirst(waker) => {
+        let next = match std::mem::replace(lifecycle, Lifecycle::Submitted(meta)) {
+            Lifecycle::WaitingFirst(_, waker) => {
                 // Two-step zero-copy: the result is what the submitter waits for.
                 wake = Some(waker);
                 Some(if more {
-                    Lifecycle::CompletedMore(result, flags)
+                    Lifecycle::CompletedMore(meta, result, flags)
                 } else {
-                    Lifecycle::Completed(result, flags)
+                    Lifecycle::Completed(meta, result, flags)
                 })
             }
-            Lifecycle::AwaitNotif(waker) if !more => {
+            Lifecycle::AwaitNotif(_, waker) if !more => {
                 wake = waker;
-                Some(Lifecycle::Notified)
+                Some(Lifecycle::Notified(meta))
             }
-            Lifecycle::Submitted if more => Some(Lifecycle::CompletedMore(result, flags)),
-            Lifecycle::Submitted => Some(Lifecycle::Completed(result, flags)),
-            Lifecycle::Waiting(waker) if more => {
+            Lifecycle::Submitted(_) if more => Some(Lifecycle::CompletedMore(meta, result, flags)),
+            Lifecycle::Submitted(_) => Some(Lifecycle::Completed(meta, result, flags)),
+            Lifecycle::Waiting(_, waker) if more => {
                 // Don't wake yet: the final CQE is still to come.
-                Some(Lifecycle::WaitingMore(waker, result, flags))
+                Some(Lifecycle::WaitingMore(meta, waker, result, flags))
             }
-            Lifecycle::Waiting(waker) => {
+            Lifecycle::Waiting(_, waker) => {
                 wake = Some(waker);
-                Some(Lifecycle::Completed(result, flags))
+                Some(Lifecycle::Completed(meta, result, flags))
             }
-            Lifecycle::Ignored(data) if more => Some(Lifecycle::IgnoredMore(data)),
-            Lifecycle::CompletedMore(stored, stored_flags) if !more => Some(Lifecycle::Completed(
-                stored,
-                stored_flags & !IORING_CQE_F_MORE,
-            )),
-            Lifecycle::WaitingMore(waker, stored, stored_flags) if !more => {
+            Lifecycle::Ignored(_, data) if more => Some(Lifecycle::IgnoredMore(meta, data)),
+            Lifecycle::CompletedMore(_, stored, stored_flags) if !more => Some(
+                Lifecycle::Completed(meta, stored, stored_flags & !IORING_CQE_F_MORE),
+            ),
+            Lifecycle::WaitingMore(_, waker, stored, stored_flags) if !more => {
                 wake = Some(waker);
                 Some(Lifecycle::Completed(
+                    meta,
                     stored,
                     stored_flags & !IORING_CQE_F_MORE,
                 ))
             }
-            Lifecycle::Ignored(data) | Lifecycle::IgnoredMore(data) if !more => {
+            Lifecycle::Ignored(_, data) | Lifecycle::IgnoredMore(_, data) if !more => {
                 // Put it back so that `remove` hands it out to be dropped later.
-                *lifecycle = Lifecycle::Ignored(data);
+                *lifecycle = Lifecycle::Ignored(meta, data);
                 None
             }
             // A CQE in between, or one after the op completed: keep the state.
@@ -454,8 +516,11 @@ impl Ref<'_, MaybeFdLifecycle> {
     #[allow(clippy::needless_pass_by_ref_mut)]
     #[inline]
     pub(crate) fn poll_op(mut self, cx: &mut Context<'_>) -> Poll<CompletionMeta> {
-        match &mut self.lifecycle {
-            Lifecycle::Completed(result, flags) => {
+        let slot: *mut Lifecycle = &mut self.lifecycle;
+        // SAFETY: `slot` points to the live state of this occupied slot; the borrow of the
+        // match ends before the `Submitted` arm overwrites the state.
+        match unsafe { &mut *slot } {
+            Lifecycle::Completed(_, result, flags) => {
                 let meta = CompletionMeta {
                     // SAFETY: the result is moved out here and the slot is freed right below
                     // without dropping it; nothing else in the slot needs a drop.
@@ -466,16 +531,20 @@ impl Ref<'_, MaybeFdLifecycle> {
                 unsafe { self.remove_forget() };
                 Poll::Ready(meta)
             }
-            ref_mut @ Lifecycle::Submitted => {
+            Lifecycle::Submitted(_) => {
                 let waker = cx.waker().clone();
                 // SAFETY: `Submitted` owns nothing, so the old state needs no drop. A plain
                 // assignment calls the drop glue of `Lifecycle`: after the clone (a call
-                // through the waker's vtable) the compiler no longer knows the state.
-                unsafe { std::ptr::write(ref_mut, Lifecycle::Waiting(waker)) };
+                // through the waker's vtable) the compiler no longer knows the state. For the
+                // same reason the meta is read after the clone: no value to keep across it.
+                unsafe {
+                    let meta = (*slot).meta();
+                    std::ptr::write(slot, Lifecycle::Waiting(meta, waker));
+                }
                 Poll::Pending
             }
             // Polled again before the CQE, by the task that already waits.
-            Lifecycle::Waiting(waker) if waker.will_wake(cx.waker()) => Poll::Pending,
+            Lifecycle::Waiting(_, waker) if waker.will_wake(cx.waker()) => Poll::Pending,
             _ => {
                 let (slab, key) = self.into_parts();
                 // SAFETY: `key` is the occupied slot of the `Ref` just taken apart.
@@ -497,28 +566,29 @@ impl Ref<'_, MaybeFdLifecycle> {
     ) -> Poll<CompletionMeta> {
         // SAFETY: the slot is occupied (caller).
         let mut this = unsafe { slab.get_unchecked(key) };
+        let meta = this.lifecycle.meta();
         let ref_mut = &mut this.lifecycle;
         match ref_mut {
-            Lifecycle::Submitted => {
-                *ref_mut = Lifecycle::Waiting(cx.waker().clone());
+            Lifecycle::Submitted(_) => {
+                *ref_mut = Lifecycle::Waiting(meta, cx.waker().clone());
                 Poll::Pending
             }
-            Lifecycle::Waiting(waker) | Lifecycle::WaitingMore(waker, _, _) => {
+            Lifecycle::Waiting(_, waker) | Lifecycle::WaitingMore(_, waker, _, _) => {
                 if !waker.will_wake(cx.waker()) {
                     *waker = cx.waker().clone();
                 }
                 Poll::Pending
             }
             // Multi-CQE: first CQE arrived but still waiting for notification
-            Lifecycle::CompletedMore(_, _) => {
-                if let Lifecycle::CompletedMore(result, flags) =
-                    std::mem::replace(ref_mut, Lifecycle::Submitted)
+            Lifecycle::CompletedMore(..) => {
+                if let Lifecycle::CompletedMore(_, result, flags) =
+                    std::mem::replace(ref_mut, Lifecycle::Submitted(meta))
                 {
-                    *ref_mut = Lifecycle::WaitingMore(cx.waker().clone(), result, flags);
+                    *ref_mut = Lifecycle::WaitingMore(meta, cx.waker().clone(), result, flags);
                 }
                 Poll::Pending
             }
-            Lifecycle::Completed(result, flags) => {
+            Lifecycle::Completed(_, result, flags) => {
                 let meta = CompletionMeta {
                     // SAFETY: the result is moved out here and the slot is freed right below
                     // without dropping it; nothing else in the slot needs a drop.
@@ -531,12 +601,12 @@ impl Ref<'_, MaybeFdLifecycle> {
             }
             // Not reachable through `Op` (dropped ops are not polled, multishot ops are not
             // `Op`s, two-step zero-copy sends use `poll_zc_*`).
-            Lifecycle::Ignored(_)
-            | Lifecycle::IgnoredMore(_)
-            | Lifecycle::Multi(_)
-            | Lifecycle::WaitingFirst(_)
-            | Lifecycle::AwaitNotif(_)
-            | Lifecycle::Notified => Poll::Pending,
+            Lifecycle::Ignored(..)
+            | Lifecycle::IgnoredMore(..)
+            | Lifecycle::Multi(..)
+            | Lifecycle::WaitingFirst(..)
+            | Lifecycle::AwaitNotif(..)
+            | Lifecycle::Notified(_) => Poll::Pending,
         }
     }
 
@@ -564,27 +634,28 @@ impl Ref<'_, MaybeFdLifecycle> {
                 }
             }
         };
+        let meta = self.lifecycle.meta();
         let ref_mut = &mut self.lifecycle;
         let cancel = match ref_mut {
-            Lifecycle::Submitted | Lifecycle::Waiting(_) | Lifecycle::WaitingFirst(_) => {
-                *ref_mut = Lifecycle::Ignored(keep(data));
+            Lifecycle::Submitted(_) | Lifecycle::Waiting(..) | Lifecycle::WaitingFirst(..) => {
+                *ref_mut = Lifecycle::Ignored(meta, keep(data));
                 true
             }
             // Zero-copy: the send is done, only the notification (the kernel releasing the
             // buffer) is still to come, so keep the slot and the buffer alive; a cancel could not
             // speed that up. Dropping the stored result closes a fd it carries.
-            Lifecycle::CompletedMore(_, _)
-            | Lifecycle::WaitingMore(_, _, _)
-            | Lifecycle::AwaitNotif(_) => {
-                *ref_mut = Lifecycle::IgnoredMore(keep(data));
+            Lifecycle::CompletedMore(..)
+            | Lifecycle::WaitingMore(..)
+            | Lifecycle::AwaitNotif(..) => {
+                *ref_mut = Lifecycle::IgnoredMore(meta, keep(data));
                 false
             }
-            Lifecycle::Completed(..) | Lifecycle::Notified => {
+            Lifecycle::Completed(..) | Lifecycle::Notified(_) => {
                 self.remove();
                 false
             }
             // Already dropped, or not an `Op`: nothing to do.
-            Lifecycle::Ignored(..) | Lifecycle::IgnoredMore(..) | Lifecycle::Multi(_) => false,
+            Lifecycle::Ignored(..) | Lifecycle::IgnoredMore(..) | Lifecycle::Multi(..) => false,
         };
         Dropped {
             cancel,
@@ -597,25 +668,26 @@ impl Ref<'_, MaybeFdLifecycle> {
     /// come, the slot stays (owning nothing: the caller keeps the data) until
     /// [`poll_zc_notif`](Self::poll_zc_notif) saw it; when it is not (`done`), the slot is freed.
     pub(crate) fn poll_zc_first(mut self, cx: &mut Context<'_>) -> Poll<ZcFirst> {
+        let meta = self.lifecycle.meta();
         let ref_mut = &mut self.lifecycle;
         match ref_mut {
-            Lifecycle::WaitingFirst(waker) => {
+            Lifecycle::WaitingFirst(_, waker) => {
                 if !waker.will_wake(cx.waker()) {
                     *waker = cx.waker().clone();
                 }
                 return Poll::Pending;
             }
-            Lifecycle::Submitted | Lifecycle::Waiting(_) => {
-                *ref_mut = Lifecycle::WaitingFirst(cx.waker().clone());
+            Lifecycle::Submitted(_) | Lifecycle::Waiting(..) => {
+                *ref_mut = Lifecycle::WaitingFirst(meta, cx.waker().clone());
                 return Poll::Pending;
             }
             Lifecycle::CompletedMore(..) | Lifecycle::WaitingMore(..) => {
-                let (result, flags) = match std::mem::replace(ref_mut, Lifecycle::AwaitNotif(None))
-                {
-                    Lifecycle::CompletedMore(result, flags)
-                    | Lifecycle::WaitingMore(_, result, flags) => (result, flags),
-                    _ => unreachable!(),
-                };
+                let (result, flags) =
+                    match std::mem::replace(ref_mut, Lifecycle::AwaitNotif(meta, None)) {
+                        Lifecycle::CompletedMore(_, result, flags)
+                        | Lifecycle::WaitingMore(_, _, result, flags) => (result, flags),
+                        _ => unreachable!(),
+                    };
                 return Poll::Ready(ZcFirst {
                     meta: CompletionMeta { result, flags },
                     done: false,
@@ -634,7 +706,7 @@ impl Ref<'_, MaybeFdLifecycle> {
             }
         }
         match self.remove().lifecycle {
-            Lifecycle::Completed(result, flags) => Poll::Ready(ZcFirst {
+            Lifecycle::Completed(_, result, flags) => Poll::Ready(ZcFirst {
                 meta: CompletionMeta { result, flags },
                 done: true,
             }),
@@ -646,14 +718,14 @@ impl Ref<'_, MaybeFdLifecycle> {
     /// slot freed) once the notification CQE arrived.
     pub(crate) fn poll_zc_notif(mut self, cx: &mut Context<'_>) -> Poll<()> {
         match &mut self.lifecycle {
-            Lifecycle::AwaitNotif(waker) => {
+            Lifecycle::AwaitNotif(_, waker) => {
                 match waker {
                     Some(w) if w.will_wake(cx.waker()) => {}
                     _ => *waker = Some(cx.waker().clone()),
                 }
                 Poll::Pending
             }
-            Lifecycle::Notified | Lifecycle::Completed(..) => {
+            Lifecycle::Notified(_) | Lifecycle::Completed(..) => {
                 self.remove();
                 Poll::Ready(())
             }
@@ -666,7 +738,7 @@ impl Ref<'_, MaybeFdLifecycle> {
     pub(crate) fn zc_released(&self) -> bool {
         matches!(
             self.lifecycle,
-            Lifecycle::Notified | Lifecycle::Completed(..)
+            Lifecycle::Notified(_) | Lifecycle::Completed(..)
         )
     }
 
@@ -683,7 +755,7 @@ impl Ref<'_, MaybeFdLifecycle> {
         mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<(Cqe, Option<Taken>)>> {
-        let Lifecycle::Multi(state) = &mut self.lifecycle else {
+        let Lifecycle::Multi(_, state) = &mut self.lifecycle else {
             return Poll::Ready(None);
         };
         if let Some(cqe) = state.queue.pop_front() {
@@ -707,7 +779,7 @@ impl Ref<'_, MaybeFdLifecycle> {
     /// The handle of a multishot op is dropped: discard the queued CQEs, then free the slot if
     /// the op is finished (returns true) or keep `data` in it until the final CQE (false).
     pub(crate) fn drop_multi<T: OpAble + 'static>(mut self, data: &mut Option<T>) -> bool {
-        let Lifecycle::Multi(state) = &mut self.lifecycle else {
+        let Lifecycle::Multi(_, state) = &mut self.lifecycle else {
             return true;
         };
         state.waker = None;
@@ -734,7 +806,7 @@ impl Ref<'_, MaybeFdLifecycle> {
     /// If the kernel is done with a multishot op: discard the CQEs not taken yet, free the slot
     /// and return true.
     pub(crate) fn finish_multi<T: OpAble>(mut self, data: &mut T) -> bool {
-        let Lifecycle::Multi(state) = &mut self.lifecycle else {
+        let Lifecycle::Multi(_, state) = &mut self.lifecycle else {
             return true;
         };
         if !state.finished {
@@ -752,7 +824,7 @@ impl Ref<'_, MaybeFdLifecycle> {
     /// Take the provided buffers of every later CQE of this multishot op at reap time. Set it
     /// right after the submit, before the driver can reap a CQE of the op.
     pub(crate) fn set_pretake(mut self, pre: PreTake) {
-        if let Lifecycle::Multi(state) = &mut self.lifecycle {
+        if let Lifecycle::Multi(_, state) = &mut self.lifecycle {
             debug_assert!(state.queue.is_empty());
             state.pretake = Some(pre);
         }
@@ -761,7 +833,7 @@ impl Ref<'_, MaybeFdLifecycle> {
     /// Whether the kernel posted the final CQE of a multishot op.
     pub(crate) fn multi_finished(&self) -> bool {
         match &self.lifecycle {
-            Lifecycle::Multi(state) => state.finished,
+            Lifecycle::Multi(_, state) => state.finished,
             _ => true,
         }
     }
@@ -1213,10 +1285,80 @@ mod tests {
         assert_eq!(super::OP_TICK_BUCKETS, 4);
     }
 
-    /// The slot size the inline data costs.
+    /// An op slot is one cache line, with and without `metrics`, and still keeps 48 bytes of
+    /// a dropped op inline. The layout of the states is the compiler's choice (the meta goes
+    /// into the word of the tag, the slab's vacant marker into a spare tag value), so it is
+    /// pinned here rather than by a compile-time assertion that could break a user's build.
+    #[cfg(target_pointer_width = "64")]
     #[test]
-    fn lifecycle_size() {
-        assert!(std::mem::size_of::<MaybeFdLifecycle>() <= 72);
+    fn slot_is_one_cache_line() {
+        use std::mem::{align_of, size_of};
+
+        use crate::driver::uring::ignored::INLINE_SIZE;
+
+        assert!(size_of::<Meta>() <= 7);
+        assert_eq!(align_of::<Meta>(), 1);
+        assert_eq!(INLINE_SIZE, 48);
+        assert_eq!(size_of::<IgnoredData>(), 56);
+        assert_eq!(size_of::<Lifecycle>(), 64);
+        assert_eq!(size_of::<MaybeFdLifecycle>(), 64);
+        assert_eq!(size_of::<Option<MaybeFdLifecycle>>(), 64);
+        assert_eq!(Slab::<MaybeFdLifecycle>::ENTRY_SIZE, 64);
+        assert_eq!(Slab::<MaybeFdLifecycle>::ENTRY_ALIGN, 64);
+    }
+
+    /// The meta survives every transition of a slot.
+    #[test]
+    fn meta_is_kept_across_states() {
+        let (waker, _flag) = flag_waker();
+        let mut cx = Context::from_waker(&waker);
+        let check = |slab: &mut Slab<MaybeFdLifecycle>, key: usize, kind: OpKind| {
+            let meta = slab.get(key).unwrap().lifecycle.meta();
+            assert!(meta.is_fd);
+            assert_eq!(meta.kind, kind);
+        };
+
+        // Submitted -> Waiting -> Completed.
+        let mut slab = Slab::new();
+        let key = slab.insert(MaybeFdLifecycle::new(true, OpKind::Single));
+        check(&mut slab, key, OpKind::Single);
+        assert!(slab.get(key).unwrap().poll_op(&mut cx).is_pending());
+        check(&mut slab, key, OpKind::Single);
+        unsafe { slab.get(key).unwrap().complete(-libc::EINVAL, 0) };
+        check(&mut slab, key, OpKind::Single);
+        assert!(slab.get(key).unwrap().poll_op(&mut cx).is_ready());
+
+        // Submitted -> Ignored -> removed with the final CQE.
+        let key = slab.insert(MaybeFdLifecycle::new(true, OpKind::Single));
+        let mut data = Some([0u64; 6]);
+        assert_eq!(
+            slab.get(key).unwrap().drop_op(&mut data).kept_inline,
+            Some(true)
+        );
+        check(&mut slab, key, OpKind::Single);
+        let done = unsafe { slab.get(key).unwrap().complete(-libc::ECANCELED, 0) };
+        assert!(done.deferred.unwrap().lifecycle.meta().is_fd);
+
+        // Zero-copy: WaitingFirst -> CompletedMore -> AwaitNotif -> Notified.
+        let key = slab.insert(MaybeFdLifecycle::new(true, OpKind::ZeroCopy));
+        assert!(slab.get(key).unwrap().poll_zc_first(&mut cx).is_pending());
+        check(&mut slab, key, OpKind::ZeroCopy);
+        unsafe {
+            slab.get(key)
+                .unwrap()
+                .complete(-libc::EINVAL, IORING_CQE_F_MORE)
+        };
+        check(&mut slab, key, OpKind::ZeroCopy);
+        assert!(slab.get(key).unwrap().poll_zc_first(&mut cx).is_ready());
+        check(&mut slab, key, OpKind::ZeroCopy);
+        unsafe { slab.get(key).unwrap().complete(0, IORING_CQE_F_NOTIF) };
+        check(&mut slab, key, OpKind::ZeroCopy);
+        assert!(slab.get(key).unwrap().poll_zc_notif(&mut cx).is_ready());
+
+        // Multishot.
+        let key = slab.insert(MaybeFdLifecycle::new(true, OpKind::Multishot));
+        unsafe { slab.get(key).unwrap().complete(1, IORING_CQE_F_MORE) };
+        check(&mut slab, key, OpKind::Multishot);
     }
 
     struct Counting(std::rc::Rc<std::cell::Cell<usize>>);

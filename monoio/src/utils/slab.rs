@@ -6,6 +6,9 @@
 //! the key ([`page_of`]), and a small table ([`PageIndex`]) gives, per page, a pointer that turns
 //! the key into its slot with one multiply-add and the bound the key must stay under. The
 //! pages themselves (free list, counters) are only touched by `insert` and `remove`.
+//!
+//! Entries are aligned to a cache line ([`CACHE_LINE`]): an entry of up to 64 bytes lies in
+//! one line, and reaching it costs at most one cache miss.
 
 use std::{
     mem::{ManuallyDrop, MaybeUninit},
@@ -29,6 +32,8 @@ const NUM_PAGES: usize = 26;
 const PAGE_INITIAL_SIZE: usize = 64;
 const PAGE_SHIFT: u32 = PAGE_INITIAL_SIZE.trailing_zeros();
 const COMPACT_INTERVAL: u32 = 2048;
+/// The alignment of an entry (the `repr(align)` of [`Entry`] repeats the number).
+const CACHE_LINE: usize = 64;
 /// One index entry for every value [`page_of`] can return, so that a lookup needs no range
 /// check on the page id: the entries beyond `NUM_PAGES` stay empty and reject every key.
 const INDEX_LEN: usize = (usize::BITS - PAGE_SHIFT) as usize;
@@ -38,7 +43,7 @@ const _: () = assert!(PAGE_INITIAL_SIZE.is_power_of_two() && NUM_PAGES <= INDEX_
 struct PageIndex<T> {
     /// The slots of the page, moved back by the page's first key (in slots): the slot of key
     /// `k` of this page is `base.wrapping_add(k)`. Null while the page does not exist.
-    base: *mut Entry<T>,
+    base: *mut Slot<T>,
     /// First key of the page whose slot was never initialized (first key of the page plus its
     /// `initialized` count); 0 while the page does not exist. A key that [`page_of`] maps to
     /// this page has an initialized slot iff it is below `end`.
@@ -59,6 +64,12 @@ impl<T> Default for Slab<T> {
 }
 
 impl<T> Slab<T> {
+    /// Size and alignment of an entry, for the layout tests of the types kept in a slab.
+    #[cfg(test)]
+    pub(crate) const ENTRY_SIZE: usize = std::mem::size_of::<Slot<T>>();
+    #[cfg(test)]
+    pub(crate) const ENTRY_ALIGN: usize = std::mem::align_of::<Slot<T>>();
+
     /// Create a new slab.
     pub(crate) const fn new() -> Slab<T> {
         Slab {
@@ -75,7 +86,7 @@ impl<T> Slab<T> {
     /// The slot of `key`, if `key` is in a page and its slot was initialized (it may be
     /// vacant).
     #[inline(always)]
-    fn entry_ptr(&self, key: usize) -> Option<NonNull<Entry<T>>> {
+    fn entry_ptr(&self, key: usize) -> Option<NonNull<Slot<T>>> {
         // SAFETY: `page_of` returns less than `INDEX_LEN`.
         let index = unsafe { self.index.get_unchecked(page_of(key)) };
         if key < index.end {
@@ -110,7 +121,7 @@ impl<T> Slab<T> {
     pub(crate) fn get(&mut self, key: usize) -> Option<Ref<'_, T>> {
         let entry = self.entry_ptr(key)?;
         // SAFETY: `entry_ptr` returns initialized slots.
-        match unsafe { entry.as_ref() } {
+        match unsafe { &entry.as_ref().0 } {
             Entry::Vacant(_) => None,
             Entry::Occupied(_) => Some(Ref {
                 slab: self,
@@ -125,7 +136,7 @@ impl<T> Slab<T> {
     pub(crate) fn peek(&self, key: usize) -> Option<&T> {
         let entry = self.entry_ptr(key)?;
         // SAFETY: `entry_ptr` returns initialized slots, and `&self` keeps the slot as it is.
-        unsafe { entry.as_ref() }.as_ref()
+        unsafe { entry.as_ref() }.0.as_ref()
     }
 
     /// Ask the CPU to pull the entry of `key` into the cache (a hint; nothing if `key` was never
@@ -134,9 +145,12 @@ impl<T> Slab<T> {
     pub(crate) fn prefetch(&self, key: usize) {
         if let Some(entry) = self.entry_ptr(key) {
             let p = entry.as_ptr().cast::<u8>();
-            // An entry may straddle two cache lines.
+            // Entries start on a cache line: the first line is all of an entry of up to 64
+            // bytes. A larger one gets its last line as well.
             prefetch_read(p);
-            prefetch_read(p.wrapping_add(std::mem::size_of::<Entry<T>>() - 1));
+            if std::mem::size_of::<Slot<T>>() > CACHE_LINE {
+                prefetch_read(p.wrapping_add(std::mem::size_of::<Slot<T>>() - 1));
+            }
         }
     }
 
@@ -168,7 +182,7 @@ impl<T> Slab<T> {
             let slot = page.next;
             let entry = page.slots.as_ptr().add(slot);
             if slot < page.initialized {
-                page.next = match &*entry {
+                page.next = match &(*entry).0 {
                     Entry::Vacant(next) => *next,
                     Entry::Occupied(_) => std::hint::unreachable_unchecked(),
                 };
@@ -179,7 +193,7 @@ impl<T> Slab<T> {
                 self.index.get_unchecked_mut(page_id).end += 1;
             }
             page.used += 1;
-            entry.write(Entry::Occupied(ManuallyDrop::into_inner(val)));
+            entry.write(Slot(Entry::Occupied(ManuallyDrop::into_inner(val))));
             slot + page.first_key
         }
     }
@@ -224,11 +238,11 @@ impl<T> Slab<T> {
     /// # Safety
     /// `entry` is the slot of `key` and occupied, and its value was moved out or needs no drop.
     #[inline]
-    unsafe fn release(&mut self, entry: NonNull<Entry<T>>, key: usize) {
+    unsafe fn release(&mut self, entry: NonNull<Slot<T>>, key: usize) {
         // SAFETY: an occupied slot is in an existing page, the one `page_of` gives.
         unsafe {
             let page = page_mut(&mut self.pages, page_of(key));
-            entry.as_ptr().write(Entry::Vacant(page.next));
+            entry.as_ptr().write(Slot(Entry::Vacant(page.next)));
             page.next = key - page.first_key;
             page.used -= 1;
         }
@@ -315,7 +329,7 @@ unsafe fn page_mut<T>(pages: &mut [Option<Page<T>>; NUM_PAGES], page_id: usize) 
 pub(crate) struct Ref<'a, T> {
     slab: &'a mut Slab<T>,
     // The slot of `key`: occupied, in a page of `slab`.
-    entry: NonNull<Entry<T>>,
+    entry: NonNull<Slot<T>>,
     key: usize,
 }
 
@@ -331,7 +345,7 @@ impl<'a, T> Ref<'a, T> {
     pub(crate) fn remove(self) -> T {
         // SAFETY: the slot is occupied; its value is moved out before the slot is freed.
         unsafe {
-            let val = match self.entry.as_ptr().read() {
+            let val = match self.entry.as_ptr().read().0 {
                 Entry::Occupied(val) => val,
                 Entry::Vacant(_) => std::hint::unreachable_unchecked(),
             };
@@ -356,7 +370,7 @@ impl<T> AsRef<T> for Ref<'_, T> {
     fn as_ref(&self) -> &T {
         // SAFETY: the slot is occupied, and borrowed through `self.slab` for as long as this
         // `Ref` lives.
-        unsafe { self.entry.as_ref().as_ref().unwrap_unchecked() }
+        unsafe { self.entry.as_ref().0.as_ref().unwrap_unchecked() }
     }
 }
 
@@ -364,7 +378,7 @@ impl<T> AsMut<T> for Ref<'_, T> {
     #[inline]
     fn as_mut(&mut self) -> &mut T {
         // SAFETY: as in `as_ref`, exclusively.
-        unsafe { self.entry.as_mut().as_mut().unwrap_unchecked() }
+        unsafe { self.entry.as_mut().0.as_mut().unwrap_unchecked() }
     }
 }
 
@@ -389,6 +403,17 @@ enum Entry<T> {
     Occupied(T),
 }
 
+/// An entry as the pages store it: aligned to a cache line, so its size is a multiple of 64
+/// and it never shares a line with its neighbours.
+///
+/// A wrapper, not a `repr(align)` on [`Entry`]: that would align each variant, and a
+/// `Vacant` padded to 64 bytes no longer fits next to the spare value of `T` that marks it,
+/// which costs a 64-byte `T` a second line.
+#[repr(align(64))]
+struct Slot<T>(Entry<T>);
+
+const _: () = assert!(std::mem::align_of::<Slot<u8>>() == CACHE_LINE);
+
 impl<T> Entry<T> {
     #[inline]
     fn as_ref(&self) -> Option<&T> {
@@ -411,7 +436,7 @@ struct Page<T> {
     // continued buffer of fixed size: `cap` slots, the first `initialized` of them
     // initialized. Owned; a raw pointer because lookups reach the slots through
     // `PageIndex::base`, a pointer derived from this one.
-    slots: NonNull<Entry<T>>,
+    slots: NonNull<Slot<T>>,
     // number of slots
     cap: usize,
     // number of occupied slots
@@ -426,9 +451,9 @@ struct Page<T> {
 
 impl<T> Page<T> {
     fn new(size: usize, first_key: usize) -> Self {
-        let slots = Box::<[Entry<T>]>::new_uninit_slice(size);
+        let slots = Box::<[Slot<T>]>::new_uninit_slice(size);
         // SAFETY: a box is never null.
-        let slots = unsafe { NonNull::new_unchecked(Box::into_raw(slots).cast::<Entry<T>>()) };
+        let slots = unsafe { NonNull::new_unchecked(Box::into_raw(slots).cast::<Slot<T>>()) };
         Self {
             slots,
             cap: size,
@@ -462,7 +487,7 @@ impl<T> Drop for Page<T> {
                 ));
             }
             drop(Box::from_raw(ptr::slice_from_raw_parts_mut(
-                self.slots.as_ptr().cast::<MaybeUninit<Entry<T>>>(),
+                self.slots.as_ptr().cast::<MaybeUninit<Slot<T>>>(),
                 self.cap,
             )));
         }
@@ -488,6 +513,29 @@ impl<T> Slab<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Entries are aligned to a cache line, and the alignment costs nothing for a value that
+    /// fills the line and has a spare value for the vacant marker.
+    #[test]
+    fn entries_are_cache_line_aligned() {
+        assert_eq!(Slab::<u8>::ENTRY_ALIGN, CACHE_LINE);
+        assert_eq!(Slab::<u8>::ENTRY_SIZE, CACHE_LINE);
+        assert_eq!(Slab::<[u64; 7]>::ENTRY_SIZE, CACHE_LINE);
+        assert_eq!(Slab::<[u64; 8]>::ENTRY_SIZE, 2 * CACHE_LINE);
+        // 64 bytes with a niche (the bool): the vacant marker goes into it.
+        assert_eq!(Slab::<([u64; 7], u32, bool)>::ENTRY_SIZE, CACHE_LINE);
+
+        let mut slab = Slab::new();
+        for i in 0..PAGE_INITIAL_SIZE * 3 {
+            let key = slab.insert(i);
+            let p = slab.peek(key).unwrap() as *const usize as usize;
+            assert_eq!(p / CACHE_LINE, (p + 7) / CACHE_LINE);
+            assert_eq!(
+                slab.get(key).unwrap().entry.as_ptr() as usize % CACHE_LINE,
+                0
+            );
+        }
+    }
 
     #[test]
     fn insert_get_remove_one() {
