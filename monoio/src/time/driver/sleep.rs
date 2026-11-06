@@ -8,7 +8,6 @@ use pin_project_lite::pin_project;
 
 use crate::time::{
     driver::{Handle, TimerEntry},
-    error::Error,
     Duration, Instant,
 };
 
@@ -198,10 +197,10 @@ pin_project! {
 
 impl Sleep {
     pub(crate) fn new_timeout(deadline: Instant) -> Sleep {
-        let handle = Handle::current();
-        let entry = TimerEntry::new(&handle, deadline);
-
-        Sleep { deadline, entry }
+        Sleep {
+            deadline,
+            entry: TimerEntry::new(Handle::current()),
+        }
     }
 
     pub(crate) fn far_future() -> Sleep {
@@ -256,29 +255,13 @@ impl Sleep {
         me.entry.reset(deadline);
         *me.deadline = deadline;
     }
-
-    fn poll_elapsed(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
-        let me = self.project();
-        me.entry.poll_elapsed(cx)
-    }
 }
 
 impl Future for Sleep {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-        // `poll_elapsed` can return an error in two cases:
-        //
-        // - AtCapacity: this is a pathological case where far too many sleep instances have been
-        //   scheduled.
-        // - Shutdown: No timer has been setup, which is a mis-use error.
-        //
-        // Both cases are extremely rare, and pretty accurately fit into
-        // "logic errors", so we just panic in this case. A user couldn't
-        // really do much better if we passed the error onwards.
-        match ready!(self.as_mut().poll_elapsed(cx)) {
-            Ok(()) => Poll::Ready(()),
-            Err(e) => panic!("timer error: {e}"),
-        }
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        let me = self.project();
+        me.entry.poll_elapsed(cx, *me.deadline)
     }
 }

@@ -2,23 +2,21 @@ use std::{fmt, rc::Rc};
 
 use crate::time::driver::ClockTime;
 
-/// Handle to time driver instance.
+/// Handle to time driver instance: one reference to its shared state.
 #[derive(Clone)]
 pub(crate) struct Handle {
-    time_source: ClockTime,
     inner: Rc<super::Inner>,
 }
 
 impl Handle {
     /// Creates a new timer `Handle` from a shared `Inner` timer state.
     pub(super) fn new(inner: Rc<super::Inner>) -> Self {
-        let time_source = inner.state.borrow_mut().time_source.clone();
-        Handle { time_source, inner }
+        Handle { inner }
     }
 
     /// Returns the time source associated with this handle
     pub(super) fn time_source(&self) -> &ClockTime {
-        &self.time_source
+        &self.inner.time_source
     }
 
     /// Access the driver's inner structure

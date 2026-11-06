@@ -19,7 +19,7 @@ use std::{cell::RefCell, fmt, io, num::NonZeroU64, ptr::NonNull, rc::Rc};
 
 use crate::{
     driver::Driver,
-    time::{error::Error, Clock, Duration, Instant},
+    time::{Clock, Duration, Instant},
 };
 
 /// Time implementation that drives [`Sleep`][sleep], [`Interval`][interval],
@@ -129,17 +129,16 @@ impl ClockTime {
     }
 }
 
-/// Timer state shared between `Driver`, `Handle`, and `Registration`.
+/// Timer state shared between the `TimeDriver` and every `Handle` (one per timer entry).
 struct Inner {
-    // The state is split like this so `Handle` can access `is_shutdown` without locking the mutex
+    /// Timing backend in use. Never changes, so it sits outside the `RefCell`.
+    time_source: ClockTime,
+
     pub(super) state: RefCell<InnerState>,
 }
 
-/// Time state shared which must be protected by a `Mutex`
+/// The mutable part of the driver's state.
 struct InnerState {
-    /// Timing backend in use
-    time_source: ClockTime,
-
     /// The last published timer `elapsed` value.
     elapsed: u64,
 
@@ -252,7 +251,7 @@ impl Handle {
             now = state.elapsed;
         }
         while let Some(entry) = state.wheel.poll(now) {
-            if let Some(waker) = unsafe { entry.fire(Ok(())) } {
+            if let Some(waker) = unsafe { entry.fire() } {
                 waker.wake();
             }
         }
@@ -263,25 +262,11 @@ impl Handle {
             .map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
     }
 
-    /// Removes a registered timer from the driver.
+    /// Unlinks a registered timer from the wheel. No waker is invoked.
     ///
-    /// The timer will be moved to the cancelled state. Wakers will _not_ be
-    /// invoked. If the timer is already completed, this function is a no-op.
-    ///
-    /// This function always acquires the driver lock, even if the entry does
-    /// not appear to be registered.
-    ///
-    /// SAFETY: The timer must not be registered with some other driver, and
-    /// `add_entry` must not be called concurrently.
-    pub(self) unsafe fn clear_entry(&self, entry: NonNull<TimerShared>) {
-        unsafe {
-            let mut state = self.get().state.borrow_mut();
-            if entry.as_ref().might_be_registered() {
-                state.wheel.remove(entry);
-            }
-
-            entry.as_ref().handle().fire(Ok(()));
-        }
+    /// SAFETY: `entry` must be registered with this driver (`TimerShared::is_registered`).
+    pub(self) unsafe fn remove(&self, entry: NonNull<TimerShared>) {
+        unsafe { self.get().state.borrow_mut().wheel.remove(entry) };
     }
 
     /// Removes and re-adds an entry to the driver.
@@ -296,7 +281,7 @@ impl Handle {
 
             // We may have raced with a firing/deregistration, so check before
             // deregistering.
-            if unsafe { entry.as_ref().might_be_registered() } {
+            if unsafe { entry.as_ref().is_registered() } {
                 state.wheel.remove(entry);
             }
 
@@ -317,7 +302,7 @@ impl Handle {
                     state.next_wake = Some(state.next_wake.map_or(tick, |w| w.min(tick)));
                     None
                 }
-                Err((entry, super::error::InsertError::Elapsed)) => unsafe { entry.fire(Ok(())) },
+                Err((entry, super::error::InsertError::Elapsed)) => unsafe { entry.fire() },
             }
         };
 
@@ -384,8 +369,8 @@ where
 impl Inner {
     pub(self) fn new(time_source: ClockTime) -> Self {
         Inner {
+            time_source,
             state: RefCell::new(InnerState {
-                time_source,
                 elapsed: 0,
                 next_wake: None,
                 wheel: wheel::Wheel::new(),
