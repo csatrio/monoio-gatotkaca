@@ -172,7 +172,7 @@ impl<D: BufOp> OpFuture<D> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn poll_result(&mut self, cx: &mut Context<'_>) -> Poll<BufResult<usize, D::Buf>> {
         let state: &mut State<D> = &mut self.state;
         match state {
@@ -249,7 +249,7 @@ macro_rules! named_future {
             /// # Panics
             ///
             /// If called again after it returned `Ready`.
-            #[inline]
+            #[inline(always)]
             pub fn poll_result(&mut self, cx: &mut Context<'_>) -> Poll<BufResult<usize, $T>> {
                 self.0.poll_result(cx)
             }
@@ -273,7 +273,7 @@ macro_rules! named_future {
         impl<$T: $Bound> Future for $name<$T> {
             type Output = BufResult<usize, $T>;
 
-            #[inline]
+            #[inline(always)]
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 self.0.poll_result(cx)
             }
