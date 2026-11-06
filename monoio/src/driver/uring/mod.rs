@@ -1179,6 +1179,8 @@ impl UringInner {
             return;
         }
         if let Some(lifecycle) = inner.ops.slab.get(index) {
+            // Unread when both `metrics` and `async-cancel` are off.
+            #[allow(unused_variables)]
             let dropped = lifecycle.drop_op(data);
             metric!(match dropped.kept_inline {
                 Some(true) => inner.stats.ignored_inline += 1,
