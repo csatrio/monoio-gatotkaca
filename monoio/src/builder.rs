@@ -28,6 +28,9 @@ pub struct RuntimeBuilder<D> {
     // LIFO slot for hand-over wakes, see `lifo_slot`
     lifo_slot: bool,
 
+    // priority for tasks woken by small completions, see `small_io_priority` (0: off)
+    small_io_max: u32,
+
     // [bounded, unbounded] io-wq worker caps, see `iowq_max_workers`
     iowq_max_workers: Option<[u32; 2]>,
 
@@ -76,6 +79,7 @@ impl<T> RuntimeBuilder<T> {
             task_budget: None,
             coop_budget: None,
             lifo_slot: false,
+            small_io_max: 0,
             iowq_max_workers: None,
             fixed_files: [0, 0],
 
@@ -135,6 +139,7 @@ impl Buildable for IoUringDriver {
             context.task_budget = this.task_budget;
             context.coop_budget = this.coop_budget;
             context.lifo_slot = this.lifo_slot;
+            context.small_io_max = this.small_io_max;
             Ok(Runtime::new(context, driver))
         })
     }
@@ -365,6 +370,29 @@ impl<D> RuntimeBuilder<D> {
         self.lifo_slot = on;
         self
     }
+
+    /// Priority for tasks woken by small completions (off by default). With `Some(n)`, a task
+    /// woken by a completion (CQE) whose result is below `n` (a byte count under `n`, an fd, 0,
+    /// or an error) goes to a priority queue that runs before the ready queue, instead of to the
+    /// back of the ready queue. Completions of `n` bytes or more (bulk reads and writes) keep
+    /// the FIFO order and mark their task as a bulk task: its next 8 small completion wakes
+    /// also use the queue, so the small steps of a bulk transfer (reading the next request,
+    /// opening or closing a file) between its large chunks don't jump the queue either.
+    /// `Some(0)` is the same as `None`.
+    ///
+    /// Use it with a small [`task_budget`](Self::task_budget) (and
+    /// [`lifo_slot`](Self::lifo_slot)) when small requests share a core with bulk transfers: a
+    /// request with k I/O steps then waits about k rounds of `task_budget` tasks instead of k
+    /// traversals of the whole ready queue. Without a task budget a round already runs the
+    /// whole queue, so this changes little. At most half of a round's budget goes to the
+    /// priority queue while other tasks are ready, so bulk tasks keep running. Waking a task
+    /// from another task, a timer, another thread, or by itself is not affected. A good `n` is
+    /// above the request/response sizes and below the bulk chunk size, e.g. 16 KiB.
+    #[must_use]
+    pub fn small_io_priority(mut self, n: Option<u32>) -> Self {
+        self.small_io_max = n.unwrap_or(0);
+        self
+    }
 }
 
 // ===== enable_timer related =====
@@ -390,6 +418,7 @@ where
             task_budget: this.task_budget,
             coop_budget: this.coop_budget,
             lifo_slot: this.lifo_slot,
+            small_io_max: this.small_io_max,
             iowq_max_workers: this.iowq_max_workers,
             fixed_files: this.fixed_files,
             #[cfg(feature = "sync")]
@@ -423,6 +452,7 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
             task_budget,
             coop_budget,
             lifo_slot,
+            small_io_max,
             iowq_max_workers,
             fixed_files,
             #[cfg(feature = "sync")]
@@ -436,6 +466,7 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
             task_budget,
             coop_budget,
             lifo_slot,
+            small_io_max,
             iowq_max_workers,
             fixed_files,
             #[cfg(feature = "sync")]

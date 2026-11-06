@@ -46,6 +46,8 @@ server
   --coop               RuntimeBuilder::coop_taskrun()
   --coop-budget N      RuntimeBuilder::coop_budget(Some(N)) (per-task coop budget)
   --lifo               RuntimeBuilder::lifo_slot(true)
+  --small-io SZ        RuntimeBuilder::small_io_priority(Some(SZ)) (tasks woken by completions
+                       below SZ bytes run first)
   --skip-empty-enter   RuntimeBuilder::skip_empty_enter() (reap without entering when the SQ is empty)
   --defer              RuntimeBuilder::defer_taskrun()
   --accept single|multi  accept loop: one accept() at a time + spawn (default), or accept_multi
@@ -60,6 +62,14 @@ workload
   --hop                answer rr requests through a worker task leased from a pool (proxy model)
   --pool P             workers in the --hop pool (default 64)
   --hop-nops N         io_uring NOP round trips a worker does per request (default 0)
+  --upstream           proxy model with a real upstream: a share of the rr connections (--proxy-frac)
+                       lease one of --pool upstream connections (strict FIFO waiters, like the SUT's
+                       pool), write --rr-size bytes to an echo server on --upstream-cpu, read them
+                       back, release, answer; the others answer directly (json model). Reports
+                       both classes and the server-side time of each proxy step
+  --proxy-frac F       share of rr connections that are proxy connections (default 0.5)
+  --upstream-cpu C     CPU of the upstream echo thread (default: the first client CPU, removed from
+                       the client set)
   --accept-ramp K      extra rr connections opened during the first --ramp-secs of the window
   --ramp-secs S        ramp length (default 5)
 run
@@ -80,6 +90,7 @@ struct Args {
     defer: bool,
     coop_budget: Option<u32>,
     lifo: bool,
+    small_io: Option<u32>,
     skip_empty_enter: bool,
     accept_multi: bool,
     bulk: usize,
@@ -92,6 +103,9 @@ struct Args {
     hop: bool,
     pool: usize,
     hop_nops: usize,
+    upstream: bool,
+    proxy_frac: f64,
+    upstream_cpu: Option<usize>,
     ramp: usize,
     ramp_secs: f64,
     warmup: f64,
@@ -122,6 +136,7 @@ fn parse_args() -> Result<Args, String> {
         coop: false,
         coop_budget: None,
         lifo: false,
+        small_io: None,
         skip_empty_enter: false,
         defer: false,
         accept_multi: false,
@@ -135,6 +150,9 @@ fn parse_args() -> Result<Args, String> {
         hop: false,
         pool: 64,
         hop_nops: 0,
+        upstream: false,
+        proxy_frac: 0.5,
+        upstream_cpu: None,
         ramp: 0,
         ramp_secs: 5.0,
         warmup: 2.0,
@@ -165,6 +183,7 @@ fn parse_args() -> Result<Args, String> {
             "--coop" => a.coop = true,
             "--coop-budget" => a.coop_budget = Some(num(&flag, val()?)?),
             "--lifo" => a.lifo = true,
+            "--small-io" => a.small_io = Some(parse_size(&val()?)? as u32),
             "--skip-empty-enter" => a.skip_empty_enter = true,
             "--defer" => a.defer = true,
             "--accept" => match val()?.as_str() {
@@ -182,6 +201,9 @@ fn parse_args() -> Result<Args, String> {
             "--hop" => a.hop = true,
             "--pool" => a.pool = num(&flag, val()?)?,
             "--hop-nops" => a.hop_nops = num(&flag, val()?)?,
+            "--upstream" => a.upstream = true,
+            "--proxy-frac" => a.proxy_frac = num(&flag, val()?)?,
+            "--upstream-cpu" => a.upstream_cpu = Some(num(&flag, val()?)?),
             "--accept-ramp" => a.ramp = num(&flag, val()?)?,
             "--ramp-secs" => a.ramp_secs = num(&flag, val()?)?,
             "--warmup" => a.warmup = num(&flag, val()?)?,
@@ -201,6 +223,22 @@ fn parse_args() -> Result<Args, String> {
         a.client_cpus = (0..n).filter(|&c| c != a.cpu).collect();
         if a.client_cpus.is_empty() {
             a.client_cpus.push(a.cpu); // single-CPU machine: share it
+        }
+    }
+    if a.upstream {
+        if a.hop {
+            return Err("--upstream and --hop are exclusive".into());
+        }
+        if !(0.0..=1.0).contains(&a.proxy_frac) {
+            return Err("--proxy-frac must be in 0..=1".into());
+        }
+        let up = match a.upstream_cpu {
+            Some(c) => c,
+            None => a.client_cpus[0],
+        };
+        a.upstream_cpu = Some(up);
+        if a.client_cpus.len() > 1 {
+            a.client_cpus.retain(|&c| c != up);
         }
     }
     Ok(a)
@@ -227,6 +265,9 @@ fn apply_tune(mut b: RuntimeBuilder<IoUringDriver>, a: &Args) -> RuntimeBuilder<
     if a.skip_empty_enter {
         b = b.skip_empty_enter();
     }
+    if a.small_io.is_some() {
+        b = b.small_io_priority(a.small_io);
+    }
     b
 }
 
@@ -249,6 +290,9 @@ fn tune_label(a: &Args) -> String {
     }
     if a.skip_empty_enter {
         v.push("skipenter".into());
+    }
+    if let Some(n) = a.small_io {
+        v.push(format!("smallio{n}"));
     }
     if v.is_empty() {
         "default".into()
@@ -395,6 +439,7 @@ struct ServerResult {
     accepts_peak_1s: u64,
     accept_to_first_read: Hist,
     control_late_ms: f64,
+    steps: Vec<Hist>,
     #[cfg(feature = "metrics")]
     metrics: (String, String),
 }
@@ -409,6 +454,36 @@ struct ServerState {
     bulk_size: usize,
     pool: Option<Pool>,
     hop_nops: usize,
+    /// `--upstream`: the upstream connection pool and its address.
+    up: Option<UpPool>,
+    /// `--upstream`: server-side time of each proxy step in the window, see [`Step`].
+    steps: RefCell<Vec<Hist>>,
+}
+
+/// Server-side steps of a proxy request (`--upstream`), each from the end of the previous one.
+#[derive(Clone, Copy)]
+enum Step {
+    /// Request read → lease granted (idle connection or permission to open one).
+    Lease,
+    /// → request written to the upstream (`write_all` returned).
+    UpWrite,
+    /// → echo read back (`read_exact` returned); lease released right after.
+    UpRead,
+    /// → response written to the client.
+    Reply,
+    /// json requests: request read → response written.
+    JsonReply,
+}
+const STEPS: [&str; 5] = ["lease", "up_write", "up_read", "reply", "json_reply"];
+
+impl ServerState {
+    fn step(&self, s: Step, from: &mut Instant) {
+        let now = Instant::now();
+        if self.window.get().is_some_and(|w| w.contains(now)) {
+            self.steps.borrow_mut()[s as usize].record(now - *from);
+        }
+        *from = now;
+    }
 }
 
 impl ServerState {
@@ -510,6 +585,168 @@ impl Pool {
     }
 }
 
+/// The `--upstream` pool, the same bookkeeping as the benchmark's `common::pool`: at most `cap`
+/// connections; idle ones are reused; when none is idle and `cap` exist, the caller waits in a
+/// strict FIFO; returning a connection wakes the front waiter, which takes it when it runs.
+struct UpPool {
+    addr: SocketAddr,
+    cap: usize,
+    live: Cell<usize>,
+    idle: RefCell<Vec<TcpStream>>,
+    next_id: Cell<u64>,
+    waiters: RefCell<VecDeque<(u64, Waker)>>,
+}
+
+impl UpPool {
+    fn new(addr: SocketAddr, cap: usize) -> Self {
+        UpPool {
+            addr,
+            cap,
+            live: Cell::new(0),
+            idle: RefCell::new(Vec::new()),
+            next_id: Cell::new(0),
+            waiters: RefCell::new(VecDeque::new()),
+        }
+    }
+
+    fn available(&self) -> bool {
+        !self.idle.borrow().is_empty() || self.live.get() < self.cap
+    }
+
+    fn wake_front(&self) {
+        if let Some((_, w)) = self.waiters.borrow().front() {
+            w.wake_by_ref();
+        }
+    }
+
+    /// A connection: `Some` idle one, `None` = open a new one (the slot is counted).
+    async fn acquire(&self) -> Option<TcpStream> {
+        let mut id: Option<u64> = None;
+        poll_fn(|cx| {
+            let my_turn = match (id, self.waiters.borrow().front()) {
+                (None, None) => true,
+                (Some(me), Some((front, _))) => me == *front,
+                _ => false,
+            };
+            if my_turn && self.available() {
+                let c = self.idle.borrow_mut().pop();
+                if c.is_none() {
+                    self.live.set(self.live.get() + 1);
+                }
+                if id.is_some() {
+                    self.waiters.borrow_mut().pop_front();
+                }
+                if self.available() {
+                    self.wake_front();
+                }
+                return Poll::Ready(c);
+            }
+            match id {
+                None => {
+                    let n = self.next_id.get();
+                    self.next_id.set(n + 1);
+                    self.waiters.borrow_mut().push_back((n, cx.waker().clone()));
+                    id = Some(n);
+                }
+                Some(me) => {
+                    if let Some(e) = self.waiters.borrow_mut().iter_mut().find(|(w, _)| *w == me) {
+                        e.1 = cx.waker().clone();
+                    }
+                }
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
+    fn put(&self, c: TcpStream) {
+        self.idle.borrow_mut().push(c);
+        self.wake_front();
+    }
+
+    fn discard(&self) {
+        self.live.set(self.live.get() - 1);
+        self.wake_front();
+    }
+}
+
+/// One proxy request through the upstream pool; `false` on an upstream error.
+async fn proxy_request(st: &ServerState, up: &UpPool, t: &mut Instant) -> bool {
+    let conn = up.acquire().await;
+    st.step(Step::Lease, t);
+    let mut conn = match conn {
+        Some(c) => c,
+        None => match TcpStream::connect(up.addr).await {
+            Ok(c) => {
+                let _ = c.set_nodelay(true);
+                c
+            }
+            Err(_) => {
+                up.discard();
+                return false;
+            }
+        },
+    };
+    let (r, _) = conn.write_all(st.rr_resp.clone()).await;
+    st.step(Step::UpWrite, t);
+    if r.is_err() {
+        up.discard();
+        return false;
+    }
+    let (r, _) = conn.read_exact(Vec::with_capacity(st.rr_resp.len())).await;
+    st.step(Step::UpRead, t);
+    if r.is_err() {
+        up.discard();
+        return false;
+    }
+    up.put(conn);
+    true
+}
+
+/// `--upstream`: the echo server, one task per connection, on its own thread and CPU.
+fn upstream_thread(cpu: usize, size: usize, addr_tx: mpsc::Sender<io::Result<SocketAddr>>) {
+    if let Err(e) = monoio::utils::bind_to_cpu_set([cpu]) {
+        eprintln!("upstream: bind to cpu {cpu} failed: {e:?}");
+    }
+    let mut rt = RuntimeBuilder::<IoUringDriver>::new()
+        .with_entries(1024)
+        .enable_timer()
+        .build()
+        .expect("upstream runtime");
+    rt.block_on(async move {
+        let opts = ListenerOpts::new().backlog(4096);
+        let l = match TcpListener::bind_with_config("127.0.0.1:0", &opts) {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = addr_tx.send(Err(e));
+                return;
+            }
+        };
+        let _ = addr_tx.send(Ok(l.local_addr().unwrap()));
+        loop {
+            let Ok((mut s, _)) = l.accept().await else {
+                continue;
+            };
+            let _ = s.set_nodelay(true);
+            monoio::spawn(async move {
+                let mut buf = Vec::with_capacity(size);
+                loop {
+                    buf.clear();
+                    let (r, b) = s.read_exact(buf).await;
+                    if r.is_err() {
+                        return;
+                    }
+                    let (r, b) = s.write_all(b).await;
+                    buf = b;
+                    if r.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+}
+
 async fn worker_task(slot: Rc<WorkerSlot>, nops: usize) {
     loop {
         poll_fn(|cx| {
@@ -575,6 +812,16 @@ async fn serve_rr(st: Rc<ServerState>, mut s: TcpStream, accepted: Instant) {
                     .record(accepted.elapsed());
             }
         }
+        let mut t = Instant::now();
+        let proxy = match &st.up {
+            Some(up) if buf[0] == b'p' => {
+                if !proxy_request(&st, up, &mut t).await {
+                    return;
+                }
+                true
+            }
+            _ => false,
+        };
         if let Some(pool) = &st.pool {
             let i = pool.lease().await;
             pool.run_job(i).await;
@@ -583,6 +830,9 @@ async fn serve_rr(st: Rc<ServerState>, mut s: TcpStream, accepted: Instant) {
         let (r, _) = s.write_all(st.rr_resp.clone()).await;
         if r.is_err() {
             return;
+        }
+        if st.up.is_some() {
+            st.step(if proxy { Step::Reply } else { Step::JsonReply }, &mut t);
         }
     }
 }
@@ -674,6 +924,7 @@ fn metrics_delta(
         ),
         ("coop_yields", d(ra.coop_yields, rb.coop_yields)),
         ("lifo_polls", d(ra.lifo_polls, rb.lifo_polls)),
+        ("prio_polls", d(ra.prio_polls, rb.prio_polls)),
     ];
     line += "\nruntime delta:";
     json += ",\"runtime\":{";
@@ -705,6 +956,7 @@ fn metrics_delta(
 
 fn server_thread(
     a: Args,
+    up_addr: Option<SocketAddr>,
     addr_tx: mpsc::Sender<io::Result<(SocketAddr, SocketAddr)>>,
     window: SharedWindow,
     res_tx: mpsc::Sender<ServerResult>,
@@ -743,6 +995,8 @@ fn server_thread(
             bulk_size: a.bulk_size,
             pool: a.hop.then(|| Pool::new(a.pool)),
             hop_nops: a.hop_nops,
+            up: up_addr.map(|addr| UpPool::new(addr, a.pool)),
+            steps: RefCell::new(vec![Hist::new(); STEPS.len()]),
         });
         if let Some(pool) = &st.pool {
             for w in &pool.workers {
@@ -781,6 +1035,7 @@ fn server_thread(
                 .unwrap_or(0),
             accept_to_first_read: st.accept_to_first_read.borrow().clone(),
             control_late_ms,
+            steps: st.steps.borrow().clone(),
             #[cfg(feature = "metrics")]
             metrics,
         });
@@ -794,6 +1049,8 @@ fn server_thread(
 #[derive(Default)]
 struct ClientStats {
     rr_hist: RefCell<Option<Hist>>,
+    /// `--upstream`: latency of the proxy connections (`rr_hist` then holds the json ones).
+    px_hist: RefCell<Option<Hist>>,
     rr_sent: Cell<u64>,
     rr_ok: Cell<u64>,
     rr_timeouts: Cell<u64>,
@@ -815,6 +1072,7 @@ fn inc(c: &Cell<u64>, n: u64) {
 
 struct ClientResult {
     rr_hist: Hist,
+    px_hist: Hist,
     rr_sent: u64,
     rr_ok: u64,
     rr_timeouts: u64,
@@ -853,6 +1111,7 @@ impl ClientStats {
         ClientResult {
             rr_backlog,
             rr_hist: self.rr_hist.borrow_mut().take().unwrap(),
+            px_hist: self.px_hist.borrow_mut().take().unwrap(),
             rr_sent: self.rr_sent.get(),
             rr_ok: self.rr_ok.get(),
             rr_timeouts: self.rr_timeouts.get(),
@@ -924,14 +1183,19 @@ async fn one_request(
         Err(_) => {
             // The exchange was dropped midway: the connection state is unknown.
             *stream = None;
-            *bufs = rr_bufs(&cx.a);
+            let proxy = bufs.0.first() == Some(&b'p');
+            *bufs = rr_bufs(&cx.a, proxy);
             Ok(false)
         }
     }
 }
 
-fn rr_bufs(a: &Args) -> (Vec<u8>, Vec<u8>) {
-    (vec![b'q'; 64], Vec::with_capacity(a.rr_size))
+fn rr_bufs(a: &Args, proxy: bool) -> (Vec<u8>, Vec<u8>) {
+    let mut req = vec![b'q'; 64];
+    if proxy {
+        req[0] = b'p';
+    }
+    (req, Vec::with_capacity(a.rr_size))
 }
 
 /// Open-loop rr connection: requests at `sched`, `sched + interval`, ...; latency from the
@@ -941,8 +1205,9 @@ async fn rr_loop(
     mut stream: Option<TcpStream>,
     mut sched: Instant,
     cursor: Rc<Cell<Instant>>,
+    proxy: bool,
 ) {
-    let mut bufs = rr_bufs(&cx.a);
+    let mut bufs = rr_bufs(&cx.a, proxy);
     let st = &cx.st;
     loop {
         cursor.set(sched);
@@ -966,7 +1231,8 @@ async fn rr_loop(
         match one_request(&cx, &mut stream, &mut bufs, sched).await {
             Ok(true) if in_win => {
                 inc(&st.rr_ok, 1);
-                if let Some(h) = st.rr_hist.borrow_mut().as_mut() {
+                let hist = if proxy { &st.px_hist } else { &st.rr_hist };
+                if let Some(h) = hist.borrow_mut().as_mut() {
                     h.record(sched.elapsed());
                 }
             }
@@ -992,7 +1258,7 @@ async fn ramp_conn(cx: Rc<Ctx>, at: Instant) {
     cx.st.cursors.borrow_mut().push(cursor.clone());
     sleep_until(at).await;
     let mut stream = None;
-    let mut bufs = rr_bufs(&cx.a);
+    let mut bufs = rr_bufs(&cx.a, false);
     match one_request(&cx, &mut stream, &mut bufs, at).await {
         Ok(true) => {
             inc(&cx.st.ramp_ok, 1);
@@ -1004,7 +1270,7 @@ async fn ramp_conn(cx: Rc<Ctx>, at: Instant) {
         Err(_) => inc(&cx.st.ramp_errors, 1),
     }
     if rr {
-        rr_loop(cx.clone(), stream, at + cx.interval, cursor).await;
+        rr_loop(cx.clone(), stream, at + cx.interval, cursor, false).await;
     }
 }
 
@@ -1113,6 +1379,7 @@ fn client_thread(
             interval,
             st: ClientStats {
                 rr_hist: RefCell::new(Some(Hist::new())),
+                px_hist: RefCell::new(Some(Hist::new())),
                 ramp_hist: RefCell::new(Some(Hist::new())),
                 ..Default::default()
             },
@@ -1126,7 +1393,9 @@ fn client_thread(
                 let at = w.load + phase;
                 let cursor = Rc::new(Cell::new(at));
                 cx.st.cursors.borrow_mut().push(cursor.clone());
-                monoio::spawn(rr_loop(cx.clone(), Some(s), at, cursor));
+                // `--upstream`: proxy connections spread evenly over the indices.
+                let proxy = a.upstream && is_proxy(idx, a.proxy_frac);
+                monoio::spawn(rr_loop(cx.clone(), Some(s), at, cursor, proxy));
             }
         }
         for &i in &plan.ramp {
@@ -1138,6 +1407,11 @@ fn client_thread(
         let _ = res_tx.send(cx.st.take(&cx.w, cx.interval));
         std::future::pending::<()>().await;
     });
+}
+
+/// Whether rr connection `idx` is a proxy connection, for a share `frac` spread evenly.
+fn is_proxy(idx: usize, frac: f64) -> bool {
+    ((idx + 1) as f64 * frac).floor() > (idx as f64 * frac).floor()
 }
 
 // ===== main =====
@@ -1163,6 +1437,21 @@ fn main() {
         std::process::exit(1);
     }
 
+    let up_addr = a.upstream_cpu.filter(|_| a.upstream).map(|cpu| {
+        let (tx, rx) = mpsc::channel();
+        let size = a.rr_size;
+        std::thread::Builder::new()
+            .name("fairness-upstream".into())
+            .spawn(move || upstream_thread(cpu, size, tx))
+            .unwrap();
+        match rx.recv() {
+            Ok(Ok(addr)) => addr,
+            _ => {
+                eprintln!("upstream failed to start");
+                std::process::exit(1);
+            }
+        }
+    });
     let window: SharedWindow = Arc::new(OnceLock::new());
     let (addr_tx, addr_rx) = mpsc::channel();
     let (srv_tx, srv_rx) = mpsc::channel();
@@ -1170,7 +1459,7 @@ fn main() {
         let (a, window) = (a.clone(), window.clone());
         std::thread::Builder::new()
             .name("fairness-server".into())
-            .spawn(move || server_thread(a, addr_tx, window, srv_tx))
+            .spawn(move || server_thread(a, up_addr, addr_tx, window, srv_tx))
             .unwrap();
     }
     let addrs = match addr_rx.recv() {
@@ -1253,6 +1542,7 @@ fn main() {
 
 fn report(a: &Args, clients: &[ClientResult], nthreads: usize, server: Option<&ServerResult>) {
     let mut rr = Hist::new();
+    let mut px = Hist::new();
     let mut ramp = Hist::new();
     let (mut sent, mut ok, mut to, mut err) = (0, 0, 0, 0);
     let (mut bytes, mut resps, mut berr) = (0, 0, 0);
@@ -1260,6 +1550,7 @@ fn report(a: &Args, clients: &[ClientResult], nthreads: usize, server: Option<&S
     for c in clients {
         backlog += c.rr_backlog;
         rr.merge(&c.rr_hist);
+        px.merge(&c.px_hist);
         ramp.merge(&c.ramp_hist);
         sent += c.rr_sent;
         ok += c.rr_ok;
@@ -1331,6 +1622,32 @@ fn report(a: &Args, clients: &[ClientResult], nthreads: usize, server: Option<&S
             String::new()
         },
     );
+    let mut steps_json = String::new();
+    if a.upstream {
+        let mut line = format!(
+            "upstream: json n={} p50={:.2} p99={:.2} | proxy n={} p50={:.2} p99={:.2} p99.9={:.2} max={:.2} ms | \
+             server steps p50/p99 ms:",
+            rr.total,
+            rr.q_ms(0.5),
+            rr.q_ms(0.99),
+            px.total,
+            px.q_ms(0.5),
+            px.q_ms(0.99),
+            px.q_ms(0.999),
+            px.max_ms()
+        );
+        if let Some(s) = server {
+            for (name, h) in STEPS.iter().zip(&s.steps) {
+                line += &format!(" {name}={:.2}/{:.2}", h.q_ms(0.5), h.q_ms(0.99));
+                steps_json += &format!(
+                    ",\"step_{name}_p50_ms\":{:.3},\"step_{name}_p99_ms\":{:.3}",
+                    h.q_ms(0.5),
+                    h.q_ms(0.99)
+                );
+            }
+        }
+        println!("{line}");
+    }
     #[cfg(feature = "metrics")]
     if let Some(s) = server {
         println!("{}", s.metrics.0);
@@ -1351,7 +1668,15 @@ fn report(a: &Args, clients: &[ClientResult], nthreads: usize, server: Option<&S
              \"ramp_errors\":{ramp_err},\"ramp_pending\":{ramp_pending},\"accepts_per_s\":{aps:.2},\
              \"accepts_peak_1s\":{acc_peak},\"accept_to_first_read_p50_ms\":{a2r50:.3},\
              \"accept_to_first_read_p99_ms\":{a2r99:.3},\"accept_to_first_read_max_ms\":{a2rmax:.3},\
-             \"control_late_ms\":{late:.2},\"clients_missing\":{missing}",
+             \"control_late_ms\":{late:.2},\"clients_missing\":{missing},\
+             \"upstream\":{upstream},\"proxy_frac\":{pfrac},\"json_p50_ms\":{p50:.3},\"json_p99_ms\":{p99:.3},\
+             \"proxy_n\":{pxn},\"proxy_p50_ms\":{px50:.3},\"proxy_p99_ms\":{px99:.3},\"proxy_p999_ms\":{px999:.3}{steps_json}",
+            upstream = a.upstream,
+            pfrac = a.proxy_frac,
+            pxn = px.total,
+            px50 = px.q_ms(0.5),
+            px99 = px.q_ms(0.99),
+            px999 = px.q_ms(0.999),
             tune = tune_label(a),
             acc_mode = if a.accept_multi { "multi" } else { "single" },
             hop = a.hop,

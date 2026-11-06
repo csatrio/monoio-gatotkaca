@@ -83,6 +83,10 @@ cargo run --release -p adaptif-gatotkaca-monoio --example fairness --features me
 | `--hop` | off | answer via a leased worker task (proxy model) |
 | `--pool P` | 64 | worker slots in the `--hop` pool |
 | `--hop-nops N` | 0 | NOP round trips per worker job (extra CQE hops) |
+| `--upstream` | off | proxy model with a real upstream echo thread (W2-m3): `--proxy-frac` of the rr connections lease one of `--pool` upstream connections (strict FIFO waiters, like `common::pool`), write/read `--rr-size` bytes upstream, release, reply. Reports json and proxy latency separately plus server-side step times (`lease`, `up_write`, `up_read`, `reply`, `json_reply`) |
+| `--proxy-frac F` | 0.5 | share of rr connections that are proxy connections (`--upstream`) |
+| `--upstream-cpu C` | first client CPU | upstream echo CPU (removed from the client set) |
+| `--small-io SZ` | off | `small_io_priority(Some(SZ))` (W2-m3) |
 | `--accept-ramp K` | 0 | extra rr connections opened during the ramp |
 | `--ramp-secs S` | 5 | ramp length, from the window start |
 | `--warmup S` | 2 | seconds before the window |

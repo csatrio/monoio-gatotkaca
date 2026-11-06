@@ -43,6 +43,9 @@ pub(crate) struct Header {
     pub(crate) vtable: &'static Vtable,
     /// Thread ID(sync: used for wake task on its thread; sync disabled: do checking)
     pub(crate) owner_id: usize,
+    /// `small_io_priority`: small completions still needed before this task's completion
+    /// wakes count as priority wakes again (0: they do). Only touched on the owner thread.
+    pub(crate) bulk: std::cell::Cell<u8>,
 }
 
 pub(crate) struct Trailer {
@@ -59,6 +62,7 @@ impl<T: Future, S: Schedule> Cell<T, S> {
                 state: State::new(),
                 vtable: raw::vtable::<T, S>(),
                 owner_id,
+                bulk: std::cell::Cell::new(0),
             },
             core: Core {
                 scheduler,
