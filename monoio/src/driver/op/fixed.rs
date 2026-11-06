@@ -27,12 +27,40 @@ use crate::{
 /// The offset for "no offset / current position" (sockets, pipes).
 pub(crate) const NO_OFFSET: u64 = -1i64 as u64;
 
-pub(crate) struct ReadFixed {
+/// The file and offset of a fixed-buffer op. These ops serve both files (an offset) and
+/// sockets ([`NO_OFFSET`]): without an offset the op counts as a send (`TX`) or receive in
+/// flight on the socket, like [`InFlight`](crate::driver::shared_fd::InFlight) (see there for
+/// why the count is never early); with one (a file, which has no `try_send`) nothing is
+/// counted. The offset tells the two apart, so the op data needs no extra field.
+struct Target<const TX: bool> {
     /// Holds a strong ref to the FD, preventing the file from being closed while the operation
     /// is in-flight.
     fd: SharedFd,
-    pub(crate) buf: FixedBuf,
     offset: u64,
+}
+
+impl<const TX: bool> Target<TX> {
+    #[inline]
+    fn new(fd: SharedFd, offset: u64) -> Self {
+        if offset == NO_OFFSET {
+            fd.begin_op::<TX>();
+        }
+        Self { fd, offset }
+    }
+}
+
+impl<const TX: bool> Drop for Target<TX> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.offset == NO_OFFSET {
+            self.fd.end_op::<TX>();
+        }
+    }
+}
+
+pub(crate) struct ReadFixed {
+    at: Target<false>,
+    pub(crate) buf: FixedBuf,
     fixed: bool,
 }
 
@@ -44,9 +72,8 @@ impl Op<ReadFixed> {
     ) -> SubmitResult<Self, FixedBuf> {
         let fixed = on_current_ring(&buf);
         Op::submit_or_return(ReadFixed {
-            fd,
+            at: Target::new(fd, offset),
             buf,
-            offset,
             fixed,
         })
         .map_err(|(e, d)| (e, d.buf))
@@ -57,12 +84,13 @@ impl OpAble for ReadFixed {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
         let ptr = self.buf.write_ptr();
         let len = self.buf.bytes_total() as u32;
-        sqe_fd!(self.fd, |fd| if self.fixed {
+        let offset = self.at.offset;
+        sqe_fd!(self.at.fd, |fd| if self.fixed {
             opcode::ReadFixed::new(fd, ptr, len, self.buf.buf_index())
-                .offset(self.offset)
+                .offset(offset)
                 .build()
         } else {
-            opcode::Read::new(fd, ptr, len).offset(self.offset).build()
+            opcode::Read::new(fd, ptr, len).offset(offset).build()
         })
     }
 }
@@ -82,11 +110,8 @@ impl BufOp for ReadFixed {
 }
 
 pub(crate) struct WriteFixed<B> {
-    /// Holds a strong ref to the FD, preventing the file from being closed while the operation
-    /// is in-flight.
-    fd: SharedFd,
+    at: Target<true>,
     pub(crate) buf: B,
-    offset: u64,
     fixed: bool,
 }
 
@@ -94,9 +119,8 @@ impl<B: FixedIoBuf> Op<WriteFixed<B>> {
     pub(crate) fn write_fixed(fd: SharedFd, buf: B, offset: u64) -> SubmitResult<Self, B> {
         let fixed = on_current_ring(&buf);
         Op::submit_or_return(WriteFixed {
-            fd,
+            at: Target::new(fd, offset),
             buf,
-            offset,
             fixed,
         })
         .map_err(|(e, d)| (e, d.buf))
@@ -107,12 +131,13 @@ impl<B: FixedIoBuf> OpAble for WriteFixed<B> {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
         let ptr = self.buf.read_ptr();
         let len = self.buf.bytes_init() as u32;
-        sqe_fd!(self.fd, |fd| if self.fixed {
+        let offset = self.at.offset;
+        sqe_fd!(self.at.fd, |fd| if self.fixed {
             opcode::WriteFixed::new(fd, ptr, len, self.buf.buf_index())
-                .offset(self.offset)
+                .offset(offset)
                 .build()
         } else {
-            opcode::Write::new(fd, ptr, len).offset(self.offset).build()
+            opcode::Write::new(fd, ptr, len).offset(offset).build()
         })
     }
 }
@@ -286,9 +311,8 @@ mod tests {
             let fixed = on_current_ring(&buf);
             assert_eq!(fixed, want_fixed);
             let write = WriteFixed {
-                fd: fd(),
+                at: Target::new(fd(), 0),
                 buf: buf.freeze(),
-                offset: 0,
                 fixed,
             };
             let code = opcode_of(write);
@@ -299,9 +323,8 @@ mod tests {
             };
             assert_eq!(code, want);
             let read = ReadFixed {
-                fd: fd(),
+                at: Target::new(fd(), 0),
                 buf: pool.get().unwrap(),
-                offset: 0,
                 fixed,
             };
             let want = if want_fixed {
@@ -315,5 +338,28 @@ mod tests {
         let mut rt_b = RuntimeBuilder::<IoUringDriver>::new().build().unwrap();
         rt_b.block_on(async { check(false) });
         check(false);
+    }
+
+    /// Only the ops without an offset (sockets) count as in flight; a file op counts nothing.
+    #[test]
+    fn only_ops_without_offset_count() {
+        let devnull = std::fs::File::open("/dev/null").unwrap();
+        let fd = SharedFd::new_without_register(devnull.into_raw_fd());
+        assert!(fd.can_send_now() && fd.can_recv_now());
+
+        let file_write = Target::<true>::new(fd.clone(), 0);
+        let file_read = Target::<false>::new(fd.clone(), 4096);
+        assert!(fd.can_send_now() && fd.can_recv_now());
+        drop((file_write, file_read));
+        assert!(fd.can_send_now() && fd.can_recv_now());
+
+        let sock_write = Target::<true>::new(fd.clone(), NO_OFFSET);
+        assert!(!fd.can_send_now() && fd.can_recv_now());
+        let sock_read = Target::<false>::new(fd.clone(), NO_OFFSET);
+        assert!(!fd.can_send_now() && !fd.can_recv_now());
+        drop(sock_write);
+        assert!(fd.can_send_now() && !fd.can_recv_now());
+        drop(sock_read);
+        assert!(fd.can_send_now() && fd.can_recv_now());
     }
 }

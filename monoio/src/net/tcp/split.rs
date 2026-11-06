@@ -75,6 +75,14 @@ impl TcpOwnedReadHalf {
     pub fn readv_op<T: IoVecBufMut>(&self, buf_vec: T) -> ReadvFuture<T> {
         unsafe { &*self.0.get() }.readv_op(buf_vec)
     }
+
+    /// See [`TcpStream::try_recv`]: one non-blocking `recv(2)`; `WouldBlock` also while a ring
+    /// receive of the stream is in flight.
+    #[inline]
+    pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        // Safety: halves of one stream share a thread; the call only reads the fd handle.
+        unsafe { &*self.0.get() }.try_recv(buf)
+    }
 }
 
 impl AsReadFd for TcpOwnedReadHalf {
@@ -142,6 +150,45 @@ impl TcpOwnedWriteHalf {
     #[inline]
     pub fn writev_op<T: IoVecBuf>(&self, buf_vec: T) -> WritevFuture<T> {
         unsafe { &*self.0.get() }.writev_op(buf_vec)
+    }
+
+    /// See [`TcpStream::try_send`]: one non-blocking `send(2)`; `WouldBlock` also while a ring
+    /// send of the stream is in flight.
+    #[inline]
+    pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
+        // Safety: halves of one stream share a thread; the call only reads the fd handle.
+        unsafe { &*self.0.get() }.try_send(buf)
+    }
+
+    /// See [`TcpStream::try_send_vectored`].
+    #[inline]
+    pub fn try_send_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        unsafe { &*self.0.get() }.try_send_vectored(bufs)
+    }
+
+    /// See [`TcpStream::send_eager`]. The future does not borrow the half.
+    #[inline]
+    pub fn send_eager<T: IoBuf>(&self, buf: T) -> SendFuture<T> {
+        unsafe { &*self.0.get() }.send_eager(buf)
+    }
+
+    /// See [`TcpStream::send_eager_with_flags`].
+    #[inline]
+    pub fn send_eager_with_flags<T: IoBuf>(&self, buf: T, flags: MsgFlags) -> SendFuture<T> {
+        unsafe { &*self.0.get() }.send_eager_with_flags(buf, flags)
+    }
+
+    /// See [`TcpStream::set_eager_send`]. The switch belongs to the socket: `write` and
+    /// `write_all` of this half follow it.
+    #[inline]
+    pub fn set_eager_send(&self, on: bool) {
+        unsafe { &*self.0.get() }.set_eager_send(on)
+    }
+
+    /// See [`TcpStream::eager_send`].
+    #[inline]
+    pub fn eager_send(&self) -> bool {
+        unsafe { &*self.0.get() }.eager_send()
     }
 }
 

@@ -3,10 +3,14 @@ use io_uring::opcode;
 use super::{super::shared_fd::SharedFd, submit::SubmitResult, Completion, Op, OpAble};
 use crate::{
     buf::{IoBufMut, IoVecBufMut},
-    driver::shared_fd::sqe_fd,
+    driver::shared_fd::{sqe_fd, RxFd},
     io::futures::BufOp,
     BufResult,
 };
+
+// Which of these count as a receive in flight (`RxFd`, see `InFlight` in `shared_fd.rs`):
+// `Read` and `ReadVec`, the reads without an offset, which is what sockets and pipes use.
+// `ReadAt` is the files' op and stays as it was: files have no `try_recv`.
 
 macro_rules! read_result {
     ($($name:ident<$T:ident : $Trait:ident> { $buf:ident }),* $(,)?) => {
@@ -48,15 +52,19 @@ read_result! {
 
 pub(crate) struct Read<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed
-    /// while the operation is in-flight.
-    fd: SharedFd,
+    /// while the operation is in-flight. Counts as a receive in flight.
+    fd: RxFd,
     /// Reference to the in-flight buffer.
     pub(crate) buf: T,
 }
 
 impl<T: IoBufMut> Op<Read<T>> {
     pub(crate) fn read(fd: SharedFd, buf: T) -> SubmitResult<Op<Read<T>>, T> {
-        Op::submit_or_return(Read { fd, buf }).map_err(|(e, d)| (e, d.buf))
+        Op::submit_or_return(Read {
+            fd: RxFd::new(fd),
+            buf,
+        })
+        .map_err(|(e, d)| (e, d.buf))
     }
 }
 
@@ -104,15 +112,19 @@ impl<T: IoBufMut> OpAble for ReadAt<T> {
 
 pub(crate) struct ReadVec<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed
-    /// while the operation is in-flight.
-    fd: SharedFd,
+    /// while the operation is in-flight. Counts as a receive in flight.
+    fd: RxFd,
     /// Reference to the in-flight buffer.
     pub(crate) buf_vec: T,
 }
 
 impl<T: IoVecBufMut> Op<ReadVec<T>> {
     pub(crate) fn readv(fd: SharedFd, buf_vec: T) -> SubmitResult<Self, T> {
-        Op::submit_or_return(ReadVec { fd, buf_vec }).map_err(|(e, d)| (e, d.buf_vec))
+        Op::submit_or_return(ReadVec {
+            fd: RxFd::new(fd),
+            buf_vec,
+        })
+        .map_err(|(e, d)| (e, d.buf_vec))
     }
 }
 

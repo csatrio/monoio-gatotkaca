@@ -13,15 +13,15 @@ use {
 use super::{super::shared_fd::SharedFd, submit::SubmitResult, Completion, Op, OpAble};
 use crate::{
     buf::{IoBufMut, IoVecBufMut, IoVecMeta, MsgMeta},
-    driver::shared_fd::sqe_fd,
+    driver::shared_fd::{sqe_fd, RxFd},
     io::futures::BufOp,
     BufResult,
 };
 
 pub(crate) struct Recv<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed
-    /// while the operation is in-flight.
-    fd: SharedFd,
+    /// while the operation is in-flight. Counts as a receive in flight on the socket.
+    fd: RxFd,
 
     /// Reference to the in-flight buffer.
     pub(crate) buf: T,
@@ -50,7 +50,7 @@ impl<T: IoBufMut> Op<Recv<T>> {
     ) -> SubmitResult<Self, T> {
         let ioprio = if poll_first { RECVSEND_POLL_FIRST } else { 0 };
         Op::submit_or_return(Recv {
-            fd,
+            fd: RxFd::new(fd),
             buf,
             flags,
             ioprio,
@@ -93,6 +93,10 @@ impl<T: IoBufMut> OpAble for Recv<T> {
     }
 }
 
+/// `recvmsg` with the sender's address, for UDP sockets.
+///
+/// Not counted as a receive in flight (`RxFd`), and neither is [`RecvMsgUnix`]: only datagram
+/// and seqpacket sockets use them, and those have no `try_recv`.
 pub(crate) struct RecvMsg<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed
     /// while the operation is in-flight.
@@ -230,5 +234,22 @@ impl<T: IoBufMut> OpAble for RecvMsgUnix<T> {
             &mut self.info.2 as *mut _
         )
         .build())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::size_of;
+
+    use super::*;
+
+    /// The in-flight guard is free: a dropped in-flight receive still fits the inline storage
+    /// of the op slot (48 bytes; `Recv<Vec<u8>>` also fits 40).
+    #[test]
+    fn recv_data_did_not_grow() {
+        assert_eq!(size_of::<RxFd>(), size_of::<SharedFd>());
+        assert_eq!(size_of::<Recv<Vec<u8>>>(), 40);
+        #[cfg(feature = "bytes")]
+        assert_eq!(size_of::<Recv<bytes::BytesMut>>(), 48);
     }
 }

@@ -3,10 +3,14 @@ use io_uring::opcode;
 use super::{super::shared_fd::SharedFd, submit::SubmitResult, Completion, Op, OpAble};
 use crate::{
     buf::{IoBuf, IoVecBuf},
-    driver::shared_fd::sqe_fd,
-    io::futures::BufOp,
+    driver::shared_fd::{sqe_fd, TxFd},
+    io::futures::{BufOp, WritevFuture},
     BufResult,
 };
+
+// Which of these count as a send in flight (`TxFd`, see `InFlight` in `shared_fd.rs`): `Write`
+// and `WriteVec`, the writes without an offset, which is what the socket streams use.
+// `WriteAt` is the files' op and stays as it was: files have no `try_send`.
 
 macro_rules! write_result {
     ($($name:ident<$T:ident : $Trait:ident> { $buf:ident }), * $(,)?) => {
@@ -37,13 +41,18 @@ write_result! {
 }
 
 pub(crate) struct Write<T> {
-    fd: SharedFd,
+    /// Counts as a send in flight.
+    fd: TxFd,
     pub(crate) buf: T,
 }
 
 impl<T: IoBuf> Op<Write<T>> {
     pub(crate) fn write(fd: SharedFd, buf: T) -> SubmitResult<Self, T> {
-        Op::submit_or_return(Write { fd, buf }).map_err(|(e, d)| (e, d.buf))
+        Op::submit_or_return(Write {
+            fd: TxFd::new(fd),
+            buf,
+        })
+        .map_err(|(e, d)| (e, d.buf))
     }
 }
 
@@ -95,15 +104,47 @@ impl<T: IoBuf> OpAble for WriteAt<T> {
 
 pub(crate) struct WriteVec<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed
-    /// while the operation is in-flight.
-    fd: SharedFd,
+    /// while the operation is in-flight. Counts as a send in flight.
+    fd: TxFd,
     pub(crate) buf_vec: T,
 }
 
 impl<T: IoVecBuf> Op<WriteVec<T>> {
     pub(crate) fn writev(fd: SharedFd, buf_vec: T) -> SubmitResult<Self, T> {
-        Op::submit_or_return(WriteVec { fd, buf_vec }).map_err(|(e, d)| (e, d.buf_vec))
+        Op::submit_or_return(WriteVec {
+            fd: TxFd::new(fd),
+            buf_vec,
+        })
+        .map_err(|(e, d)| (e, d.buf_vec))
     }
+}
+
+/// `writev` of a stream socket with `set_eager_send(true)`: one direct, non-blocking
+/// `sendmsg(2)` (`MSG_NOSIGNAL`) from the calling thread first.
+///
+/// - It took something (all, or a part): a [`WritevFuture`] that is resolved already, with
+///   that count. A part is a short write, which every `writev` caller has to handle anyway, so
+///   no offset into the iovecs is needed.
+/// - The socket buffer is full, a ring send is in flight on the socket (ordering) or the
+///   socket has no fd: the ring `WRITEV`, as without the switch.
+/// - A real error: a resolved future with it.
+///
+/// Never inlined, like `send_eager`: `writev` callers that never turn the switch on must not
+/// grow.
+#[inline(never)]
+pub(crate) fn writev_eager<T: IoVecBuf>(fd: &SharedFd, buf_vec: T) -> WritevFuture<T> {
+    if fd.can_send_now() {
+        // SAFETY: `IoVecBuf`: the pointer is valid for that many iovecs, and their memory is
+        // readable, while `buf_vec` lives.
+        let res =
+            unsafe { fd.send_vectored_now(buf_vec.read_iovec_ptr(), buf_vec.read_iovec_len()) };
+        match res {
+            Ok(n) => return WritevFuture::ready(Ok(n), buf_vec),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return WritevFuture::ready(Err(e), buf_vec),
+        }
+    }
+    WritevFuture::new(Op::writev(fd.clone(), buf_vec))
 }
 
 impl<T: IoVecBuf> OpAble for WriteVec<T> {
