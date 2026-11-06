@@ -94,5 +94,10 @@ tls-native-alpn = ["tls-native", "native-tls/alpn"]
 tls-native-vendored = ["tls-native", "native-tls/vendored"]
 default = ["async-cancel", "bytes", "macros", "utils"]
 
+# load reproducer for round 2 (docs/performance-improvement/round2/W0-repro.md)
+[[example]]
+name = "fairness"
+required-features = ["bytes", "utils"]
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
