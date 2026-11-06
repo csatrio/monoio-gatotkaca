@@ -44,6 +44,9 @@ server
   --entries N          io_uring entries of the server ring (default 4096)
   --budget N           RuntimeBuilder::task_budget(N)
   --coop               RuntimeBuilder::coop_taskrun()
+  --coop-budget N      RuntimeBuilder::coop_budget(Some(N)) (per-task coop budget)
+  --lifo               RuntimeBuilder::lifo_slot(true)
+  --skip-empty-enter   RuntimeBuilder::skip_empty_enter() (reap without entering when the SQ is empty)
   --defer              RuntimeBuilder::defer_taskrun()
   --accept single|multi  accept loop: one accept() at a time + spawn (default), or accept_multi
 workload
@@ -75,8 +78,9 @@ struct Args {
     budget: Option<usize>,
     coop: bool,
     defer: bool,
-    // TODO(W1-sched): `--coop-budget N`, `--lifo` land here (and in `apply_tune`).
-    // TODO(W2): `--reap-without-enter` lands here (and in `apply_tune`).
+    coop_budget: Option<u32>,
+    lifo: bool,
+    skip_empty_enter: bool,
     accept_multi: bool,
     bulk: usize,
     bulk_size: usize,
@@ -116,6 +120,9 @@ fn parse_args() -> Result<Args, String> {
         entries: 4096,
         budget: None,
         coop: false,
+        coop_budget: None,
+        lifo: false,
+        skip_empty_enter: false,
         defer: false,
         accept_multi: false,
         bulk: 0,
@@ -156,6 +163,9 @@ fn parse_args() -> Result<Args, String> {
             "--entries" => a.entries = num(&flag, val()?)?,
             "--budget" => a.budget = Some(num(&flag, val()?)?),
             "--coop" => a.coop = true,
+            "--coop-budget" => a.coop_budget = Some(num(&flag, val()?)?),
+            "--lifo" => a.lifo = true,
+            "--skip-empty-enter" => a.skip_empty_enter = true,
             "--defer" => a.defer = true,
             "--accept" => match val()?.as_str() {
                 "single" => a.accept_multi = false,
@@ -196,9 +206,7 @@ fn parse_args() -> Result<Args, String> {
     Ok(a)
 }
 
-/// Builder tuning of the measured (server) runtime. Later packages add their options here:
-/// - TODO(W1-sched): `--coop-budget N` -> `b.coop_budget(Some(n))`, `--lifo` -> `b.lifo_slot(true)`;
-/// - TODO(W2): `--reap-without-enter` -> the builder method W2 adds.
+/// Builder tuning of the measured (server) runtime.
 fn apply_tune(mut b: RuntimeBuilder<IoUringDriver>, a: &Args) -> RuntimeBuilder<IoUringDriver> {
     b = b.with_entries(a.entries);
     if let Some(n) = a.budget {
@@ -209,6 +217,15 @@ fn apply_tune(mut b: RuntimeBuilder<IoUringDriver>, a: &Args) -> RuntimeBuilder<
     }
     if a.defer {
         b = b.defer_taskrun();
+    }
+    if a.coop_budget.is_some() {
+        b = b.coop_budget(a.coop_budget);
+    }
+    if a.lifo {
+        b = b.lifo_slot(true);
+    }
+    if a.skip_empty_enter {
+        b = b.skip_empty_enter();
     }
     b
 }
@@ -223,6 +240,15 @@ fn tune_label(a: &Args) -> String {
     }
     if a.defer {
         v.push("defer".into());
+    }
+    if let Some(n) = a.coop_budget {
+        v.push(format!("coopbudget{n}"));
+    }
+    if a.lifo {
+        v.push("lifo".into());
+    }
+    if a.skip_empty_enter {
+        v.push("skipenter".into());
     }
     if v.is_empty() {
         "default".into()

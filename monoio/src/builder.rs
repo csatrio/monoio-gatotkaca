@@ -22,6 +22,12 @@ pub struct RuntimeBuilder<D> {
     // tasks run per round, see `task_budget`
     task_budget: Option<usize>,
 
+    // per-poll coop budget, see `coop_budget`
+    coop_budget: Option<u32>,
+
+    // LIFO slot for hand-over wakes, see `lifo_slot`
+    lifo_slot: bool,
+
     // [bounded, unbounded] io-wq worker caps, see `iowq_max_workers`
     iowq_max_workers: Option<[u32; 2]>,
 
@@ -68,6 +74,8 @@ impl<T> RuntimeBuilder<T> {
             urb: io_uring::IoUring::builder(),
             opts: DriverOptions::default(),
             task_budget: None,
+            coop_budget: None,
+            lifo_slot: false,
             iowq_max_workers: None,
             fixed_files: [0, 0],
 
@@ -125,6 +133,8 @@ impl Buildable for IoUringDriver {
             #[cfg(not(feature = "sync"))]
             let mut context = crate::runtime::Context::new();
             context.task_budget = this.task_budget;
+            context.coop_budget = this.coop_budget;
+            context.lifo_slot = this.lifo_slot;
             Ok(Runtime::new(context, driver))
         })
     }
@@ -319,6 +329,42 @@ impl<D> RuntimeBuilder<D> {
         self.task_budget = Some(n);
         self
     }
+
+    /// Cooperative budget per task poll (off by default). With `Some(n)`, a task may take `n`
+    /// ready results from I/O futures (op futures, `uring::MultiOp::next`, `uring::submit_chain`)
+    /// and [`task::consume_budget`](crate::task::consume_budget) calls per poll; the next one
+    /// wakes the task and returns `Pending`, so it goes to the back of the ready queue (the
+    /// result stays queued, nothing is lost). `Some(0)` is treated as `Some(1)`.
+    ///
+    /// An op future is always `Pending` on its first poll, so this only limits tasks that keep
+    /// finding results already queued: multishot `MultiOp`s, chains, CPU loops with
+    /// `consume_budget`. The typed multishot streams (`AcceptStream`, `RecvStream`) are not
+    /// budgeted. Exempt a future with [`task::unconstrained`](crate::task::unconstrained).
+    /// Without `sync`, the main future of `block_on` is polled again right away when it yields,
+    /// so the budget does not help there.
+    #[must_use]
+    pub fn coop_budget(mut self, n: Option<u32>) -> Self {
+        self.coop_budget = n.map(|n| n.clamp(1, crate::task::coop::UNCONSTRAINED - 1));
+        self
+    }
+
+    /// LIFO slot (off by default, tokio's design). A task woken by the task that is running
+    /// (a waker hand-over: a channel send, a pool lease, a join) is polled right after it,
+    /// instead of at the back of the ready queue. If another task is woken the same way before
+    /// that, the earlier one goes to the back of the queue. After 3 consecutive slot polls the
+    /// next slot task goes to the back of the queue. Slot polls count against
+    /// [`task_budget`](Self::task_budget).
+    ///
+    /// Completions (CQEs), wakes from other threads or from outside a task, and a task waking
+    /// itself ([`task::yield_now`](crate::task::yield_now), coop yields) always use the queue.
+    ///
+    /// With a small `task_budget(n)` this keeps hand-over chains from waiting a full queue
+    /// traversal per hop.
+    #[must_use]
+    pub fn lifo_slot(mut self, on: bool) -> Self {
+        self.lifo_slot = on;
+        self
+    }
 }
 
 // ===== enable_timer related =====
@@ -342,6 +388,8 @@ where
             urb: this.urb,
             opts: this.opts,
             task_budget: this.task_budget,
+            coop_budget: this.coop_budget,
+            lifo_slot: this.lifo_slot,
             iowq_max_workers: this.iowq_max_workers,
             fixed_files: this.fixed_files,
             #[cfg(feature = "sync")]
@@ -373,6 +421,8 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
             urb,
             opts,
             task_budget,
+            coop_budget,
+            lifo_slot,
             iowq_max_workers,
             fixed_files,
             #[cfg(feature = "sync")]
@@ -384,6 +434,8 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
             urb,
             opts,
             task_budget,
+            coop_budget,
+            lifo_slot,
             iowq_max_workers,
             fixed_files,
             #[cfg(feature = "sync")]

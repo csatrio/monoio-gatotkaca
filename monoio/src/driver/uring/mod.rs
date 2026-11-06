@@ -618,6 +618,15 @@ impl Driver for IoUringDriver {
         inner.tick()?;
         drop_deferred(&self.inner);
         super::raw::deliver(&self.inner);
+        // Foreign wakers: a ready queue that never empties never parks, so drain them here too.
+        #[cfg(feature = "sync")]
+        {
+            let inner = unsafe { &mut *self.inner.get() };
+            while let Some(w) = inner.waker_consumer.pop(&inner.waker_queue) {
+                w.wake();
+                metric!(crate::runtime_stats::note_remote_wakes(1));
+            }
+        }
         Ok(())
     }
 

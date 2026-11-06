@@ -262,13 +262,19 @@ pub struct MultiOp<T: Unpin + 'static>(MultishotOp<RawMultiSqe<T>>);
 
 impl<T: Unpin + 'static> MultiOp<T> {
     /// Poll for the next completion. `Ready(None)` once the final one was returned.
+    ///
+    /// With [`coop_budget`](crate::RuntimeBuilder::coop_budget), each CQE taken spends one unit
+    /// of the task's budget; once it is spent this yields (the CQE stays queued).
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Cqe>> {
-        self.0.poll_next(cx)
+        let budget = ready!(crate::task::coop::poll_proceed(cx));
+        let next = ready!(self.0.poll_next(cx));
+        crate::task::coop::consume(budget);
+        Poll::Ready(next)
     }
 
     /// The next completion, or `None` once the final one was returned.
     pub async fn next(&mut self) -> Option<Cqe> {
-        std::future::poll_fn(|cx| self.0.poll_next(cx)).await
+        std::future::poll_fn(|cx| self.poll_next(cx)).await
     }
 
     /// Ask the kernel to cancel the operation (AsyncCancel). Keep polling: the completions
