@@ -117,13 +117,13 @@ kernel is from memory and marked **to verify**. Nothing was built or measured fo
 
 | id | statement (from memory) | matters for | how |
 |---|---|---|---|
-| KV1 | A `DEFER_TASKRUN` ring runs at most max(20, `min_complete`) deferred task-work items per run (`IO_LOCAL_TW_DEFAULT_MAX`, 6.12+) and sets `IORING_SQ_TASKRUN` again when items are left | D1: one drain enter handles at most 20 completions; `max` must be documented in those units | read `io_uring/io_uring.c` at v7.0; probe: 200 ready receives, count CQEs per enter |
+| KV1 | A `DEFER_TASKRUN` ring runs at most max(20, `min_complete`) deferred task-work items per run (`IO_LOCAL_TW_DEFAULT_MAX`, 6.12+) and sets `IORING_SQ_TASKRUN` again when items are left. **G0: 6.13+; an enter that slept delivers exactly `min_complete` items** | D1: one drain enter handles at most 20 completions; `max` must be documented in those units | read `io_uring/io_uring.c` at v7.0; probe: 200 ready receives, count CQEs per enter |
 | KV2 | If a link member with `CQE_SKIP_SUCCESS` fails, the kernel posts its CQE and **skips** the CQEs of the cancelled members after it (`REQ_F_SKIP_LINK_CQES`). ROUND3.md assumes the opposite ("the receive's CQE always arrives") | C1 slot bookkeeping. If true, a pair posts exactly one CQE in every case | probe: SEND(skip, link) + RECV; cases: send ok, peer reset, short send on a full socket, invalid SQE at prep |
 | KV3 | `MSG_WAITALL` on a stream SEND retries a short send in the kernel and fails the link if it stays short | C1: "skipped" must mean "fully sent" | probe with a full socket buffer |
 | KV4 | The kernel copies the `msghdr` and imports the iovec when it prepares the SQE (at `io_uring_enter`), not when the SQE is pushed | A1: lifetime of the `msghdr` | read `io_uring/net.c` at v7.0 |
 | KV5 | `IORING_SEND_VECTORIZED` (vectored plain SEND, no `msghdr`) exists from 6.17 | A1 alternative | read the uapi header; probe |
 
-A design below that depends on a statement is fixed only after its probe.
+A design below that depends on a statement is fixed only after its probe. **Verdicts: [round3/G0.md](round3/G0.md), section 1.**
 
 ## Efficiency alternatives found while reading
 
@@ -269,10 +269,11 @@ Merge order: r3-stats, r3-repro, r3-probe.
   (two stores; needs `IORING_FEAT_MIN_TIMEOUT`, else `Unsupported`).
 - Not done: the generic `after_park` hook. `drain_taskrun` covers the need; a callback on the park path would cost
   every user an indirect call.
-- If G0 shows that a larger backlog is left behind at many connections: a second commit with a single
-  non-blocking drain, `want = cq.len()` (returns at once because that many CQEs already exist, and raises the
-  kernel's cap to that number), for the lead to compare against the loop. Depends on KV1.
-- The D2 fix, if G0 found one in the driver.
+- Second variant for the lead to compare (G0: at 2000 connections a `defer` round carries only 40 frames): a
+  drain **before** `tick()` with `want = cq.len()` (returns at once because that many CQEs already exist, and
+  raises the kernel's cap to that number), behind a `#[doc(hidden)]` builder method and `reqresp --ring
+  draincq<N>`. The lead keeps one variant at G1.
+- No D2 fix: G0 found the cause outside the driver (one accept per round on the bench; see G0.md section 3).
 - `reqresp --ring drain<N>`.
 - Tests: on a `defer` ring, receives that complete after the wait returned are delivered before the tasks run
   again (`metrics`: `drain_enters > 0`); `max = 0` and non-DEFER rings behave as today.
@@ -493,9 +494,9 @@ seed (r3-base)
 
 | wave / gate | state |
 |---|---|
-| seed | not started |
-| wave 0 | not started |
-| G0 | not started |
+| seed | done (`957f8c5`, tag `r3-base`) |
+| wave 0 | done (tag `r3-wave0`): r3-stats, r3-repro, r3-probe; lead added `reqresp --bulk-work` |
+| G0 | done ([round3/G0.md](round3/G0.md)): KV2–KV5 hold, KV1 partly (cap since 6.13, wake-up run capped at `min_complete`); D1 reproduced in direction (`defer` leaves task work after 47% of waiting enters, `coop` 2%); D2 = one accept per round on the bench under `coop`'s one-round-per-sweep regime (run 122: p99 7.1 s → 22 ms with `acceptmulti`), no driver fix; baselines recorded |
 | wave 1 | not started |
 | G1 | not started |
 | wave 2 | not started |

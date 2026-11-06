@@ -54,8 +54,9 @@ one server core
   --sizes a,b,..       frame sizes, cycled per connection (default 4k,16k,64k; k, m suffixes)
   --bulk M             bulk connections the server writes to without pause (default 0)
   --chunk SZ           bulk write size (default 32k)
-  --bulk-work N        user-space passes over each bulk chunk before it is sent (default 0;
-                       models a server that encrypts its stream chunks)
+  --bulk-work SZ       bytes of user-space work on each bulk chunk before it is sent (default 0;
+                       a byte-serial pass, about 2 us per KiB: models a server that encrypts
+                       its stream chunks; may exceed --chunk)
   --think US           client pause between a reply and its next frame, microseconds (default 0)
   --path P             plain | pipe | mshot | eager | pair (default pipe)
   --deadline D         none | timeout (default none)
@@ -75,7 +76,7 @@ struct Args {
     sizes: Vec<usize>,
     bulk: usize,
     chunk: usize,
-    bulk_work: u32,
+    bulk_work: usize,
     think: u64,
     path: Path,
     deadline: deadline::Mode,
@@ -160,7 +161,7 @@ fn args() -> Args {
             "--sizes" => a.sizes = v().split(',').map(|s| size(f, s)).collect(),
             "--bulk" => a.bulk = num(f, &v()),
             "--chunk" => a.chunk = size(f, &v()),
-            "--bulk-work" => a.bulk_work = num(f, &v()),
+            "--bulk-work" => a.bulk_work = size(f, &v()),
             "--think" => a.think = num(f, &v()),
             "--path" => {
                 let v = v();
