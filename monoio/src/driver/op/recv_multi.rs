@@ -73,6 +73,23 @@ pub(crate) struct RecvMultiOp {
     rearm: Cell<bool>,
     // `cancel` was called: never re-arm.
     cancelled: Cell<bool>,
+    // The last re-arm was after `ENOBUFS` and no data came since: another `ENOBUFS` means the
+    // ring is still empty, so it is reported instead of re-arming in a loop.
+    enobufs_retry: Cell<bool>,
+    // An error met by `poll_read_into` after it had copied data: returned by the next call.
+    #[cfg(feature = "bytes")]
+    pending_err: Option<io::Error>,
+}
+
+/// What `poll_next_cqe` does with an `ENOBUFS` that ended the multishot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnEnobufs {
+    /// Yield it as an error; the stream ends (`next`).
+    Yield,
+    /// Re-arm and continue (the buffers the caller copied out are back in the ring). Only if
+    /// the re-armed recv hits `ENOBUFS` again before any data is it yielded, and the next poll
+    /// re-arms again.
+    Rearm,
 }
 
 impl RecvMultiOp {
@@ -94,6 +111,9 @@ impl RecvMultiOp {
             eof: false,
             rearm: Cell::new(false),
             cancelled: Cell::new(false),
+            enobufs_retry: Cell::new(false),
+            #[cfg(feature = "bytes")]
+            pending_err: None,
         })
     }
 
@@ -103,59 +123,82 @@ impl RecvMultiOp {
     }
 
     /// Next CQE with data (`res > 0`). `None` after EOF, after a cancel, or after an error that
-    /// ended the multishot. `ENOBUFS` (the ring ran dry) is yielded as an error; the kernel ends
-    /// the multishot with it, so `None` follows. CQEs not yielded have their buffers released.
+    /// ended the multishot. `ENOBUFS` (the ring ran dry) ends the multishot: see [`OnEnobufs`].
+    /// CQEs not yielded have their buffers released.
     ///
     /// The kernel may also end the multishot after a chunk (a bundle recv does whenever it used
     /// the last free buffer, any recv on CQ overflow): it is then submitted again.
-    fn poll_next_cqe(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<Cqe>>> {
-        if self.eof {
-            return Poll::Ready(None);
-        }
-        if self.rearm.replace(false) {
-            let Some(op) = self.op.take() else {
+    fn poll_next_cqe(
+        &mut self,
+        cx: &mut Context<'_>,
+        on_enobufs: OnEnobufs,
+    ) -> Poll<Option<io::Result<Cqe>>> {
+        loop {
+            if self.eof {
+                return Poll::Ready(None);
+            }
+            if self.rearm.replace(false) {
+                let Some(op) = self.op.take() else {
+                    return Poll::Ready(None);
+                };
+                // The final CQE was taken, so the data is free.
+                let Ok(data) = op.into_data() else {
+                    unreachable!("re-arm before the final CQE")
+                };
+                match MultishotOp::submit(data) {
+                    Ok(op) => self.op = Some(op),
+                    Err((e, _)) => return Poll::Ready(Some(Err(e))),
+                }
+            }
+            let Some(op) = self.op.as_mut() else {
                 return Poll::Ready(None);
             };
-            // The final CQE was taken, so the data is free.
-            let Ok(data) = op.into_data() else {
-                unreachable!("re-arm before the final CQE")
+            let Some(cqe) = ready!(op.poll_next(cx)) else {
+                return Poll::Ready(None);
             };
-            match MultishotOp::submit(data) {
-                Ok(op) => self.op = Some(op),
-                Err((e, _)) => return Poll::Ready(Some(Err(e))),
-            }
-        }
-        let Some(op) = self.op.as_mut() else {
-            return Poll::Ready(None);
-        };
-        let Some(cqe) = ready!(op.poll_next(cx)) else {
-            return Poll::Ready(None);
-        };
-        let res = cqe.res();
-        let more = cqe.more();
-        Poll::Ready(match res {
-            n if n > 0 => {
-                if !more && !self.cancelled.get() {
+            let res = cqe.res();
+            let more = cqe.more();
+            return Poll::Ready(match res {
+                n if n > 0 => {
+                    if !more && !self.cancelled.get() {
+                        self.rearm.set(true);
+                    }
+                    self.enobufs_retry.set(false);
+                    Some(Ok(cqe))
+                }
+                0 => {
+                    // EOF: a buffer it may carry goes back to the ring (bundles consume none).
+                    self.discard(cqe);
+                    self.eof = true;
+                    if more {
+                        self.cancel();
+                    }
+                    None
+                }
+                n if n == -libc::ECANCELED && !more => None,
+                n if n == -libc::ENOBUFS
+                    && !more
+                    && on_enobufs == OnEnobufs::Rearm
+                    && !self.cancelled.get() =>
+                {
+                    // Counts ENOBUFS in the ring stats.
+                    self.discard(cqe);
                     self.rearm.set(true);
+                    if !self.enobufs_retry.replace(true) {
+                        // The caller copied its buffers out: they are free again.
+                        continue;
+                    }
+                    // Still no free buffer after a re-arm: someone else holds them. Report
+                    // it; the next poll re-arms again.
+                    Some(Err(io::Error::from_raw_os_error(libc::ENOBUFS)))
                 }
-                Some(Ok(cqe))
-            }
-            0 => {
-                // EOF: a buffer it may carry goes back to the ring (bundles consume none).
-                self.discard(cqe);
-                self.eof = true;
-                if more {
-                    self.cancel();
+                _ => {
+                    // Counts ENOBUFS in the ring stats.
+                    self.discard(cqe);
+                    Some(Err(io::Error::from_raw_os_error(-res)))
                 }
-                None
-            }
-            n if n == -libc::ECANCELED && !more => None,
-            _ => {
-                // Counts ENOBUFS in the ring stats.
-                self.discard(cqe);
-                Some(Err(io::Error::from_raw_os_error(-res)))
-            }
-        })
+            });
+        }
     }
 
     fn discard(&self, cqe: Cqe) {
@@ -171,35 +214,96 @@ impl RecvMultiOp {
     pub(crate) fn poll_next_buf(
         &mut self,
         cx: &mut Context<'_>,
+        on_enobufs: OnEnobufs,
     ) -> Poll<Option<io::Result<SelectedBuf>>> {
-        let next = ready!(self.poll_next_cqe(cx));
-        Poll::Ready(next.map(|cqe| {
-            let data = self.data();
-            debug_assert!(!data.bundle);
-            data.ring
-                .take(cqe?)
-                .ok_or_else(|| io::Error::other("recv completion without a provided buffer"))
-        }))
+        let next = match ready!(self.poll_next_cqe(cx, on_enobufs)) {
+            Some(Ok(cqe)) => cqe,
+            Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+            None => return Poll::Ready(None),
+        };
+        let data = self.data();
+        debug_assert!(!data.bundle);
+        Poll::Ready(Some(data.ring.take(next).ok_or_else(|| {
+            io::Error::other("recv completion without a provided buffer")
+        })))
     }
 
     /// Next filled bundle (a bundle op), see `poll_next_cqe`. Never empty.
     pub(crate) fn poll_next_bundle(
         &mut self,
         cx: &mut Context<'_>,
+        on_enobufs: OnEnobufs,
     ) -> Poll<Option<io::Result<Bundle>>> {
-        let next = ready!(self.poll_next_cqe(cx));
-        Poll::Ready(next.map(|cqe| {
-            let data = self.data();
-            debug_assert!(data.bundle);
-            let bundle = data.ring.take_bundle(cqe?);
-            if bundle.is_empty() {
-                Err(io::Error::other(
-                    "recv completion without a provided buffer",
-                ))
-            } else {
-                Ok(bundle)
-            }
+        let next = match ready!(self.poll_next_cqe(cx, on_enobufs)) {
+            Some(Ok(cqe)) => cqe,
+            Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+            None => return Poll::Ready(None),
+        };
+        let data = self.data();
+        debug_assert!(data.bundle);
+        let bundle = data.ring.take_bundle(next);
+        Poll::Ready(Some(if bundle.is_empty() {
+            Err(io::Error::other(
+                "recv completion without a provided buffer",
+            ))
+        } else {
+            Ok(bundle)
         }))
+    }
+
+    /// Copy what was received into `dst` (bundle or not): waits for the first chunk, then takes
+    /// every chunk already queued without waiting, and gives each buffer back to the ring right
+    /// after its copy. `Ok(0)` once the recv ended (EOF, cancel, or after an error was returned).
+    /// `ENOBUFS` re-arms (see [`OnEnobufs::Rearm`]). An error after some data is returned by
+    /// the next call.
+    #[cfg(feature = "bytes")]
+    pub(crate) fn poll_read_into(
+        &mut self,
+        cx: &mut Context<'_>,
+        dst: &mut bytes::BytesMut,
+    ) -> Poll<io::Result<usize>> {
+        if let Some(e) = self.pending_err.take() {
+            return Poll::Ready(Err(e));
+        }
+        let mut n = 0;
+        loop {
+            let cqe = match self.poll_next_cqe(cx, OnEnobufs::Rearm) {
+                Poll::Pending if n == 0 => return Poll::Pending,
+                Poll::Pending | Poll::Ready(None) => return Poll::Ready(Ok(n)),
+                Poll::Ready(Some(Err(e))) => {
+                    if n == 0 {
+                        return Poll::Ready(Err(e));
+                    }
+                    self.pending_err = Some(e);
+                    return Poll::Ready(Ok(n));
+                }
+                Poll::Ready(Some(Ok(cqe))) => cqe,
+            };
+            let data = self.data();
+            if data.bundle {
+                let bundle = data.ring.take_bundle(cqe);
+                dst.reserve(bundle.bytes());
+                for buf in bundle {
+                    dst.extend_from_slice(&buf);
+                    n += buf.len();
+                }
+            } else {
+                match data.ring.take(cqe) {
+                    Some(buf) => {
+                        dst.extend_from_slice(&buf);
+                        n += buf.len();
+                    }
+                    None => {
+                        let e = io::Error::other("recv completion without a provided buffer");
+                        if n == 0 {
+                            return Poll::Ready(Err(e));
+                        }
+                        self.pending_err = Some(e);
+                        return Poll::Ready(Ok(n));
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn cancel(&self) {
@@ -279,12 +383,31 @@ impl RecvBundleStream {
 
     /// Poll for the next received bundle.
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<Bundle>>> {
-        self.op.poll_next_bundle(cx)
+        self.op.poll_next_bundle(cx, OnEnobufs::Yield)
     }
 
     /// The next received bundle; `None` after EOF, cancel, or an error that ended the recv.
     pub async fn next(&mut self) -> Option<io::Result<Bundle>> {
-        std::future::poll_fn(|cx| self.op.poll_next_bundle(cx)).await
+        std::future::poll_fn(|cx| self.op.poll_next_bundle(cx, OnEnobufs::Yield)).await
+    }
+
+    /// Copy the next received bundle(s) into `dst`, giving the buffers back to the ring at
+    /// once; `Ok(0)` at EOF. Same rules as
+    /// [`RecvStream::read_into`](crate::net::tcp::RecvStream::read_into), including the
+    /// automatic re-arm after `ENOBUFS`.
+    #[cfg(feature = "bytes")]
+    pub async fn read_into(&mut self, dst: &mut bytes::BytesMut) -> io::Result<usize> {
+        std::future::poll_fn(|cx| self.op.poll_read_into(cx, dst)).await
+    }
+
+    /// Poll form of [`read_into`](Self::read_into).
+    #[cfg(feature = "bytes")]
+    pub fn poll_read_into(
+        &mut self,
+        cx: &mut Context<'_>,
+        dst: &mut bytes::BytesMut,
+    ) -> Poll<io::Result<usize>> {
+        self.op.poll_read_into(cx, dst)
     }
 
     /// Stop receiving (AsyncCancel). Bundles already received are still returned, then `next`

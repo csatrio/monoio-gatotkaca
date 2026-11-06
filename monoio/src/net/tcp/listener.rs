@@ -11,16 +11,57 @@ use {
 
 use super::stream::TcpStream;
 use crate::{
-    driver::{op::Op, shared_fd::SharedFd},
+    driver::{
+        op::{accept_multi::BatchAcceptor, Op},
+        shared_fd::SharedFd,
+    },
     io::{stream::Stream, CancelHandle},
     net::{AcceptFlags, ListenerOpts},
 };
 
-/// TcpListener
+/// A TCP listening socket.
+///
+/// # Writing an accept loop
+///
+/// A loop around [`accept`](Self::accept) has one accept SQE in flight, so it accepts **one
+/// connection per scheduler round**: the accept completes, the task runs once in the next
+/// round, and only then is the next accept submitted. With many busy connections a round is
+/// long, and the kernel's accept queue grows while connections wait (with their client
+/// timeouts running). Measured (round 2, gate G0) with 4096 connections and 1 MiB responses:
+/// rounds of ~10 ms gave ~100 accepts/s, the accept queue reached 3,338 and ~6,200 requests
+/// per run timed out. Accepting with a multishot accept removed every timeout at no
+/// throughput cost.
+///
+/// Under load, take everything queued per wakeup:
+///
+/// ```no_run
+/// # async fn serve(listener: monoio::net::TcpListener) -> std::io::Result<()> {
+/// use monoio::net::AcceptFlags;
+///
+/// let mut conns = Vec::with_capacity(256);
+/// loop {
+///     // One multishot accept stays armed between calls (Linux 5.19+).
+///     listener
+///         .accept_batch_into(&mut conns, 256, AcceptFlags::EMPTY)
+///         .await?;
+///     for (stream, _peer) in conns.drain(..) {
+///         monoio::spawn(async move { /* serve stream */ drop(stream) });
+///     }
+/// }
+/// # }
+/// ```
+///
+/// [`accept_batch`](Self::accept_batch) / [`accept_batch_into`](Self::accept_batch_into)
+/// keep the multishot accept inside the listener. To own it, use
+/// [`accept_multi`](Self::accept_multi) and [`AcceptStream::next_batch`](super::AcceptStream::next_batch)
+/// (or `next()` per connection: still no SQE per connection, and queued connections are taken
+/// one per poll without waiting for a new round trip). Both re-arm themselves when the kernel
+/// ends the multishot without an error.
 pub struct TcpListener {
     pub(super) fd: SharedFd,
     sys_listener: Option<std::net::TcpListener>,
     meta: UnsafeCell<ListenerMeta>,
+    batch: BatchAcceptor,
 }
 
 impl TcpListener {
@@ -31,7 +72,52 @@ impl TcpListener {
             fd,
             sys_listener: Some(sys_listener),
             meta: UnsafeCell::new(ListenerMeta::default()),
+            batch: BatchAcceptor::default(),
         }
+    }
+
+    /// Wait for at least one connection, then return every connection already accepted, up to
+    /// `max`, with their peer addresses, from one poll. See "Writing an accept loop" above.
+    ///
+    /// The first call arms a multishot accept (Linux 5.19+) that stays armed in the listener:
+    /// connections arriving between calls are accepted by the kernel and queued, and the next
+    /// call returns them without a round trip. `flags` are set on every accepted socket; later
+    /// calls must pass the same `flags` while it is armed (`InvalidInput` otherwise).
+    ///
+    /// - Allocates the returned `Vec`; [`accept_batch_into`](Self::accept_batch_into) reuses
+    ///   yours.
+    /// - Never returns an empty `Vec`. An error ends the multishot (e.g. `EMFILE`); it is
+    ///   returned (after the connections taken before it), and the next call arms a new one.
+    ///   On kernels without multishot accept the first call fails with `EINVAL`.
+    /// - One task at a time: a second concurrent call fails with `ResourceBusy`. Dropping the
+    ///   future (e.g. in `select!`) is fine: the accept and its queued connections stay.
+    /// - Peers already gone (`getpeername` fails) are closed and skipped.
+    /// - [`accept`](Self::accept) on the same listener still works; the two compete for
+    ///   connections.
+    /// - Dropping the listener cancels the multishot and closes the connections it queued.
+    pub async fn accept_batch(
+        &self,
+        max: usize,
+        flags: AcceptFlags,
+    ) -> io::Result<Vec<(TcpStream, SocketAddr)>> {
+        let mut dst = Vec::new();
+        self.accept_batch_into(&mut dst, max, flags).await?;
+        Ok(dst)
+    }
+
+    /// [`accept_batch`](Self::accept_batch) appending to `dst` (not cleared), so a loop that
+    /// drains one `Vec` allocates nothing. Returns how many were appended (at least 1).
+    pub async fn accept_batch_into(
+        &self,
+        dst: &mut Vec<(TcpStream, SocketAddr)>,
+        max: usize,
+        flags: AcceptFlags,
+    ) -> io::Result<usize> {
+        self.batch
+            .accept(&self.fd, flags.bits(), max, |fd| {
+                super::multishot::push_with_addr(dst, fd)
+            })
+            .await
     }
 
     /// Bind to address with config

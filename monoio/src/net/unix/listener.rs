@@ -1,13 +1,16 @@
 use std::{
     io,
-    mem::{ManuallyDrop, MaybeUninit},
+    mem::ManuallyDrop,
     os::unix::prelude::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
     path::Path,
 };
 
 use super::{socket_addr::SocketAddr, UnixStream};
 use crate::{
-    driver::{op::Op, shared_fd::SharedFd},
+    driver::{
+        op::{accept_multi::BatchAcceptor, Op},
+        shared_fd::SharedFd,
+    },
     io::{stream::Stream, CancelHandle},
     net::{AcceptFlags, ListenerOpts},
 };
@@ -16,6 +19,8 @@ use crate::{
 pub struct UnixListener {
     pub(super) fd: SharedFd,
     sys_listener: Option<std::os::unix::net::UnixListener>,
+    // The multishot accept of `accept_batch`.
+    pub(super) batch: BatchAcceptor,
 }
 
 impl UnixListener {
@@ -24,6 +29,7 @@ impl UnixListener {
         Self {
             fd,
             sys_listener: Some(sys_listener),
+            batch: BatchAcceptor::default(),
         }
     }
 
@@ -140,6 +146,7 @@ impl UnixListener {
             Ok(shared) => Ok(Self {
                 fd: shared,
                 sys_listener: Some(sys_listener),
+                batch: BatchAcceptor::default(),
             }),
             Err(e) => Err(e),
         }
@@ -167,18 +174,15 @@ impl IntoRawFd for UnixListener {
     #[inline]
     fn into_raw_fd(self) -> RawFd {
         let mut this = ManuallyDrop::new(self);
-        #[allow(invalid_value)]
-        #[allow(clippy::uninit_assumed_init)]
-        let (mut fd, mut sys_listener) = unsafe {
-            (
-                MaybeUninit::uninit().assume_init(),
-                MaybeUninit::uninit().assume_init(),
-            )
+        let _ = this.sys_listener.take().unwrap().into_raw_fd();
+        // SAFETY: `this` is never used or dropped again; each field is dropped or moved out
+        // exactly once (`sys_listener` is `None` now and owns nothing).
+        let fd = unsafe {
+            std::ptr::drop_in_place(&mut this.batch);
+            std::ptr::read(&this.fd)
         };
-        std::mem::swap(&mut this.fd, &mut fd);
-        std::mem::swap(&mut this.sys_listener, &mut sys_listener);
-        let _ = sys_listener.take().unwrap().into_raw_fd();
 
+        // Fails while a multishot accept (`accept_multi`, `accept_batch`) still holds the fd.
         fd.try_unwrap()
             .expect("unexpected multiple reference to rawfd")
     }

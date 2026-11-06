@@ -16,7 +16,7 @@ pub use crate::driver::op::{
     send_zc::{SendZcFuture, ZcPending},
 };
 pub use listener::TcpListener;
-pub use multishot::{AcceptStream, DirectAcceptStream, RecvStream};
+pub use multishot::{AcceptStream, DirectAcceptStream, MultiRecvReader, RecvStream};
 pub use split::{TcpOwnedReadHalf, TcpOwnedWriteHalf};
 pub use stream::{TcpConnectOpts, TcpStream};
 pub use zero_copy::{zc_worthwhile, ZC_MIN_LEN};
