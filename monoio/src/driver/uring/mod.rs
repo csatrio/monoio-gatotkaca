@@ -13,6 +13,7 @@ use std::{
 use io_uring::{opcode, squeue, types, types::Timespec, EnterFlags, IoUring};
 use lifecycle::MaybeFdLifecycle;
 pub(crate) use lifecycle::ZcFirst;
+pub(crate) use lifecycle::{PreTake, Taken};
 
 use super::{
     op::{CompletionMeta, Op, OpAble, OpKind},
@@ -1223,6 +1224,33 @@ impl UringInner {
         match inner.ops.slab.get(index) {
             Some(slot) => slot.poll_multi(cx),
             None => Poll::Ready(None),
+        }
+    }
+
+    /// [`poll_multi`](Self::poll_multi) with the buffers taken at reap time, see
+    /// `Ref::poll_multi_taken`.
+    pub(crate) fn poll_multi_taken(
+        this: &Rc<UnsafeCell<UringInner>>,
+        index: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<(Cqe, Option<lifecycle::Taken>)>> {
+        let inner = unsafe { &mut *this.get() };
+        match inner.ops.slab.get(index) {
+            Some(slot) => slot.poll_multi_taken(cx),
+            None => Poll::Ready(None),
+        }
+    }
+
+    /// Take the provided buffers of the CQEs of the multishot op at `index` at reap time, see
+    /// `Ref::set_pretake`.
+    pub(crate) fn set_pretake(
+        this: &Rc<UnsafeCell<UringInner>>,
+        index: usize,
+        pre: lifecycle::PreTake,
+    ) {
+        let inner = unsafe { &mut *this.get() };
+        if let Some(slot) = inner.ops.slab.get(index) {
+            slot.set_pretake(pre);
         }
     }
 

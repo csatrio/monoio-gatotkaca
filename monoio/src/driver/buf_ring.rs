@@ -122,7 +122,16 @@ impl BufRingOptions {
     /// views are dropped.
     ///
     /// [`BufRing::take`] must then see every completion of the group exactly once, in completion
-    /// order: the offset of the data is tracked from the lengths.
+    /// order: the offset of the data is tracked from the lengths. `recv_multi` and
+    /// `recv_multi_bundle` do that for you (the driver takes the buffers when it reaps the
+    /// completions), even with many connections on one ring. With your own SQEs take them in the
+    /// CQE hook; raw `MultiOp`s and single-shot receives are taken in poll order, so they must
+    /// not share an incremental ring with other operations.
+    ///
+    /// Sizing: a buffer goes back only when every piece of it was consumed, so one slow
+    /// connection holds a whole buffer. Shared by many connections, give the ring at least about
+    /// `2 * connections * bytes in flight per connection` in total (and more buffers rather than
+    /// bigger ones), or receives end with `ENOBUFS`.
     pub fn incremental(mut self, on: bool) -> Self {
         self.incremental = on;
         self
@@ -414,6 +423,12 @@ impl BufRing {
     fn shared(&self) -> &Shared {
         // SAFETY: `Shared` is alive while a handle exists (see the module docs).
         unsafe { self.0.as_ref() }
+    }
+
+    /// Incremental mode ([`BufRingOptions::incremental`]): completions must be taken in CQ
+    /// order.
+    pub(crate) fn is_incremental(&self) -> bool {
+        self.shared().incremental
     }
 
     /// The group id, to set as `buf_group` on the SQE.

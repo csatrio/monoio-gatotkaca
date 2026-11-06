@@ -16,6 +16,7 @@ use crate::{
     driver::{
         raw::{BufRing, Cqe, SelectedBuf},
         shared_fd::{sqe_fd, SharedFd},
+        uring::{PreTake, Taken},
     },
     io::stream::Stream,
 };
@@ -63,6 +64,24 @@ fn check_bundles(ring: &BufRing) -> io::Result<()> {
     }
 }
 
+/// Submit a multishot recv. On an incremental ring the driver takes the buffers when it reaps
+/// each CQE: the pieces of one buffer go to many connections, and only the CQ order gives their
+/// offsets (and says when the buffer is free again).
+fn submit(data: RecvMulti) -> Result<MultishotOp<RecvMulti>, (io::Error, RecvMulti)> {
+    let pre = data
+        .ring
+        .is_incremental()
+        .then(|| PreTake::new(data.ring.clone(), data.bundle));
+    let op = MultishotOp::submit(data)?;
+    if let Some(pre) = pre {
+        op.set_pretake(pre);
+    }
+    Ok(op)
+}
+
+/// A CQE with data, and its buffers if the driver took them already.
+type Got = (Cqe, Option<Taken>);
+
 /// The receive loop shared by TCP and Unix streams: yields the filled buffers.
 pub(crate) struct RecvMultiOp {
     // `None` once a re-arm failed.
@@ -105,7 +124,7 @@ impl RecvMultiOp {
             ring: ring.clone(),
             bundle,
         };
-        let op = MultishotOp::submit(data).map_err(|(e, _)| e)?;
+        let op = submit(data).map_err(|(e, _)| e)?;
         Ok(Self {
             op: Some(op),
             eof: false,
@@ -132,7 +151,7 @@ impl RecvMultiOp {
         &mut self,
         cx: &mut Context<'_>,
         on_enobufs: OnEnobufs,
-    ) -> Poll<Option<io::Result<Cqe>>> {
+    ) -> Poll<Option<io::Result<Got>>> {
         loop {
             if self.eof {
                 return Poll::Ready(None);
@@ -145,7 +164,7 @@ impl RecvMultiOp {
                 let Ok(data) = op.into_data() else {
                     unreachable!("re-arm before the final CQE")
                 };
-                match MultishotOp::submit(data) {
+                match submit(data) {
                     Ok(op) => self.op = Some(op),
                     Err((e, _)) => return Poll::Ready(Some(Err(e))),
                 }
@@ -153,7 +172,7 @@ impl RecvMultiOp {
             let Some(op) = self.op.as_mut() else {
                 return Poll::Ready(None);
             };
-            let Some(cqe) = ready!(op.poll_next(cx)) else {
+            let Some((cqe, taken)) = ready!(op.poll_next_taken(cx)) else {
                 return Poll::Ready(None);
             };
             let res = cqe.res();
@@ -164,11 +183,11 @@ impl RecvMultiOp {
                         self.rearm.set(true);
                     }
                     self.enobufs_retry.set(false);
-                    Some(Ok(cqe))
+                    Some(Ok((cqe, taken)))
                 }
                 0 => {
                     // EOF: a buffer it may carry goes back to the ring (bundles consume none).
-                    self.discard(cqe);
+                    self.discard(cqe, taken);
                     self.eof = true;
                     if more {
                         self.cancel();
@@ -182,7 +201,7 @@ impl RecvMultiOp {
                     && !self.cancelled.get() =>
                 {
                     // Counts ENOBUFS in the ring stats.
-                    self.discard(cqe);
+                    self.discard(cqe, taken);
                     self.rearm.set(true);
                     if !self.enobufs_retry.replace(true) {
                         // The caller copied its buffers out: they are free again.
@@ -194,19 +213,40 @@ impl RecvMultiOp {
                 }
                 _ => {
                     // Counts ENOBUFS in the ring stats.
-                    self.discard(cqe);
+                    self.discard(cqe, taken);
                     Some(Err(io::Error::from_raw_os_error(-res)))
                 }
             });
         }
     }
 
-    fn discard(&self, cqe: Cqe) {
-        let data = self.data();
-        if data.bundle {
-            drop(data.ring.take_bundle(cqe));
-        } else {
-            drop(data.ring.take(cqe));
+    // Release the buffers of `cqe` (counting `ENOBUFS` in the ring stats).
+    fn discard(&self, cqe: Cqe, taken: Option<Taken>) {
+        if taken.is_none() {
+            let data = self.data();
+            if data.bundle {
+                drop(data.ring.take_bundle(cqe));
+            } else {
+                drop(data.ring.take(cqe));
+            }
+        }
+    }
+
+    // The buffer of a non-bundle CQE.
+    fn buf(&self, (cqe, taken): Got) -> Option<SelectedBuf> {
+        match taken {
+            Some(Taken::Buf(buf)) => buf,
+            Some(Taken::Bundle(_)) => unreachable!("bundle taken for a plain recv"),
+            None => self.data().ring.take(cqe),
+        }
+    }
+
+    // The buffers of a bundle CQE.
+    fn bundle(&self, (cqe, taken): Got) -> Bundle {
+        match taken {
+            Some(Taken::Bundle(bundle)) => bundle,
+            Some(Taken::Buf(_)) => unreachable!("buffer taken for a bundle recv"),
+            None => self.data().ring.take_bundle(cqe),
         }
     }
 
@@ -221,9 +261,8 @@ impl RecvMultiOp {
             Some(Err(e)) => return Poll::Ready(Some(Err(e))),
             None => return Poll::Ready(None),
         };
-        let data = self.data();
-        debug_assert!(!data.bundle);
-        Poll::Ready(Some(data.ring.take(next).ok_or_else(|| {
+        debug_assert!(!self.data().bundle);
+        Poll::Ready(Some(self.buf(next).ok_or_else(|| {
             io::Error::other("recv completion without a provided buffer")
         })))
     }
@@ -239,9 +278,8 @@ impl RecvMultiOp {
             Some(Err(e)) => return Poll::Ready(Some(Err(e))),
             None => return Poll::Ready(None),
         };
-        let data = self.data();
-        debug_assert!(data.bundle);
-        let bundle = data.ring.take_bundle(next);
+        debug_assert!(self.data().bundle);
+        let bundle = self.bundle(next);
         Poll::Ready(Some(if bundle.is_empty() {
             Err(io::Error::other(
                 "recv completion without a provided buffer",
@@ -267,7 +305,7 @@ impl RecvMultiOp {
         }
         let mut n = 0;
         loop {
-            let cqe = match self.poll_next_cqe(cx, OnEnobufs::Rearm) {
+            let got = match self.poll_next_cqe(cx, OnEnobufs::Rearm) {
                 Poll::Pending if n == 0 => return Poll::Pending,
                 Poll::Pending | Poll::Ready(None) => return Poll::Ready(Ok(n)),
                 Poll::Ready(Some(Err(e))) => {
@@ -277,18 +315,17 @@ impl RecvMultiOp {
                     self.pending_err = Some(e);
                     return Poll::Ready(Ok(n));
                 }
-                Poll::Ready(Some(Ok(cqe))) => cqe,
+                Poll::Ready(Some(Ok(got))) => got,
             };
-            let data = self.data();
-            if data.bundle {
-                let bundle = data.ring.take_bundle(cqe);
+            if self.data().bundle {
+                let bundle = self.bundle(got);
                 dst.reserve(bundle.bytes());
                 for buf in bundle {
                     dst.extend_from_slice(&buf);
                     n += buf.len();
                 }
             } else {
-                match data.ring.take(cqe) {
+                match self.buf(got) {
                     Some(buf) => {
                         dst.extend_from_slice(&buf);
                         n += buf.len();
