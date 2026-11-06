@@ -27,6 +27,7 @@ use crate::time::{error::Elapsed, sleep_until, Duration, Instant, Sleep};
 ///
 /// The original future may be obtained by calling [`Timeout::into_inner`]. This
 /// consumes the `Timeout`.
+#[inline(always)]
 pub fn timeout<T>(duration: Duration, future: T) -> Timeout<T>
 where
     T: Future,
@@ -51,6 +52,7 @@ where
 ///
 /// The original future may be obtained by calling [`Timeout::into_inner`]. This
 /// consumes the `Timeout`.
+#[inline(always)]
 pub fn timeout_at<T>(deadline: Instant, future: T) -> Timeout<T>
 where
     T: Future,
@@ -76,6 +78,7 @@ pin_project! {
 }
 
 impl<T> Timeout<T> {
+    #[inline(always)]
     pub(crate) fn new_with_delay(value: T, delay: Sleep) -> Timeout<T> {
         Timeout { value, delay }
     }

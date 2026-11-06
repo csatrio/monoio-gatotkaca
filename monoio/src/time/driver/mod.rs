@@ -15,7 +15,12 @@ mod wheel;
 
 pub(super) mod sleep;
 
-use std::{cell::RefCell, fmt, io, num::NonZeroU64, ptr::NonNull, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    fmt, io,
+    ptr::NonNull,
+    rc::Rc,
+};
 
 use crate::{
     driver::Driver,
@@ -29,8 +34,8 @@ use crate::{
 /// notifying the [`Sleep`][sleep] instances once their deadlines are reached.
 ///
 /// It is expected that a single instance manages many individual
-/// [`Sleep`][sleep] instances. The `Driver` implementation is thread-safe and,
-/// as such, is able to handle callers from across threads.
+/// [`Sleep`][sleep] instances. Like the runtime it belongs to, it lives on one
+/// thread.
 ///
 /// After creating the `Driver` instance, the caller must repeatedly call `park`
 /// or `park_timeout`. The time driver will perform no work unless `park` or
@@ -38,10 +43,6 @@ use crate::{
 ///
 /// The driver has a resolution of one millisecond. Any unit of time that falls
 /// between milliseconds are rounded up to the next millisecond.
-///
-/// When an instance is dropped, any outstanding [`Sleep`][sleep] instance that
-/// has not elapsed will be notified with an error. At this point, calling
-/// `poll` on the [`Sleep`][sleep] instance will result in panic.
 ///
 /// # Implementation
 ///
@@ -74,15 +75,17 @@ use crate::{
 /// instances will either be canceled (dropped) or their associated entries will
 /// reach level zero and be notified.
 ///
+/// The wheel only moves when a timer is due: the driver keeps the earliest
+/// tick at which anything can happen (`next_wake`) and, per park and per
+/// cold-path submit, compares the clock against it. Without a registered
+/// timer it does not read the clock at all.
+///
 /// [paper]: http://www.cs.columbia.edu/~nahum/w6998/papers/ton97-timing-wheels.pdf
 /// [sleep]: crate::time::Sleep
 /// [timeout]: crate::time::Timeout
 /// [interval]: crate::time::Interval
 #[derive(Debug)]
 pub struct TimeDriver<D: 'static> {
-    /// Timing backend in use
-    time_source: ClockTime,
-
     /// Shared state
     pub(crate) handle: Handle,
 
@@ -134,19 +137,16 @@ struct Inner {
     /// Timing backend in use. Never changes, so it sits outside the `RefCell`.
     time_source: ClockTime,
 
-    pub(super) state: RefCell<InnerState>,
-}
-
-/// The mutable part of the driver's state.
-struct InnerState {
-    /// The last published timer `elapsed` value.
-    elapsed: u64,
-
-    /// The earliest time at which we promise to wake up without unparking
-    next_wake: Option<NonZeroU64>,
+    /// A tick that is not later than the expiration of any registered timer, or 0 without one.
+    ///
+    /// It is a lower bound, not the exact minimum: registering a timer lowers it, removing one
+    /// leaves it alone, and it is exact again after each `process_at_time`. The driver reads the
+    /// clock and looks at the wheel only when this tick is reached, so a park or a cold-path
+    /// submit with nothing due costs one load (no timer) or one clock read (timers pending).
+    next_wake: Cell<u64>,
 
     /// Timer wheel
-    wheel: wheel::Wheel,
+    wheel: RefCell<wheel::Wheel>,
 }
 
 // ===== impl Driver =====
@@ -165,32 +165,34 @@ where
     ///
     /// Specifying the source of time is useful when testing.
     pub(crate) fn new(park: D, clock: Clock) -> TimeDriver<D> {
-        let time_source = ClockTime::new(clock);
-
-        let inner = Inner::new(time_source.clone());
+        let inner = Inner::new(ClockTime::new(clock));
 
         TimeDriver {
-            time_source,
             handle: Handle::new(Rc::new(inner)),
             park,
         }
     }
 
     fn park_internal(&self, limit: Option<Duration>) -> io::Result<()> {
-        let mut inner_state = self.handle.get().state.borrow_mut();
+        let inner = self.handle.get();
 
-        let next_wake = inner_state.wheel.next_expiration_time();
-        inner_state.next_wake =
-            next_wake.map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
-        drop(inner_state);
-
-        match next_wake {
-            Some(when) => {
-                let now = self.time_source.now();
+        match inner.next_wake.get() {
+            // No timer is registered: nothing to wake up for.
+            0 => {
+                if let Some(duration) = limit {
+                    self.park.park_timeout(duration)?;
+                } else {
+                    self.park.park()?;
+                }
+            }
+            // `when` may be earlier than the earliest timer (see `Inner::next_wake`). The wake-up
+            // is then early once: `process_at_time` makes the bound exact.
+            when => {
+                let now = inner.time_source.now();
                 // Note that we effectively round up to 1ms here - this avoids
                 // very short-duration microsecond-resolution sleeps that the OS
                 // might treat as zero-length.
-                let mut duration = self.time_source.tick_to_duration(when.saturating_sub(now));
+                let mut duration = inner.time_source.tick_to_duration(when.saturating_sub(now));
 
                 if duration > Duration::from_millis(0) {
                     if let Some(limit) = limit {
@@ -202,107 +204,96 @@ where
                     self.park.park_timeout(Duration::from_secs(0))?;
                 }
             }
-            None => {
-                if let Some(duration) = limit {
-                    self.park.park_timeout(duration)?;
-                } else {
-                    self.park.park()?;
-                }
-            }
         }
 
-        // Process pending timers after waking up
-        self.handle.process();
+        // Fire the timers that are due after waking up
+        self.handle.process_if_due();
 
         Ok(())
     }
 }
 
 impl Handle {
-    /// Runs timer related logic, and returns the next wakeup time
-    pub(self) fn process(&self) {
-        let now = self.time_source().now();
-
-        self.process_at_time(now)
-    }
-
     /// Fire due timers, cheaply: no clock read without pending timers, no wheel poll before the
     /// earliest deadline (`next_wake` is never later than it).
     pub(self) fn process_if_due(&self) {
-        let Some(next) = self.get().state.borrow().next_wake else {
+        let inner = self.get();
+        let next = inner.next_wake.get();
+        if next == 0 {
             return;
-        };
-        let now = self.time_source().now();
-        if now >= next.get() {
+        }
+        let now = inner.time_source.now();
+        if now >= next {
             self.process_at_time(now);
         }
     }
 
+    /// Advances the wheel to `now`, fires what is due and makes `next_wake` exact.
+    #[cold]
     pub(self) fn process_at_time(&self, mut now: u64) {
-        let mut state = self.get().state.borrow_mut();
-
-        if now < state.elapsed {
-            // Time went backwards! This normally shouldn't happen as the Rust language
-            // guarantees that an Instant is monotonic, but can happen when running
-            // Linux in a VM on a Windows host due to std incorrectly trusting the
-            // hardware clock to be monotonic.
-            //
-            // See <https://github.com/tokio-rs/tokio/issues/3619> for more information.
-            now = state.elapsed;
+        let inner = self.get();
+        {
+            let wheel = inner.wheel.borrow();
+            if now < wheel.elapsed() {
+                // Time went backwards! This normally shouldn't happen as the Rust language
+                // guarantees that an Instant is monotonic, but can happen when running
+                // Linux in a VM on a Windows host due to std incorrectly trusting the
+                // hardware clock to be monotonic (tokio issue 3619).
+                now = wheel.elapsed();
+            }
         }
-        while let Some(entry) = state.wheel.poll(now) {
+        loop {
+            // The wheel is not borrowed while a waker runs: a wake may run code that creates,
+            // resets or drops timers (also ones that wait on the wheel's pending list).
+            let entry = inner.wheel.borrow_mut().poll(now);
+            let Some(entry) = entry else {
+                break;
+            };
             if let Some(waker) = unsafe { entry.fire() } {
                 waker.wake();
             }
         }
-        state.elapsed = state.wheel.elapsed();
-        state.next_wake = state
-            .wheel
-            .poll_at()
-            .map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
+        let next = inner.wheel.borrow().poll_at();
+        inner.next_wake.set(next.map_or(0, |t| t.max(1)));
     }
 
     /// Unlinks a registered timer from the wheel. No waker is invoked.
     ///
     /// SAFETY: `entry` must be registered with this driver (`TimerShared::is_registered`).
     pub(self) unsafe fn remove(&self, entry: NonNull<TimerShared>) {
-        unsafe { self.get().state.borrow_mut().wheel.remove(entry) };
+        unsafe { self.get().wheel.borrow_mut().remove(entry) };
     }
 
     /// Removes and re-adds an entry to the driver.
     ///
     /// SAFETY: The timer must be either unregistered, or registered with this
-    /// driver. No other threads are allowed to concurrently manipulate the
-    /// timer at all (the current thread should hold an exclusive reference to
-    /// the `TimerEntry`)
+    /// driver, and the caller must hold the exclusive reference to its `TimerEntry`.
     pub(self) unsafe fn reregister(&self, new_tick: u64, entry: NonNull<TimerShared>) {
+        let inner = self.get();
         let waker = unsafe {
-            let mut state = self.get().state.borrow_mut();
+            let mut wheel = inner.wheel.borrow_mut();
 
-            // We may have raced with a firing/deregistration, so check before
-            // deregistering.
-            if unsafe { entry.as_ref().is_registered() } {
-                state.wheel.remove(entry);
+            if entry.as_ref().is_registered() {
+                wheel.remove(entry);
             }
 
-            // Now that we have exclusive control of this entry, mint a handle to reinsert
-            // it.
+            // Now that the entry is in no list, mint a handle to reinsert it.
             let entry = entry.as_ref().handle();
 
             entry.set_expiration(new_tick);
 
-            // Note: We don't have to worry about racing with some other resetting
-            // thread, because add_entry and reregister require exclusive control of
-            // the timer entry.
-            match unsafe { state.wheel.insert(entry) } {
+            match wheel.insert(entry) {
                 Ok(_) => {
                     // Keep `next_wake` no later than any registered timer, so
                     // `process_if_due` never skips a due one.
-                    let tick = NonZeroU64::new(new_tick.max(1)).unwrap();
-                    state.next_wake = Some(state.next_wake.map_or(tick, |w| w.min(tick)));
+                    let tick = new_tick.max(1);
+                    let wake = inner.next_wake.get();
+                    if wake == 0 || tick < wake {
+                        inner.next_wake.set(tick);
+                    }
                     None
                 }
-                Err((entry, super::error::InsertError::Elapsed)) => unsafe { entry.fire() },
+                Err((entry, super::error::InsertError::Elapsed)) => entry.fire(),
             }
         };
 
@@ -355,26 +346,14 @@ impl<D: std::os::unix::io::AsRawFd> std::os::unix::io::AsRawFd for TimeDriver<D>
     }
 }
 
-impl<D> Drop for TimeDriver<D>
-where
-    D: 'static,
-{
-    fn drop(&mut self) {
-        // self.shutdown();
-    }
-}
-
 // ===== impl Inner =====
 
 impl Inner {
     pub(self) fn new(time_source: ClockTime) -> Self {
         Inner {
             time_source,
-            state: RefCell::new(InnerState {
-                elapsed: 0,
-                next_wake: None,
-                wheel: wheel::Wheel::new(),
-            }),
+            next_wake: Cell::new(0),
+            wheel: RefCell::new(wheel::Wheel::new()),
         }
     }
 }
