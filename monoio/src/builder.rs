@@ -7,6 +7,8 @@ use crate::{
     Runtime,
 };
 
+mod sqpoll_check;
+
 // ===== basic builder structure definition =====
 
 /// Runtime builder
@@ -33,6 +35,9 @@ pub struct RuntimeBuilder<D> {
 
     // [runtime, kernel] fixed file slots, see `with_fixed_files`
     fixed_files: [u32; 2],
+
+    // SQPOLL settings, applied at `build()`, see `sqpoll`
+    sqpoll: sqpoll_check::SqpollSettings,
 
     // blocking handle
     #[cfg(feature = "sync")]
@@ -78,6 +83,7 @@ impl<T> RuntimeBuilder<T> {
             lifo_slot: false,
             iowq_max_workers: None,
             fixed_files: [0, 0],
+            sqpoll: sqpoll_check::SqpollSettings::default(),
 
             #[cfg(feature = "sync")]
             blocking_handle: crate::blocking::BlockingStrategy::ExecuteLocal.into(),
@@ -116,8 +122,11 @@ impl Buildable for IoUringDriver {
         #[cfg(feature = "sync")]
         let blocking_handle = this.blocking_handle;
 
+        let mut urb = this.urb;
+        this.sqpoll.apply(&mut urb)?;
+
         BUILD_THREAD_ID.set(&thread_id, || {
-            let driver = IoUringDriver::new_with_entries(&this.urb, this.entries, this.opts)?;
+            let driver = IoUringDriver::new_with_entries(&urb, this.entries, this.opts)?;
             if let Some(mut max) = this.iowq_max_workers {
                 // Safety: the runtime does not exist yet, nothing else touches the ring.
                 unsafe {
@@ -365,6 +374,39 @@ impl<D> RuntimeBuilder<D> {
         self.lifo_slot = on;
         self
     }
+
+    /// Let a kernel thread poll the submission queue (`IORING_SETUP_SQPOLL`), so submitting
+    /// needs no `io_uring_enter` while the thread is awake. It sleeps after `idle` without work
+    /// (rounded down to milliseconds) and the driver wakes it when needed. `cpu` pins it
+    /// (`IORING_SETUP_SQ_AFF`); with `None` it inherits the affinity of the thread that calls
+    /// `build()` (Linux 7.0). `cpu` may lie outside that thread's affinity mask, but not
+    /// outside its cpuset (`EINVAL`). Unprivileged since 5.11 (older kernels need root for
+    /// SQPOLL and `CAP_SYS_NICE` for `cpu`).
+    ///
+    /// The poller busy-spins on its CPU. Give it a CPU of its own: on the event loop's own CPU
+    /// the two compete for one core (measured: about −85% throughput and client timeouts).
+    /// `build()` reads the building thread's affinity and reports a conflict when the thread
+    /// may run on one CPU only and `cpu` is `None` or that CPU: by default with one warning on
+    /// stderr per process, with [`deny_sqpoll_conflict`](Self::deny_sqpoll_conflict) by
+    /// failing with `InvalidInput`.
+    ///
+    /// Applied at `build()`, so it survives a later [`uring_builder`](Self::uring_builder)
+    /// call. SQPOLL set directly on an `io_uring::Builder` passed to `uring_builder` keeps
+    /// working, but is not checked.
+    #[must_use]
+    pub fn sqpoll(mut self, idle: Duration, cpu: Option<u32>) -> Self {
+        self.sqpoll.cfg = Some((idle, cpu));
+        self
+    }
+
+    /// Make `build()` fail with [`io::ErrorKind::InvalidInput`] instead of warning when the
+    /// [`sqpoll`](Self::sqpoll) thread would share the event loop's only CPU. No effect without
+    /// `sqpoll`.
+    #[must_use]
+    pub fn deny_sqpoll_conflict(mut self) -> Self {
+        self.sqpoll.deny = true;
+        self
+    }
 }
 
 // ===== enable_timer related =====
@@ -392,6 +434,7 @@ where
             lifo_slot: this.lifo_slot,
             iowq_max_workers: this.iowq_max_workers,
             fixed_files: this.fixed_files,
+            sqpoll: this.sqpoll,
             #[cfg(feature = "sync")]
             blocking_handle: this.blocking_handle,
             _mark: PhantomData,
@@ -425,6 +468,7 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
             lifo_slot,
             iowq_max_workers,
             fixed_files,
+            sqpoll,
             #[cfg(feature = "sync")]
             blocking_handle,
             ..
@@ -438,6 +482,7 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
             lifo_slot,
             iowq_max_workers,
             fixed_files,
+            sqpoll,
             #[cfg(feature = "sync")]
             blocking_handle,
             _mark: PhantomData,
