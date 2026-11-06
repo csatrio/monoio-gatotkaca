@@ -253,6 +253,8 @@ fn skip_empty_enter_skips() {
         });
         spinner.await;
     });
+    #[cfg(feature = "metrics")]
     let s = rt.driver().stats();
+    #[cfg(feature = "metrics")]
     assert!(s.enter_skipped > 0, "{s:?}");
 }

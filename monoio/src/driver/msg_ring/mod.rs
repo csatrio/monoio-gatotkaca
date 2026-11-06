@@ -124,7 +124,7 @@ pub fn msg_ring(
 const NOWAIT_USER_DATA: u64 = (0b11 << 62) | 0x4d53_4752; // "MSGR"
 
 thread_local! {
-    // Handles of queued `msg_ring_nowait` SQEs, each with the value of `sqes_submitted` after
+    // Handles of queued `msg_ring_nowait` SQEs, each with the value of `sqes_consumed` after
     // which the kernel has consumed the SQE (so the fd number in it is no longer needed).
     static NOWAIT_KEEPALIVE: RefCell<VecDeque<(u64, RingHandle)>> =
         const { RefCell::new(VecDeque::new()) };
@@ -149,7 +149,7 @@ pub fn msg_ring_nowait(target: &RingHandle, id: u64, res: i32) -> io::Result<()>
         .flags(squeue::Flags::SKIP_SUCCESS)
         .user_data(NOWAIT_USER_DATA);
     CURRENT.with(|inner| {
-        let submitted = unsafe { (*inner.0.get()).stats() }.sqes_submitted;
+        let submitted = unsafe { (*inner.0.get()).sqes_consumed() };
         // The driver is not borrowed here: no runtime code runs inside this closure.
         let queued = inner.with_ring(|ring| {
             // SAFETY: the SQE points to no memory; its fd stays open (see the keepalive below).
@@ -165,9 +165,9 @@ pub fn msg_ring_nowait(target: &RingHandle, id: u64, res: i32) -> io::Result<()>
         })?;
         NOWAIT_KEEPALIVE.with(|keep| {
             let mut keep = keep.borrow_mut();
-            // `sqes_submitted` only counts the driver's own enters (and restarts at 0 on
-            // `reset_stats` or with a new runtime): it can lag behind, never run ahead, so
-            // handles are at worst kept a bit longer.
+            // `sqes_consumed` only counts the driver's own enters (and restarts at 0 with a
+            // new runtime): it can lag behind, never run ahead, so handles are at worst kept a
+            // bit longer.
             while keep.front().is_some_and(|(at, _)| *at <= submitted) {
                 keep.pop_front();
             }

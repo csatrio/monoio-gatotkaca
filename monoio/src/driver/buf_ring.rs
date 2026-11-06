@@ -129,18 +129,28 @@ impl BufRingOptions {
     }
 }
 
-/// Counters of a [`BufRing`], see [`BufRing::stats`].
+/// State and counters of a [`BufRing`], see [`BufRing::stats`]. The counters (all fields but
+/// `in_use`) need the `metrics` feature.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BufRingStats {
     /// Completions passed to [`BufRing::take`] that failed with `ENOBUFS` (the pool was empty).
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
     pub enobufs: u64,
     /// Buffers currently held by the application (with at least one live [`SelectedBuf`]).
     pub in_use: usize,
     /// The highest `in_use` seen.
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
     pub high_water: usize,
     /// Buffers handed out by [`BufRing::take`] and [`BufRing::take_bundle`].
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
     pub taken: u64,
     /// Buffers given back to the ring.
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
     pub recycled: u64,
 }
 
@@ -180,9 +190,13 @@ struct Shared {
     last_filled: Cell<u16>,
     bufs: Box<[BufState]>,
     in_use: Cell<usize>,
+    #[cfg(feature = "metrics")]
     high_water: Cell<usize>,
+    #[cfg(feature = "metrics")]
     enobufs: Cell<u64>,
+    #[cfg(feature = "metrics")]
     taken: Cell<u64>,
+    #[cfg(feature = "metrics")]
     recycled: Cell<u64>,
     // Dropped after `Drop for Shared` has unregistered the group.
     _ring_map: Mapping,
@@ -376,9 +390,13 @@ impl BufRing {
             last_filled: Cell::new(0),
             bufs,
             in_use: Cell::new(0),
+            #[cfg(feature = "metrics")]
             high_water: Cell::new(0),
+            #[cfg(feature = "metrics")]
             enobufs: Cell::new(0),
+            #[cfg(feature = "metrics")]
             taken: Cell::new(0),
+            #[cfg(feature = "metrics")]
             recycled: Cell::new(0),
             _ring_map: ring_map,
             _pool_map: pool_map,
@@ -419,14 +437,18 @@ impl BufRing {
         self.shared().publish();
     }
 
-    /// The counters of this ring.
+    /// The state (and, with the `metrics` feature, the counters) of this ring.
     pub fn stats(&self) -> BufRingStats {
         let s = self.shared();
         BufRingStats {
+            #[cfg(feature = "metrics")]
             enobufs: s.enobufs.get(),
             in_use: s.in_use.get(),
+            #[cfg(feature = "metrics")]
             high_water: s.high_water.get(),
+            #[cfg(feature = "metrics")]
             taken: s.taken.get(),
+            #[cfg(feature = "metrics")]
             recycled: s.recycled.get(),
         }
     }
@@ -450,7 +472,7 @@ impl BufRing {
     fn take_parts(&self, res: i32, flags: u32) -> Option<SelectedBuf> {
         let s = self.shared();
         if res == -libc::ENOBUFS {
-            s.enobufs.set(s.enobufs.get() + 1);
+            metric!(s.enobufs.set(s.enobufs.get() + 1));
             return None;
         }
         let bid = cqueue::buffer_select(flags)?;
@@ -527,7 +549,7 @@ impl BufRing {
             bytes: 0,
         };
         if res == -libc::ENOBUFS {
-            s.enobufs.set(s.enobufs.get() + 1);
+            metric!(s.enobufs.set(s.enobufs.get() + 1));
             return bundle;
         }
         // No data: the kernel consumed nothing (a 0-byte bundle commits no buffer), even if the
@@ -636,10 +658,10 @@ impl Shared {
         if views == 0 {
             let in_use = self.in_use.get() + 1;
             self.in_use.set(in_use);
-            self.high_water.set(self.high_water.get().max(in_use));
+            metric!(self.high_water.set(self.high_water.get().max(in_use)));
         }
         self.views.set(self.views.get() + 1);
-        self.taken.set(self.taken.get() + 1);
+        metric!(self.taken.set(self.taken.get() + 1));
     }
 
     fn slot(&self, pos: u16) -> *mut RawEntry {
@@ -718,7 +740,7 @@ impl Shared {
         state.in_kernel.set(true);
         state.offset.set(0);
         self.fill_slot(bid);
-        self.recycled.set(self.recycled.get() + 1);
+        metric!(self.recycled.set(self.recycled.get() + 1));
         if !self.batch {
             self.publish();
         } else if !self.queued.get() {
@@ -1078,6 +1100,7 @@ mod tests {
         drop((a, b));
         // Slots written, tail not published.
         assert_eq!(kernel_tail(&ring), 4);
+        #[cfg(feature = "metrics")]
         assert_eq!(ring.stats().recycled, 2);
         flush_pending();
         assert_eq!(kernel_tail(&ring), 6);
@@ -1155,6 +1178,7 @@ mod tests {
             [(2, 0, 64), (3, 0, 20), (1, 0, 64), (0, 0, 10)]
         );
         assert_eq!(ring.stats().in_use, 0);
+        #[cfg(feature = "metrics")]
         assert_eq!(ring.stats().taken, 6);
 
         // Nothing received: nothing consumed, even if the completion names a buffer.
@@ -1163,6 +1187,7 @@ mod tests {
             .take_bundle_parts(-libc::ECONNRESET, flags(2, false))
             .is_empty());
         assert!(ring.take_bundle_parts(-libc::ENOBUFS, 0).is_empty());
+        #[cfg(feature = "metrics")]
         assert_eq!(ring.stats().enobufs, 1);
         assert_eq!(ring.stats().in_use, 0);
     }
@@ -1206,6 +1231,7 @@ mod tests {
         assert_eq!((c.bid(), c.offset(), c.len()), (2, 5, 3));
         drop((a, first, c));
         assert_eq!(ring.stats().in_use, 0);
+        #[cfg(feature = "metrics")]
         assert_eq!(ring.stats().recycled, 3);
     }
 }

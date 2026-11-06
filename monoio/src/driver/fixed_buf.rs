@@ -47,17 +47,23 @@ const MAX_TABLE_SLOTS: u32 = 1 << 14;
 /// The kernel's limit on the size of one registered buffer.
 const MAX_BUF_SIZE: usize = 1 << 30;
 
-/// Counters of a [`FixedBufPool`], see [`FixedBufPool::stats`].
+/// State and counters of a [`FixedBufPool`], see [`FixedBufPool::stats`]. The counters
+/// (`high_water`, `exhausted`) need the `metrics` feature.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FixedBufStats {
     /// Buffers currently handed out ([`FixedBuf`]s and frozen buffers alive, including those
     /// held by in-flight ops).
     pub in_use: usize,
     /// The highest `in_use` seen.
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
     pub high_water: usize,
     /// The number of buffers in the pool.
     pub capacity: usize,
     /// Calls to [`FixedBufPool::get`] that found the pool empty.
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
     pub exhausted: u64,
 }
 
@@ -226,7 +232,9 @@ struct Shared {
     handles: Cell<usize>,
     // `FixedBuf`s alive (= buffers in use).
     live: Cell<usize>,
+    #[cfg(feature = "metrics")]
     high_water: Cell<usize>,
+    #[cfg(feature = "metrics")]
     exhausted: Cell<u64>,
 }
 
@@ -298,7 +306,9 @@ impl FixedBufPool {
             segments: RefCell::new(Vec::new()),
             handles: Cell::new(1),
             live: Cell::new(0),
+            #[cfg(feature = "metrics")]
             high_water: Cell::new(0),
+            #[cfg(feature = "metrics")]
             exhausted: Cell::new(0),
         };
         // On failure `shared` is dropped here, which gives back what `add` took.
@@ -314,14 +324,15 @@ impl FixedBufPool {
     /// Take a buffer out of the pool, empty (`len() == 0`). `None` if all are in use.
     pub fn get(&self) -> Option<FixedBuf> {
         let s = self.shared();
-        let Some(id) = s.free.borrow_mut().pop() else {
+        let id = s.free.borrow_mut().pop();
+        metric!(if id.is_none() {
             s.exhausted.set(s.exhausted.get() + 1);
-            return None;
-        };
+        });
+        let id = id?;
         let (ptr, index) = s.bufs.borrow()[id as usize];
         let live = s.live.get() + 1;
         s.live.set(live);
-        s.high_water.set(s.high_water.get().max(live));
+        metric!(s.high_water.set(s.high_water.get().max(live)));
         Some(FixedBuf {
             shared: self.0,
             ptr,
@@ -349,13 +360,15 @@ impl FixedBufPool {
         self.shared().bufs.borrow().len()
     }
 
-    /// The counters of this pool.
+    /// The state (and, with the `metrics` feature, the counters) of this pool.
     pub fn stats(&self) -> FixedBufStats {
         let s = self.shared();
         FixedBufStats {
             in_use: s.live.get(),
+            #[cfg(feature = "metrics")]
             high_water: s.high_water.get(),
             capacity: s.bufs.borrow().len(),
+            #[cfg(feature = "metrics")]
             exhausted: s.exhausted.get(),
         }
     }

@@ -110,6 +110,7 @@ async fn enobufs_then_rearm() {
     assert_eq!(err.raw_os_error(), Some(libc::ENOBUFS));
     assert!(chunks.next().await.is_none());
     assert!(chunks.is_finished());
+    #[cfg(feature = "metrics")]
     assert!(ring.stats().enobufs >= 1);
 
     // Free the buffers and re-arm: the data is still in the socket.
@@ -352,6 +353,7 @@ async fn bundle_enobufs_then_rearm() {
     let err = bundles.next().await.unwrap().unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::ENOBUFS));
     assert!(bundles.next().await.is_none());
+    #[cfg(feature = "metrics")]
     assert!(ring.stats().enobufs >= 1);
 
     drop(held);

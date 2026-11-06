@@ -183,7 +183,9 @@ fn slots_are_reused() {
             settle().await;
         }
         let stats = fixed_file_stats().unwrap();
-        assert_eq!((stats.in_use, stats.high_water, stats.exhausted), (0, 2, 0));
+        assert_eq!(stats.in_use, 0);
+        #[cfg(feature = "metrics")]
+        assert_eq!((stats.high_water, stats.exhausted), (2, 0));
     });
 }
 
@@ -195,6 +197,7 @@ fn table_exhaustion() {
         let err = b.register_fixed().unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENFILE));
         assert!(!b.is_fixed());
+        #[cfg(feature = "metrics")]
         assert_eq!(fixed_file_stats().unwrap().exhausted, 1);
 
         // accept_direct fails before accepting: the connection stays in the backlog.

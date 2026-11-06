@@ -40,6 +40,7 @@ async fn cancel_all_tcp() {
     let recvs: Vec<_> = (0..4u8).map(|i| server.recv_op(vec![i])).collect();
     let other = other_server.recv_op(Vec::with_capacity(16));
 
+    #[cfg(feature = "metrics")]
     monoio::reset_driver_stats();
     server.cancel_all().unwrap();
     for (i, recv) in recvs.into_iter().enumerate() {
@@ -52,8 +53,11 @@ async fn cancel_all_tcp() {
         // The buffer comes back untouched.
         assert_eq!(buf, [i as u8]);
     }
+    #[cfg(feature = "metrics")]
     let s = monoio::driver_stats();
+    #[cfg(feature = "metrics")]
     assert_eq!(s.cancel_fd_pushed, 1, "{s:?}");
+    #[cfg(feature = "metrics")]
     assert_eq!(s.cancels_pushed, 0, "{s:?}");
 
     // The other connection is not affected.

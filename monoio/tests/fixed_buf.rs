@@ -51,7 +51,10 @@ async fn get_drop_reuse() {
     assert_eq!((a.len(), a.capacity()), (0, 4096));
     assert!(pool.get().is_none());
     let stats = pool.stats();
-    assert_eq!((stats.in_use, stats.high_water, stats.capacity), (2, 2, 2));
+    assert_eq!((stats.in_use, stats.capacity), (2, 2));
+    #[cfg(feature = "metrics")]
+    assert_eq!(stats.high_water, 2);
+    #[cfg(feature = "metrics")]
     assert_eq!(stats.exhausted, 1);
 
     let index = a.buf_index();
@@ -61,7 +64,9 @@ async fn get_drop_reuse() {
     assert_eq!(c.buf_index(), index);
     drop((b, c));
     let stats = pool.stats();
-    assert_eq!((stats.in_use, stats.high_water), (0, 2));
+    assert_eq!(stats.in_use, 0);
+    #[cfg(feature = "metrics")]
+    assert_eq!(stats.high_water, 2);
 }
 
 #[monoio::test]

@@ -62,6 +62,7 @@ async fn many_producers_keep_per_sender_order() {
     for t in threads {
         t.join().unwrap();
     }
+    #[cfg(feature = "metrics")]
     assert!(rx.wakeups() < SENDERS * N / 10, "wakeups {}", rx.wakeups());
 }
 
@@ -76,6 +77,7 @@ async fn full_then_room_again() {
         tx.send(i).unwrap();
     }
     assert_eq!(tx.send(4), Err(SendError::Full(4)));
+    #[cfg(feature = "metrics")]
     assert_eq!(rx.stats().full, 1);
     assert_eq!(rx.recv().await, Some(0));
     // The node comes back once the receiver returns its batch (when it next looks for more).
@@ -150,9 +152,12 @@ async fn ring_thread_sender_uses_msg_ring() {
     .await
     .expect("lost wakeup: receiver hung");
     sender.join().unwrap();
+    #[cfg(feature = "metrics")]
     let stats = rx.stats();
+    #[cfg(feature = "metrics")]
     assert!(stats.ring_wakeups > 0, "{stats:?}");
     // The last sender's drop happens after the runtime exits: an eventfd wakeup at most.
+    #[cfg(feature = "metrics")]
     assert!(stats.eventfd_wakeups <= 1, "{stats:?}");
 }
 
@@ -171,8 +176,11 @@ async fn same_ring_sender_rings_directly() {
     }
     task.await;
     assert_eq!(rx.recv().await, None);
+    #[cfg(feature = "metrics")]
     let stats = rx.stats();
+    #[cfg(feature = "metrics")]
     assert_eq!(stats.eventfd_wakeups, 0, "{stats:?}");
+    #[cfg(feature = "metrics")]
     assert!(stats.ring_wakeups >= 3, "{stats:?}");
 }
 
@@ -212,6 +220,7 @@ fn ring_sender_to_defer_taskrun_receiver() {
         .await
         .expect("lost wakeup: receiver hung");
         sender.join().unwrap();
+        #[cfg(feature = "metrics")]
         assert!(rx.stats().ring_wakeups > 0);
     });
 }

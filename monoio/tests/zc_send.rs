@@ -5,11 +5,13 @@
 
 use std::{cell::Cell, future::Future, pin::Pin, rc::Rc, task::Context};
 
+#[cfg(feature = "metrics")]
+use monoio::uring::opcode;
 use monoio::{
     buf::{IoBuf, IoBufMut, VecBuf},
     io::AsyncReadRentExt,
     net::{zc_worthwhile, TcpListener, TcpStream, ZC_MIN_LEN},
-    uring::{opcode, FixedBufPool},
+    uring::FixedBufPool,
     IoUringDriver, RuntimeBuilder,
 };
 
@@ -63,6 +65,7 @@ async fn settle() {
 async fn early_result_then_release() {
     let (client, mut server) = tcp_pair().await;
     let data = payload(64 * 1024);
+    #[cfg(feature = "metrics")]
     monoio::reset_driver_stats();
 
     let fut = client.send_zc_early(data.clone());
@@ -75,9 +78,13 @@ async fn early_result_then_release() {
     assert_eq!(buf, data);
     assert_eq!(read_n(&mut server, n).await, data[..n]);
 
+    #[cfg(feature = "metrics")]
     let s = monoio::driver_stats();
+    #[cfg(feature = "metrics")]
     assert_eq!(s.zc_sends, 1, "{s:?}");
+    #[cfg(feature = "metrics")]
     assert_eq!(s.zc_notifs, 1, "{s:?}");
+    #[cfg(feature = "metrics")]
     assert_eq!(s.ops_by_opcode[opcode::SendZc::CODE as usize], 1);
 }
 
@@ -179,13 +186,17 @@ async fn send_zc_fixed_loopback() {
     let mut buf = pool.get().unwrap();
     buf.extend_from_slice(&data);
 
+    #[cfg(feature = "metrics")]
     monoio::reset_driver_stats();
     let (res, buf) = client.send_zc_fixed(buf).await;
     let n = res.unwrap();
     assert_eq!(read_n(&mut server, n).await, data[..n]);
     assert_eq!(&buf[..], &data[..]);
+    #[cfg(feature = "metrics")]
     let s = monoio::driver_stats();
+    #[cfg(feature = "metrics")]
     assert_eq!(s.ops_by_opcode[opcode::SendZc::CODE as usize], 1);
+    #[cfg(feature = "metrics")]
     assert_eq!(s.zc_notifs, 1, "{s:?}");
 
     // Frozen (shared) views are accepted too, and the early variant.
@@ -227,12 +238,16 @@ async fn send_vectored_zc_echo() {
     let total: usize = parts.iter().map(Vec::len).sum();
     let expected = parts.concat();
 
+    #[cfg(feature = "metrics")]
     monoio::reset_driver_stats();
     let (res, bufs) = client.send_vectored_zc(VecBuf::from(parts.clone())).await;
     assert_eq!(res.unwrap(), total);
     assert_eq!(Vec::<Vec<u8>>::from(bufs), parts);
+    #[cfg(feature = "metrics")]
     let s = monoio::driver_stats();
+    #[cfg(feature = "metrics")]
     assert_eq!(s.ops_by_opcode[opcode::SendMsgZc::CODE as usize], 1);
+    #[cfg(feature = "metrics")]
     assert_eq!(s.zc_sends, 1);
 
     // Echo it back the same way.
@@ -251,15 +266,20 @@ async fn send_auto_picks_by_size() {
     assert!(zc_worthwhile(ZC_MIN_LEN));
 
     let (client, mut server) = tcp_pair().await;
+    #[cfg(feature = "metrics")]
     let send_code = opcode::Send::CODE as usize;
+    #[cfg(feature = "metrics")]
     let zc_code = opcode::SendZc::CODE as usize;
 
+    #[cfg(feature = "metrics")]
     monoio::reset_driver_stats();
     let small = payload(100);
     let (res, _) = client.send_auto(small.clone()).await;
     assert_eq!(res.unwrap(), 100);
     assert_eq!(read_n(&mut server, 100).await, small);
+    #[cfg(feature = "metrics")]
     let s = monoio::driver_stats();
+    #[cfg(feature = "metrics")]
     assert_eq!(
         (s.ops_by_opcode[send_code], s.ops_by_opcode[zc_code]),
         (1, 0)
@@ -270,7 +290,9 @@ async fn send_auto_picks_by_size() {
     let n = res.unwrap();
     assert_eq!(buf, large);
     assert_eq!(read_n(&mut server, n).await, large[..n]);
+    #[cfg(feature = "metrics")]
     let s = monoio::driver_stats();
+    #[cfg(feature = "metrics")]
     assert_eq!(
         (s.ops_by_opcode[send_code], s.ops_by_opcode[zc_code]),
         (1, 1)

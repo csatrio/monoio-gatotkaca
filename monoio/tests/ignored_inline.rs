@@ -138,6 +138,7 @@ async fn small_data_is_inline() {
     assert_eq!(drops.get(), N);
     drops.set(0);
 
+    #[cfg(feature = "metrics")]
     monoio::reset_driver_stats();
     let made = drop_in_flight::<0>(&server, &drops).await;
     assert_eq!(
@@ -146,9 +147,13 @@ async fn small_data_is_inline() {
     );
     // Kept alive while the kernel may still write to them.
     assert_eq!(drops.get(), 0);
+    #[cfg(feature = "metrics")]
     let s = monoio::driver_stats();
+    #[cfg(feature = "metrics")]
     assert_eq!(s.ignored_inline, N as u64, "{s:?}");
+    #[cfg(feature = "metrics")]
     assert_eq!(s.ignored_boxed, 0);
+    #[cfg(feature = "metrics")]
     assert_eq!(s.cancels_pushed, N as u64);
 
     settle().await;
@@ -169,12 +174,16 @@ async fn large_data_is_boxed() {
     settle().await;
     drops.set(0);
 
+    #[cfg(feature = "metrics")]
     monoio::reset_driver_stats();
     let made = drop_in_flight::<256>(&server, &drops).await;
     assert_eq!(made, N as u64, "one box per op");
     assert_eq!(drops.get(), 0);
+    #[cfg(feature = "metrics")]
     let s = monoio::driver_stats();
+    #[cfg(feature = "metrics")]
     assert_eq!(s.ignored_boxed, N as u64, "{s:?}");
+    #[cfg(feature = "metrics")]
     assert_eq!(s.ignored_inline, 0);
 
     settle().await;
