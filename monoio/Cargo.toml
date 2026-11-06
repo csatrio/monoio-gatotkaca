@@ -106,3 +106,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [[example]]
 name = "thread_per_core"
 required-features = ["utils"]
+
+# many connections, small frames, one server core (docs/performance-improvement/round2/W2-m5.md)
+[[example]]
+name = "smallframes"
+required-features = ["bytes", "utils"]

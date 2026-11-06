@@ -34,6 +34,7 @@ impl<T> Slab<T> {
         }
     }
 
+    #[inline]
     pub(crate) fn get(&mut self, key: usize) -> Option<Ref<'_, T>> {
         let page_id = get_page_id(key);
         // here we make 2 mut ref so we must make it safe.
@@ -49,6 +50,30 @@ impl<T> Slab<T> {
                 Entry::Vacant(_) => None,
                 Entry::Occupied(_) => Some(Ref { slab, page, index }),
             },
+        }
+    }
+
+    /// Shared access to the value of `key`, if occupied.
+    #[inline]
+    pub(crate) fn peek(&self, key: usize) -> Option<&T> {
+        let page = unsafe { self.pages.get_unchecked(get_page_id(key)) }.as_ref()?;
+        page.get(key.wrapping_sub(page.prev_len))
+    }
+
+    /// Ask the CPU to pull the entry of `key` into the cache (a hint; nothing if `key` was never
+    /// allocated). Lets a caller walking a batch of keys overlap their cache misses.
+    #[inline]
+    pub(crate) fn prefetch(&self, key: usize) {
+        let Some(page) = (unsafe { self.pages.get_unchecked(get_page_id(key)) }) else {
+            return;
+        };
+        let index = key.wrapping_sub(page.prev_len);
+        if index < page.initialized {
+            // SAFETY: `index` is within the page's slots.
+            let p = unsafe { page.slots.as_ptr().add(index) }.cast::<u8>();
+            // An entry may straddle two cache lines.
+            prefetch_read(p);
+            prefetch_read(p.wrapping_add(std::mem::size_of::<Entry<T>>() - 1));
         }
     }
 
@@ -80,10 +105,18 @@ impl<T> Slab<T> {
         panic!("out of slot");
     }
 
+    #[inline]
     pub(crate) fn mark_remove(&mut self) {
-        // compact
         self.generation = self.generation.wrapping_add(1);
         if self.generation.is_multiple_of(COMPACT_INTERVAL) {
+            self.compact();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn compact(&mut self) {
+        {
             // reset write page index
             self.w_page_id = 0;
             // find the last allocated page and try to drop
@@ -104,6 +137,20 @@ impl<T> Slab<T> {
     }
 }
 
+/// Prefetch the cache line of `p` for reading (a hint, never faults; no-op off x86_64).
+#[inline(always)]
+pub(crate) fn prefetch_read<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    #[allow(unused_unsafe)]
+    // SAFETY: a prefetch never faults, whatever the address; SSE is part of the x86_64 baseline.
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch::<_MM_HINT_T0>(p.cast::<i8>());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
 // Forked from tokio.
 fn get_page_id(key: usize) -> usize {
     const POINTER_WIDTH: u32 = std::mem::size_of::<usize>() as u32 * 8;
@@ -121,12 +168,24 @@ pub(crate) struct Ref<'a, T> {
 }
 
 impl<T> Ref<'_, T> {
+    #[inline]
     pub(crate) fn remove(self) -> T {
         // # Safety
-        // We make sure the index is valid.
-        let val = unsafe { self.page.remove(self.index).unwrap_unchecked() };
+        // We make sure the index is valid and occupied.
+        let val = unsafe { self.page.take_occupied(self.index) };
         self.slab.mark_remove();
         val
+    }
+
+    /// Free the slot without moving its value out or dropping it (the value is leaked).
+    ///
+    /// # Safety
+    /// Whatever the value owns must have been moved out already (or need no drop).
+    #[inline]
+    pub(crate) unsafe fn remove_forget(self) {
+        // SAFETY: the index is valid and occupied; the caller vouches for the value.
+        unsafe { self.page.vacate_occupied(self.index) };
+        self.slab.mark_remove();
     }
 }
 
@@ -180,10 +239,12 @@ impl<T> Entry<T> {
         }
     }
 
+    #[cfg(test)]
     fn is_vacant(&self) -> bool {
         matches!(self, Entry::Vacant(_))
     }
 
+    #[cfg(test)]
     unsafe fn unwrap_unchecked(self) -> T {
         match self {
             Entry::Vacant(_) => std::hint::unreachable_unchecked(),
@@ -284,6 +345,41 @@ impl<T> Page<T> {
         unsafe { Some(self.slots.get_unchecked_mut(slot).assume_init_mut()) }
     }
 
+    /// Move the value out of an occupied slot and free it.
+    ///
+    /// # Safety
+    /// `slot` must be initialized and occupied.
+    #[inline]
+    unsafe fn take_occupied(&mut self, slot: usize) -> T {
+        unsafe {
+            let entry = self.slots.get_unchecked_mut(slot).as_mut_ptr();
+            let val = match std::ptr::read(entry) {
+                Entry::Occupied(val) => val,
+                Entry::Vacant(_) => std::hint::unreachable_unchecked(),
+            };
+            std::ptr::write(entry, Entry::Vacant(self.next));
+            self.next = slot;
+            self.used -= 1;
+            val
+        }
+    }
+
+    /// Free an occupied slot without dropping its value.
+    ///
+    /// # Safety
+    /// `slot` must be initialized and occupied, and its value must need no drop (anything it
+    /// owned was moved out).
+    #[inline]
+    unsafe fn vacate_occupied(&mut self, slot: usize) {
+        unsafe {
+            let entry = self.slots.get_unchecked_mut(slot).as_mut_ptr();
+            std::ptr::write(entry, Entry::Vacant(self.next));
+        }
+        self.next = slot;
+        self.used -= 1;
+    }
+
+    #[cfg(test)]
     fn remove(&mut self, slot: usize) -> Option<T> {
         if slot >= self.initialized {
             return None;

@@ -268,6 +268,9 @@ impl<D> Runtime<D> {
                             if let Some(n) = coop {
                                 crate::task::coop::set(n);
                             }
+                            // With thousands of tasks their memory is cold: let the next one
+                            // load while this one runs.
+                            self.context.tasks.prefetch_next();
                             if lifo {
                                 self.context.tasks.set_use_slot(true);
                                 t.run();
