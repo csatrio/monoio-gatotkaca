@@ -509,6 +509,7 @@ impl IoUringDriver {
             while let Some(w) = inner.waker_consumer.pop(&inner.waker_queue) {
                 w.wake();
                 need_wait = false;
+                metric!(crate::runtime_stats::note_remote_wakes(1));
             }
 
             // Set status as not awake if we are going to sleep
@@ -526,6 +527,7 @@ impl IoUringDriver {
             while let Some(w) = inner.waker_consumer.pop(&inner.waker_queue) {
                 w.wake();
                 need_wait = false;
+                metric!(crate::runtime_stats::note_remote_wakes(1));
             }
         }
 

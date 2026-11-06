@@ -105,7 +105,6 @@ impl crate::runtime::Context {
 /// Count `n` foreign wakers drained by the current runtime. Hook for the driver's park (`sync`);
 /// does nothing outside a runtime.
 #[cfg(feature = "sync")]
-#[allow(dead_code)]
 #[inline]
 pub(crate) fn note_remote_wakes(n: u64) {
     CURRENT.try_with(|ctx| {

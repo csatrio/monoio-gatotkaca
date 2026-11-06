@@ -603,7 +603,11 @@ async fn accept_loop(st: Rc<ServerState>, l: TcpListener, bulk: bool, multi: boo
 }
 
 #[cfg(feature = "metrics")]
-fn metrics_delta(a: &monoio::DriverStats, b: &monoio::DriverStats, secs: f64) -> (String, String) {
+fn metrics_delta(
+    (a, ra): (&monoio::DriverStats, &monoio::RuntimeStats),
+    (b, rb): (&monoio::DriverStats, &monoio::RuntimeStats),
+    secs: f64,
+) -> (String, String) {
     let accept = monoio::uring::opcode::Accept::CODE as usize;
     let d = |x: u64, y: u64| y.saturating_sub(x);
     let cpt: Vec<String> = a
@@ -631,8 +635,44 @@ fn metrics_delta(a: &monoio::DriverStats, b: &monoio::DriverStats, secs: f64) ->
     }
     line += &format!(" cqes_per_tick=[{}]", cpt.join(","));
     json += &format!("\"cqes_per_tick\":[{}]", cpt.join(","));
-    // TODO(merge): runtime_stats() delta (rounds, ticks_submit, parks, tasks_polled,
-    // ready_queue_len, budget_exhausted_rounds, ...) goes here, in `line` and `json`.
+    let r = [
+        ("rounds", d(ra.rounds, rb.rounds)),
+        ("submits", d(ra.submits, rb.submits)),
+        ("parks", d(ra.parks, rb.parks)),
+        ("park_ms", d(ra.park_ns, rb.park_ns) / 1_000_000),
+        ("busy_ms", d(ra.busy_ns, rb.busy_ns) / 1_000_000),
+        ("tasks_polled", d(ra.tasks_polled, rb.tasks_polled)),
+        (
+            "budget_exhausted_rounds",
+            d(ra.budget_exhausted_rounds, rb.budget_exhausted_rounds),
+        ),
+        ("coop_yields", d(ra.coop_yields, rb.coop_yields)),
+        ("lifo_polls", d(ra.lifo_polls, rb.lifo_polls)),
+    ];
+    line += "\nruntime delta:";
+    json += ",\"runtime\":{";
+    for (k, v) in r {
+        line += &format!(" {k}={v} ({:.0}/s)", v as f64 / secs);
+        json += &format!("\"{k}\":{v},");
+    }
+    let ppr: Vec<String> = ra
+        .polls_per_round
+        .iter()
+        .zip(&rb.polls_per_round)
+        .map(|(x, y)| d(*x, *y).to_string())
+        .collect();
+    line += &format!(
+        " polls_per_round=[{}] queue_len={} queue_high_water={}",
+        ppr.join(","),
+        rb.ready_queue_len,
+        rb.ready_queue_high_water
+    );
+    json += &format!(
+        "\"polls_per_round\":[{}],\"queue_len\":{},\"queue_high_water\":{}}}",
+        ppr.join(","),
+        rb.ready_queue_len,
+        rb.ready_queue_high_water
+    );
     json += "}";
     (line, json)
 }
@@ -692,14 +732,18 @@ fn server_thread(
         st.window.set(Some(w));
         sleep_until(w.start).await;
         #[cfg(feature = "metrics")]
-        let s0 = monoio::driver_stats();
+        let s0 = (monoio::driver_stats(), monoio::runtime_stats());
         sleep_until(w.end).await;
         let control_late_ms = Instant::now()
             .saturating_duration_since(w.end)
             .as_secs_f64()
             * 1e3;
         #[cfg(feature = "metrics")]
-        let metrics = metrics_delta(&s0, &monoio::driver_stats(), a.duration);
+        let metrics = metrics_delta(
+            (&s0.0, &s0.1),
+            (&monoio::driver_stats(), &monoio::runtime_stats()),
+            a.duration,
+        );
         let _ = res_tx.send(ServerResult {
             accepts_window: st.accepts_window.get(),
             accepts_peak_1s: st
