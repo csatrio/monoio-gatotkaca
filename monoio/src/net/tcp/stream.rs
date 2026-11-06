@@ -7,7 +7,7 @@ use std::{
 };
 
 use {
-    libc::{shutdown, AF_INET, AF_INET6, SHUT_WR, SOCK_STREAM},
+    libc::{AF_INET, AF_INET6, SHUT_WR, SOCK_STREAM},
     std::os::unix::prelude::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
 };
 
@@ -140,18 +140,28 @@ impl TcpStream {
     }
 
     /// Get the value of the `TCP_NODELAY` option on this socket.
+    ///
+    /// `Unsupported` on a direct-only stream ([`is_direct`](Self::is_direct)): the kernel's
+    /// ring `getsockopt` only knows `SOL_SOCKET` options (see
+    /// [`get_sockopt`](Self::get_sockopt)).
     #[inline]
     pub fn nodelay(&self) -> io::Result<bool> {
         self.meta.no_delay()
     }
 
     /// Set the value of the `TCP_NODELAY` option on this socket.
+    ///
+    /// `Unsupported` on a direct-only stream ([`is_direct`](Self::is_direct)), which has no
+    /// fd for the syscall: use [`set_nodelay_async`](Self::set_nodelay_async) there.
     #[inline]
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         self.meta.set_no_delay(nodelay)
     }
 
     /// Set the value of the `SO_KEEPALIVE` option on this socket.
+    ///
+    /// `Unsupported` on a direct-only stream ([`is_direct`](Self::is_direct)): use
+    /// [`set_tcp_keepalive_async`](Self::set_tcp_keepalive_async) there.
     #[inline]
     pub fn set_tcp_keepalive(
         &self,
@@ -218,10 +228,16 @@ impl TcpStream {
     /// [`TcpListener::accept_direct`] or
     /// [`accept_multi_direct`](crate::net::TcpListener::accept_multi_direct)).
     ///
-    /// Such a stream supports all the IO ops and [`shutdown`](AsyncWriteRent::shutdown) (as
-    /// `IORING_OP_SHUTDOWN`). Everything that needs an fd fails with `Unsupported` instead:
-    /// [`local_addr`](Self::local_addr), [`nodelay`](Self::nodelay) and the other socket
-    /// options (set them on the listener, accepted sockets inherit them), and
+    /// Such a stream supports all the IO ops, [`shutdown`](AsyncWriteRent::shutdown) and
+    /// [`shutdown_with`](Self::shutdown_with) (as `IORING_OP_SHUTDOWN`), and socket options
+    /// through the ring (Linux 6.7+): [`set_sockopt`](Self::set_sockopt),
+    /// [`set_nodelay_async`](Self::set_nodelay_async),
+    /// [`set_tcp_keepalive_async`](Self::set_tcp_keepalive_async), and
+    /// [`get_sockopt`](Self::get_sockopt) for `SOL_SOCKET` options. Everything that needs an
+    /// fd fails with `Unsupported` instead: [`local_addr`](Self::local_addr), the synchronous
+    /// option calls ([`nodelay`](Self::nodelay), [`set_nodelay`](Self::set_nodelay),
+    /// [`set_tcp_keepalive`](Self::set_tcp_keepalive): a synchronous call cannot wait for a
+    /// ring completion; options set on the listener are inherited instead), and
     /// [`peer_addr`](Self::peer_addr) unless the accept reported it.
     /// [`as_raw_fd`](AsRawFd::as_raw_fd) returns `-1`, and
     /// [`into_raw_fd`](IntoRawFd::into_raw_fd) panics.
@@ -552,22 +568,7 @@ impl CancelableAsyncReadRent for TcpStream {
 /// `shutdown(SHUT_WR)`: a direct syscall (no op needed), or `IORING_OP_SHUTDOWN` (5.11+) for a
 /// direct-only socket, which has no fd.
 fn shutdown_write(fd: &SharedFd) -> impl Future<Output = io::Result<()>> {
-    let now = if fd.is_direct() {
-        None
-    } else {
-        Some(match unsafe { shutdown(fd.raw_fd(), SHUT_WR) } {
-            -1 => Err(io::Error::last_os_error()),
-            _ => Ok(()),
-        })
-    };
-    let op = now.is_none().then(|| Op::shutdown(fd, SHUT_WR));
-    async move {
-        match (now, op) {
-            (Some(res), _) => res,
-            (None, Some(op)) => op?.result().await,
-            (None, None) => Ok(()),
-        }
-    }
+    crate::driver::op::shutdown::shutdown(fd, SHUT_WR)
 }
 
 struct StreamMeta {
@@ -593,6 +594,14 @@ impl StreamMeta {
 
     fn socket(&self) -> io::Result<&socket2::Socket> {
         self.socket.as_ref().ok_or_else(direct_only_error)
+    }
+
+    /// The socket for a synchronous option call. A direct-only socket has none; the error
+    /// names the async calls that work there.
+    fn option_socket(&self) -> io::Result<&socket2::Socket> {
+        self.socket
+            .as_ref()
+            .ok_or_else(super::sockctl::direct_only_option_error)
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -628,11 +637,11 @@ impl StreamMeta {
     }
 
     fn no_delay(&self) -> io::Result<bool> {
-        self.socket()?.tcp_nodelay()
+        self.option_socket()?.tcp_nodelay()
     }
 
     fn set_no_delay(&self, no_delay: bool) -> io::Result<()> {
-        self.socket()?.set_tcp_nodelay(no_delay)
+        self.option_socket()?.set_tcp_nodelay(no_delay)
     }
 
     #[allow(unused_variables)]
@@ -652,7 +661,7 @@ impl StreamMeta {
         if let Some(retries) = retries {
             t = t.with_retries(retries)
         }
-        self.socket()?.set_tcp_keepalive(&t)
+        self.option_socket()?.set_tcp_keepalive(&t)
     }
 
     #[cfg(feature = "zero-copy")]
