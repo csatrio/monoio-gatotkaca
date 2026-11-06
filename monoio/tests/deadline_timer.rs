@@ -522,3 +522,297 @@ fn sleep_follows_its_task() {
         );
     });
 }
+
+// ===== short and long timers, idle and busy loop =====
+//
+// What the driver does behind these (r3-timer) and what must not show:
+// - The wheel only moves when a timer is due, so after a while without timers it is behind the
+//   clock, and a new timer is placed relative to an old time.
+// - With the fresh list, a timer that expires 64 ms or more after the wheel's time waits on a
+//   list before it gets a slot: every timer of 64 ms and more, and short ones on a wheel that is
+//   behind.
+// A timer fires at its time either way.
+
+/// Sleeps `ms` milliseconds and checks that it took at least that long, and not absurdly more.
+async fn checked_sleep(ms: u64) {
+    let start = Instant::now();
+    sleep(Duration::from_millis(ms)).await;
+    let took = start.elapsed();
+    assert!(
+        took >= Duration::from_millis(ms),
+        "sleep({ms} ms) took {took:?}"
+    );
+    assert!(took < LATE, "sleep({ms} ms) took {took:?}");
+}
+
+/// The timer mix of the two tests below.
+async fn timer_mix() {
+    // One after the other, on a wheel that is up to date after the first.
+    for ms in [0, 1, 5, 63, 64, 65, 70, 100] {
+        checked_sleep(ms).await;
+    }
+    // Short ones on a wheel that is 80 ms behind: no timer is registered meanwhile, so the
+    // driver does not move it, and these are 80 ms and more from its time.
+    for ms in [0, 1, 5] {
+        std::thread::sleep(80 * MS);
+        checked_sleep(ms).await;
+    }
+    // Many at once, short and long mixed, on a stale wheel again.
+    std::thread::sleep(80 * MS);
+    let tasks: Vec<_> = (0..300u64)
+        .map(|i| monoio::spawn(checked_sleep(i * 7 % 150)))
+        .collect();
+    for task in tasks {
+        task.await;
+    }
+    // A timeout that expires, between timeouts that do not.
+    for _ in 0..200 {
+        assert_eq!(timeout(Duration::from_secs(10), yield_once()).await, Ok(()));
+    }
+    let start = Instant::now();
+    assert!(timeout(70 * MS, pending::<()>()).await.is_err());
+    assert!(start.elapsed() >= 70 * MS && start.elapsed() < LATE);
+}
+
+/// Runs `test` on its own thread and fails if it does not finish: timers that stall would hang
+/// the runtime (its own timeouts could not end the test).
+fn with_watchdog(what: &str, test: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        test();
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(()) => thread.join().expect("test thread"),
+        // The thread panicked: show its message.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            std::panic::resume_unwind(thread.join().unwrap_err())
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{what}: not finished after 60 s (timers stalled)")
+        }
+    }
+}
+
+/// Idle loop: the runtime parks between the timers.
+#[test]
+fn timers_fire_on_time_idle() {
+    with_watchdog("idle", || runtime().block_on(timer_mix()));
+}
+
+/// Busy loop: tasks that are always ready, so the runtime never parks and timers are only seen
+/// by the cold-path submit.
+#[test]
+fn timers_fire_on_time_busy() {
+    for budget in [None, Some(1), Some(16)] {
+        with_watchdog("busy", move || {
+            let mut builder = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new();
+            if let Some(n) = budget {
+                builder = builder.task_budget(n);
+            }
+            let mut rt = builder.enable_timer().build().expect("runtime");
+            rt.block_on(async {
+                let stop = Rc::new(Cell::new(false));
+                for _ in 0..8 {
+                    let stop = stop.clone();
+                    monoio::spawn(async move {
+                        while !stop.get() {
+                            yield_once().await;
+                        }
+                    });
+                }
+                // In a task: the main future is not polled in a round of its own.
+                monoio::spawn(timer_mix()).await;
+                stop.set(true);
+            });
+        });
+    }
+}
+
+/// Intervals: a period that goes through the fresh list and one that does not.
+#[test]
+fn intervals_tick_on_time() {
+    runtime().block_on(async {
+        for (period, ticks) in [(70u64, 4u32), (3, 30)] {
+            let period = Duration::from_millis(period);
+            let start = Instant::now();
+            let mut interval = monoio::time::interval(period);
+            for n in 0..ticks {
+                let scheduled = interval.tick().await;
+                let now = Instant::now();
+                assert!(now >= scheduled, "tick {n} came early");
+                assert!(
+                    now >= start + period * n,
+                    "tick {n} of {period:?} after {:?}",
+                    now - start
+                );
+                assert!(now - start < LATE + period * n);
+            }
+        }
+    });
+}
+
+/// The per-request `timeout`: registered on the first poll, dropped when the request is done,
+/// tens of thousands of times, with the runtime parking now and then. Nothing is left behind
+/// for the flush that the last sleep forces, and timers still fire on time afterwards.
+#[test]
+fn timeouts_dropped_young_leave_nothing_behind() {
+    runtime().block_on(async {
+        monoio::spawn(async {
+            for i in 0..30_000u32 {
+                let res = timeout(Duration::from_secs(10), yield_once()).await;
+                assert_eq!(res, Ok(()));
+                // Reset while fresh, then dropped.
+                let mut s = pin!(sleep(Duration::from_secs(5)));
+                assert!(poll_fn(|cx| Poll::Ready(s.as_mut().poll(cx).is_pending())).await);
+                s.as_mut()
+                    .reset(Instant::now() + Duration::from_secs(i as u64 % 7 + 1));
+                if i % 3000 == 0 {
+                    checked_sleep(1).await;
+                }
+            }
+        })
+        .await;
+        checked_sleep(100).await;
+        checked_sleep(1).await;
+    });
+}
+
+// ===== timers used from inside a wake =====
+
+thread_local! {
+    /// What the hook waker runs when the driver wakes it.
+    static IN_WAKE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A waker that runs `IN_WAKE` (code that uses timers) and then wakes the task. The driver calls
+/// it while it fires timers.
+struct Hook {
+    task: std::task::Waker,
+}
+
+impl std::task::Wake for Hook {
+    fn wake(self: std::sync::Arc<Self>) {
+        let hook = IN_WAKE.with(|f| f.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+        }
+        self.task.wake_by_ref();
+    }
+}
+
+/// Polls `fut` with the hook waker until it is ready.
+async fn with_hook<F: Future>(fut: F) -> F::Output {
+    let mut fut = pin!(fut);
+    poll_fn(|cx| {
+        let hook = std::task::Waker::from(std::sync::Arc::new(Hook {
+            task: cx.waker().clone(),
+        }));
+        fut.as_mut()
+            .poll(&mut std::task::Context::from_waker(&hook))
+    })
+    .await
+}
+
+/// A waker that the driver calls may create, arm, reset and drop timers: the driver does not
+/// hold its wheel then. A timer registered there fires on time, also one that is already due.
+#[test]
+fn timers_registered_inside_a_wake() {
+    runtime().block_on(async {
+        let later = Rc::new(std::cell::RefCell::new(Box::pin(Deadline::new())));
+        let due = Rc::new(std::cell::RefCell::new(Box::pin(Deadline::new())));
+        let armed_at = Rc::new(Cell::new(None));
+        let (later2, due2, armed_at2) = (later.clone(), due.clone(), armed_at.clone());
+        IN_WAKE.with(|f| {
+            *f.borrow_mut() = Some(Box::new(move || {
+                armed_at2.set(Some(Instant::now()));
+                later2
+                    .borrow_mut()
+                    .as_mut()
+                    .arm_at(Instant::now() + 15 * MS);
+                // Already due when it is registered.
+                due2.borrow_mut().as_mut().arm_at(Instant::now() - MS);
+                // Created, registered and dropped right here: near (a slot) and far (fresh).
+                for after in [3 * MS, Duration::from_secs(3)] {
+                    let mut tmp = Box::pin(Deadline::new());
+                    tmp.as_mut().arm(after);
+                    drop(tmp);
+                }
+            }));
+        });
+
+        with_hook(sleep(10 * MS)).await;
+        let armed_at: Instant = armed_at.get().expect("the hook did not run");
+
+        // The hook ran and is gone, so these are the only references.
+        let mut due = Rc::try_unwrap(due).expect("hook is gone").into_inner();
+        let mut later = Rc::try_unwrap(later).expect("hook is gone").into_inner();
+        assert!(timeout(LATE, with_deadline(due.as_mut(), pending::<()>()))
+            .await
+            .expect("a timer that was due when registered in a wake did not fire")
+            .is_err());
+        assert!(with_deadline(later.as_mut(), pending::<()>())
+            .await
+            .is_err());
+        let took = armed_at.elapsed();
+        assert!(took >= 15 * MS && took < LATE, "fired after {took:?}");
+    });
+}
+
+/// A waker that drops and resets other timers which expire in the same pass of the driver
+/// (they wait on the wheel's pending list at that moment).
+#[test]
+fn timers_dropped_and_reset_inside_a_wake() {
+    runtime().block_on(async {
+        let at = Instant::now() + 10 * MS;
+        // Registered first, so it is the first of its slot to fire. Its waker runs the hook.
+        let mut first = Box::pin(monoio::time::sleep_until(at));
+        assert!(
+            with_hook(poll_fn(|cx| Poll::Ready(
+                first.as_mut().poll(cx).is_pending()
+            )))
+            .await
+        );
+        // Three more timers for the same tick, registered (polled once) by this task.
+        let mut victims = Vec::new();
+        for _ in 0..3 {
+            let mut s = Box::pin(monoio::time::sleep_until(at));
+            assert!(poll_fn(|cx| Poll::Ready(s.as_mut().poll(cx).is_pending())).await);
+            victims.push(s);
+        }
+        let kept = Rc::new(std::cell::RefCell::new(victims.pop().unwrap()));
+        let kept2 = kept.clone();
+        let in_pass = Rc::new(Cell::new(false));
+        let in_pass2 = in_pass.clone();
+        IN_WAKE.with(|f| {
+            *f.borrow_mut() = Some(Box::new(move || {
+                // The others are due in this pass and have not fired yet.
+                in_pass2.set(victims.iter().all(|s| !s.is_elapsed()));
+                // Two are dropped, one is pushed out by 20 ms.
+                victims.clear();
+                kept2.borrow_mut().as_mut().reset(at + 20 * MS);
+            }));
+        });
+
+        with_hook(first).await;
+        assert!(
+            IN_WAKE.with(|f| f.borrow().is_none()),
+            "the hook did not run"
+        );
+        assert!(
+            in_pass.get(),
+            "the other timers fired before the hook ran: the test did not test the pending list"
+        );
+
+        let kept = Rc::try_unwrap(kept).expect("hook is gone").into_inner();
+        kept.await;
+        let now = Instant::now();
+        assert!(
+            now >= at + 20 * MS,
+            "the reset timer fired {:?} early",
+            at + 20 * MS - now
+        );
+        assert!(now - at < LATE);
+    });
+}
