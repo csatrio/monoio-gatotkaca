@@ -1,6 +1,7 @@
 use std::{
     future::Future,
     io,
+    mem::ManuallyDrop,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -163,6 +164,61 @@ impl<T: OpAble> Op<T> {
     pub(crate) fn op_canceller(&self) -> OpCanceller {
         OpCanceller { index: self.index }
     }
+
+    /// Poll for the result of the operation.
+    ///
+    /// Once this returned `Ready` the op is finished: its slot is released and `index` is
+    /// `usize::MAX`, so dropping the op no longer calls into the driver. The data is still in
+    /// the op; [`finish`](Self::finish) takes it out.
+    ///
+    /// # Panics
+    /// If polled again after `Ready`.
+    #[inline]
+    pub(crate) fn poll_meta(&mut self, cx: &mut Context<'_>) -> Poll<CompletionMeta> {
+        // Coop budget (off: one TLS load). When spent, yield even if the result is ready: it
+        // stays in the op slot and is returned on the next poll.
+        let budget = ready!(crate::task::coop::poll_proceed(cx));
+        if self.index == usize::MAX {
+            unexpected_state();
+        }
+        let meta = ready!(self.driver.poll_op(self.index, cx));
+        crate::task::coop::consume(budget);
+
+        self.index = usize::MAX;
+        Poll::Ready(meta)
+    }
+
+    /// Take a finished op (one whose [`poll_meta`](Self::poll_meta) returned `meta`) apart.
+    ///
+    /// Consumes the op without running `Op::drop`: the only thing left to release is the
+    /// driver handle, which is dropped here, inline.
+    ///
+    /// # Panics
+    /// If the op is not finished, or its data was taken already.
+    #[inline]
+    pub(crate) fn finish(self, meta: CompletionMeta) -> Completion<T> {
+        if self.index != usize::MAX || self.data.is_none() {
+            // Unwinds through `Op::drop`, which keeps the data of an in-flight op alive.
+            unexpected_state();
+        }
+        let me = ManuallyDrop::new(self);
+        // SAFETY: `me` is never dropped, so both fields are moved out exactly once (`index`
+        // needs no drop), and `data` was checked to be `Some`.
+        unsafe {
+            drop(std::ptr::read(&me.driver));
+            Completion {
+                data: std::ptr::read(&me.data).unwrap_unchecked(),
+                meta,
+            }
+        }
+    }
+}
+
+/// An op was polled after it completed, or taken apart before.
+#[cold]
+#[inline(never)]
+fn unexpected_state() -> ! {
+    panic!("unexpected operation state")
 }
 
 impl<T> Future for Op<T>
@@ -171,26 +227,25 @@ where
 {
     type Output = Completion<T>;
 
+    #[inline]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Coop budget (off: one TLS load). When spent, yield even if the result is ready: it
-        // stays in the op slot and is returned on the next poll.
-        let budget = ready!(crate::task::coop::poll_proceed(cx));
         let me = &mut *self;
-        let data_mut = me.data.as_mut().expect("unexpected operation state");
-        let meta = ready!(me.driver.poll_op::<T>(data_mut, me.index, cx));
-        crate::task::coop::consume(budget);
-
-        me.index = usize::MAX;
-        let data = me.data.take().expect("unexpected operation state");
-        Poll::Ready(Completion { data, meta })
+        let meta = ready!(me.poll_meta(cx));
+        match me.data.take() {
+            Some(data) => Poll::Ready(Completion { data, meta }),
+            None => unexpected_state(),
+        }
     }
 }
 
 impl<T: OpAble> Drop for Op<T> {
     #[inline]
     fn drop(&mut self) {
-        self.driver
-            .drop_op(self.index, &mut self.data, T::SKIP_CANCEL);
+        // A finished op (the usual case) has nothing left in the driver: no call.
+        if self.index != usize::MAX {
+            self.driver
+                .drop_op(self.index, &mut self.data, T::SKIP_CANCEL);
+        }
     }
 }
 

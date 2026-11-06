@@ -114,12 +114,8 @@ impl Inner {
         UringInner::submit_with_data(&self.0, data)
     }
 
-    fn poll_op<T: OpAble>(
-        &self,
-        _data: &mut T,
-        index: usize,
-        cx: &mut Context<'_>,
-    ) -> Poll<CompletionMeta> {
+    #[inline]
+    fn poll_op(&self, index: usize, cx: &mut Context<'_>) -> Poll<CompletionMeta> {
         UringInner::poll_op(&self.0, index, cx)
     }
 
