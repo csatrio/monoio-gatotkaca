@@ -494,7 +494,10 @@ async fn detach_copies_and_recycles_at_once() {
 async fn stats_count_use_and_enobufs() {
     let Some(ring) = ring(28, 2, 16) else { return };
     let (a, mut b) = UnixStream::pair().unwrap();
-    assert_eq!(ring.stats(), Default::default());
+    // A new ring: nothing counted, every buffer published.
+    let mut fresh = uring::BufRingStats::default();
+    fresh.published = 2;
+    assert_eq!(ring.stats(), fresh);
 
     b.write_all(b"1").unwrap();
     let first = ring.take(recv_one(&a, &ring).await).unwrap();

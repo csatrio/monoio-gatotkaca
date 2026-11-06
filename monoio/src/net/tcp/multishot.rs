@@ -276,8 +276,10 @@ impl TcpStream {
 ///
 /// - EOF (a 0-length completion) ends the stream: `next` returns `None`.
 /// - `ENOBUFS`: the ring had no free buffer. The kernel ends the multishot, so `next` returns
-///   `Err(ENOBUFS)` once and then `None`. Release buffers, then call `recv_multi` again to
-///   re-arm; no data is lost.
+///   `Err(ENOBUFS)` once and then `None`; no data is lost. To continue, release buffers and
+///   call [`rearm_on`](Self::rearm_on) (the same ring or another one), or `recv_multi` again.
+///   [`next_rearm`](Self::next_rearm) does all of that itself: it waits for a free buffer,
+///   re-arms and never yields `ENOBUFS`.
 /// - Chunks received while nobody polls are queued (without bound, but each holds a ring
 ///   buffer, so the ring size bounds them in practice).
 /// - If the kernel ends the multishot after a chunk without an error (a bundle recv does that
@@ -306,6 +308,77 @@ impl RecvStream {
     /// The next received buffer; `None` after EOF, cancel, or an error that ended the recv.
     pub async fn next(&mut self) -> Option<io::Result<SelectedBuf>> {
         std::future::poll_fn(|cx| self.op.poll_next_buf(cx, OnEnobufs::Yield)).await
+    }
+
+    /// Like [`next`](Self::next), but it never yields `ENOBUFS`: when the kernel ended the
+    /// recv because the ring had no free buffer, it waits until one is free, re-arms the recv
+    /// and continues. No data is lost, and nothing is copied (unlike
+    /// [`read_into`](Self::read_into)).
+    ///
+    /// - It does not poll for a buffer: the task sleeps until a buffer of the ring is recycled
+    ///   (or published, see [`BufRing::grow_published`]). Each buffer that becomes free wakes
+    ///   one waiting stream, the one that waits longest, and that stream has the buffer to
+    ///   itself until its recv completes; so a ring smaller than the number of busy
+    ///   connections costs a re-arm per starved recv, not a retry storm.
+    /// - It is still the slow path: while the ring is short of buffers, a recv is ended by
+    ///   the kernel again as soon as it used the buffer it was woken for, so every chunk costs
+    ///   a re-arm (one SQE, one extra completion, about three task polls). Size the ring, or
+    ///   its working set, so that this is the exception.
+    /// - A ring with a [working set](crate::uring::BufRingOptions::working_set) that can still
+    ///   grow grows instead of making the stream wait.
+    /// - On a ring without a working set (and not incremental), buffers the kernel used for
+    ///   chunks that other streams have queued but not polled yet look free to the ring. A
+    ///   re-arm made because of them can end with `ENOBUFS` once more; the stream then waits
+    ///   for the next buffer that really comes back. It never spins.
+    /// - Buffers you hold yourself count: a task that keeps every buffer of the ring and then
+    ///   calls `next_rearm` waits forever.
+    /// - Mixing with [`next`](Self::next) and [`read_into`](Self::read_into) is fine; a wait
+    ///   that `next_rearm` began is finished by whichever is called next.
+    /// - Cancel safe: dropping the future loses nothing, the wait continues with the next call.
+    pub async fn next_rearm(&mut self) -> Option<io::Result<SelectedBuf>> {
+        std::future::poll_fn(|cx| self.op.poll_next_buf(cx, OnEnobufs::Wait)).await
+    }
+
+    /// Poll form of [`next_rearm`](Self::next_rearm).
+    pub fn poll_next_rearm(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<io::Result<SelectedBuf>>> {
+        self.op.poll_next_buf(cx, OnEnobufs::Wait)
+    }
+
+    /// Continue on another ring (of the same runtime), keeping the stream: for example from a
+    /// small, hot ring to a large one at the first `ENOBUFS`.
+    ///
+    /// Nothing is lost or reordered, because the recv on `ring` is only submitted once the
+    /// recv on the old ring has ended and all its chunks were yielded:
+    ///
+    /// - **The old recv has ended** (the stream yielded `ENOBUFS` or another error, or the
+    ///   kernel ended it and the re-arm is due): the next poll submits the recv on `ring`. A
+    ///   wait for a buffer of the old ring that [`next_rearm`](Self::next_rearm) began is
+    ///   dropped. Called with the ring it already uses, this is a plain re-arm in place.
+    /// - **The old recv is still in flight:** it is cancelled (AsyncCancel). The stream goes
+    ///   on yielding what it received into the old ring, in order: the chunks already queued
+    ///   and those the kernel posts until the cancel takes effect. When its last completion
+    ///   was taken, the recv on `ring` is submitted; bytes that arrived meanwhile are still in
+    ///   the socket. If the old recv ends with an error instead, the stream yields it and
+    ///   ends, as without the move. Called with the ring it already uses, nothing happens.
+    ///   The cancel is best effort, like [`cancel`](Self::cancel): if it could not be queued
+    ///   (a full SQ that the kernel does not take), the stream stays on the old ring until
+    ///   that recv ends; calling `rearm_on` with the same ring again repeats the cancel.
+    ///
+    /// The chunks of the old ring keep their buffers until you drop them, as always. After
+    /// EOF or [`cancel`](Self::cancel) the stream stays ended and the call does nothing.
+    /// An error of the submit shows up in `next`.
+    ///
+    /// Fails with `InvalidInput` if `ring` belongs to another runtime.
+    pub fn rearm_on(&mut self, ring: &BufRing) -> io::Result<()> {
+        self.op.rearm_on(ring)
+    }
+
+    /// The ring the stream receives into (after [`rearm_on`](Self::rearm_on): the new one).
+    pub fn ring(&self) -> &BufRing {
+        self.op.ring()
     }
 
     /// Append what was received to `dst` and give the buffers back to the ring at once.
