@@ -392,9 +392,9 @@ besides W1-sched's, and the lead applies them at merge.
 
 | Wave / gate | State |
 |---|---|
-| seed | not started |
-| 0 | not started |
-| G0 | not started |
+| seed | done (`a4de6cf`, tag `r2-base`) |
+| 0 | done (tag `r2-wave0`): W0-metrics, W0-rtstats, W0-repro; fixups: `remote_wakes` hook, runtime stats in `fairness` |
+| G0 | done ([round2/G0.md](round2/G0.md)): M1 = one accept per round (multishot accept fixes it); M2 = intra-round wakes wait a full traversal under a fixed budget; M4 = same cause as M1, W1-bufzc dropped; baseline: no regression vs 0.7.1 |
 | 1 | not started |
 | G1 + G2 | not started |
 | 2 | not started |
