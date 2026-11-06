@@ -2,6 +2,10 @@
 //! (most ops: a fd handle, a buffer handle, a few integers) is stored inline, so the drop does
 //! not allocate; large data is boxed. Either way the data is dropped exactly once, after the
 //! op completed. A counting allocator (per thread) checks the allocations.
+//!
+//! The inline limit is 48 bytes of op data (alignment 8). A receive into `Tracked<0>` is
+//! exactly that (8 for the fd handle, 32 for the buffer, 6 for the flags, padded), one into
+//! `Tracked<8>` is the first size over it. `slot_drop_alloc.rs` has the real buffer types.
 #![cfg(feature = "async-cancel")]
 
 use std::{
@@ -188,6 +192,31 @@ async fn large_data_is_boxed() {
 
     settle().await;
     assert_eq!(drops.get(), N);
+    settle().await;
+    assert_eq!(drops.get(), N);
+}
+
+/// The first op data size over the inline limit (56 bytes) is boxed: the limit is 48, not
+/// more.
+#[monoio::test(timer_enabled = true)]
+async fn data_just_over_the_limit_is_boxed() {
+    let (_client, server) = tcp_pair().await;
+    let drops = Rc::new(Cell::new(0));
+    drop_in_flight::<8>(&server, &drops).await;
+    settle().await;
+    drops.set(0);
+
+    #[cfg(feature = "metrics")]
+    monoio::reset_driver_stats();
+    let made = drop_in_flight::<8>(&server, &drops).await;
+    assert_eq!(made, N as u64, "one box per op");
+    #[cfg(feature = "metrics")]
+    let s = monoio::driver_stats();
+    #[cfg(feature = "metrics")]
+    assert_eq!(s.ignored_boxed, N as u64, "{s:?}");
+    #[cfg(feature = "metrics")]
+    assert_eq!(s.ignored_inline, 0);
+
     settle().await;
     assert_eq!(drops.get(), N);
 }

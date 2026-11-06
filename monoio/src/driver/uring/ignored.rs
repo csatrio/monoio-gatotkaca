@@ -13,6 +13,10 @@ use std::{
 
 /// Bytes of op data stored inline. Covers `Recv`/`Send`/`Read`/`Write` with a `Vec<u8>`,
 /// `Box<[u8]>`, `Bytes` or `BytesMut` buffer and the fixed-buffer ops.
+///
+/// This is what fits a one-line op slot: 64 bytes less the drop function and the word that
+/// holds the state's tag and the slot's meta (`lifecycle::tests::slot_is_one_cache_line`).
+/// One byte more costs every op slot a second cache line.
 pub(crate) const INLINE_SIZE: usize = 48;
 
 /// Largest alignment of inline data (that of the storage).
