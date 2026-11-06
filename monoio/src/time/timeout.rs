@@ -20,6 +20,20 @@ use crate::time::{error::Elapsed, sleep_until, Duration, Instant, Sleep};
 /// value is returned. Otherwise, an error is returned and the future is
 /// canceled.
 ///
+/// The duration counts from the exact clock ([`Instant::now`], one clock read
+/// per call), so the deadline never comes early, also when the task has been
+/// running for long before the call. Where a deadline that is early by up to one
+/// round of tasks is fine (request timeouts in seconds), these are cheaper:
+///
+/// - [`timeout_coarse`]: the same with the coarse clock, no clock read;
+/// - [`Deadline`](crate::time::Deadline): one timer per connection that is armed
+///   and disarmed around each request, two stores per request and no insert
+///   into the timer wheel.
+///
+/// `future` is moved into the returned `Timeout`. For a large one pass a pinned
+/// reference instead (`std::pin::pin!(future)`): a `Pin<&mut F>` is a future
+/// too, and nothing is copied.
+///
 /// # Cancelation
 ///
 /// Cancelling a timeout is done by dropping the future. No additional cleanup
@@ -38,6 +52,52 @@ where
         None => Sleep::far_future(),
     };
     Timeout::new_with_delay(future, delay)
+}
+
+/// [`timeout`] with the coarse clock: require a `Future` to complete before
+/// `duration` has elapsed since [`Instant::recent`].
+///
+/// No clock read, and the timer's place in the wheel is computed without one:
+/// cheaper than [`timeout`] by what `Instant::now()` costs and a little more.
+/// The timer is still inserted into the wheel on the first poll and removed
+/// when the `Timeout` is dropped; a [`Deadline`](crate::time::Deadline) avoids
+/// that too.
+///
+/// The price: the coarse clock lags the real one by less than one round of
+/// tasks, so the deadline can come **early** by that lag (and up to 2 ms late:
+/// the clock value and the duration are both rounded up to the wheel's
+/// millisecond). Use it for deadlines that are long compared to a round.
+/// [`timeout`] keeps the exact clock.
+///
+/// [`Sleep::deadline`] of the timer inside is `Instant::recent() + duration`.
+///
+/// # Panics
+///
+/// Outside a runtime, and in a runtime built without `enable_timer`, like
+/// [`timeout`].
+///
+/// # Examples
+///
+/// ```
+/// use monoio::time::{timeout_coarse, Duration};
+///
+/// # async fn serve_one_request() {}
+/// # #[monoio::main(timer_enabled = true)]
+/// # async fn main() {
+/// if timeout_coarse(Duration::from_secs(10), serve_one_request())
+///     .await
+///     .is_err()
+/// {
+///     println!("request timed out");
+/// }
+/// # }
+/// ```
+#[inline(always)]
+pub fn timeout_coarse<T>(duration: Duration, future: T) -> Timeout<T>
+where
+    T: Future,
+{
+    Timeout::new_with_delay(future, Sleep::new_coarse(duration))
 }
 
 /// Require a `Future` to complete before the specified instant in time.

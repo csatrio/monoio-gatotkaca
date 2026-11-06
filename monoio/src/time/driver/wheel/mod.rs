@@ -42,6 +42,14 @@ pub(crate) struct Wheel {
     pending: EntryList,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `(inserts, removes)` of this thread's wheels: the calls a timer's owner causes
+    /// (`Handle::reregister`, the drop of a registered entry). Entries the wheel itself moves or
+    /// fires are not counted. Only in the crate's unit tests.
+    pub(crate) static OPS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// Number of levels. Each level has 64 slots. By using 6 levels with 64 slots
 /// each, the timer is able to track time up to 2 years into the future with a
 /// precision of 1 millisecond.
@@ -112,6 +120,8 @@ impl Wheel {
         unsafe {
             self.levels.get_unchecked_mut(level).add_entry(item);
         }
+        #[cfg(test)]
+        OPS.with(|ops| ops.set((ops.get().0 + 1, ops.get().1)));
 
         debug_assert!({
             unsafe { self.levels.get_unchecked(level) }
@@ -125,6 +135,8 @@ impl Wheel {
 
     /// Remove `item` from the timing wheel.
     pub(crate) unsafe fn remove(&mut self, item: NonNull<TimerShared>) {
+        #[cfg(test)]
+        OPS.with(|ops| ops.set((ops.get().0, ops.get().1 + 1)));
         unsafe {
             let when = item.as_ref().cached_when();
             if when == u64::MAX {

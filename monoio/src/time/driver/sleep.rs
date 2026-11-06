@@ -7,7 +7,7 @@ use std::{
 use pin_project_lite::pin_project;
 
 use crate::time::{
-    driver::{Handle, TimerEntry},
+    driver::{duration_to_ticks, Handle, TimerEntry},
     Duration, Instant,
 };
 
@@ -200,6 +200,21 @@ impl Sleep {
         Sleep {
             deadline,
             entry: TimerEntry::new(Handle::current()),
+        }
+    }
+
+    /// A sleep that ends `duration` after the coarse clock ([`Instant::recent`]): no clock read,
+    /// and the tick is computed here, not on the first poll.
+    pub(crate) fn new_coarse(duration: Duration) -> Sleep {
+        let handle = Handle::current();
+        let recent = handle.recent();
+        let deadline = recent
+            .checked_add(duration)
+            .unwrap_or_else(|| recent + Duration::from_secs(86400 * 365 * 30));
+
+        Sleep {
+            deadline,
+            entry: TimerEntry::new_coarse(handle, duration_to_ticks(duration)),
         }
     }
 

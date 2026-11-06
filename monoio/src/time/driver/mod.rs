@@ -6,7 +6,8 @@
 //! Time driver
 
 mod entry;
-use self::entry::{EntryList, TimerEntry, TimerHandle, TimerShared};
+pub(crate) use self::entry::TimerEntry;
+use self::entry::{EntryList, TimerHandle, TimerShared};
 
 mod handle;
 pub(crate) use self::handle::Handle;
@@ -93,6 +94,27 @@ pub struct TimeDriver<D: 'static> {
     park: D,
 }
 
+/// The longest time a coarse deadline can be set ahead: about 30 years, like
+/// `Instant::far_future`.
+const MAX_TICKS_AHEAD: u64 = 86400 * 365 * 30 * 1000;
+
+/// The number of ticks (milliseconds) that cover `d`, rounded up, at most `MAX_TICKS_AHEAD`.
+/// For `TimerEntry::{new_coarse, reset_coarse}`.
+#[inline]
+pub(crate) fn duration_to_ticks(d: Duration) -> u64 {
+    let ms = d
+        .as_secs()
+        .saturating_mul(1000)
+        .saturating_add(d.subsec_nanos().div_ceil(1_000_000) as u64);
+    ms.min(MAX_TICKS_AHEAD)
+}
+
+/// `(inserts, removes)` the owners of timers caused in this thread's wheels, see `wheel::OPS`.
+#[cfg(test)]
+pub(crate) fn wheel_ops() -> (u64, u64) {
+    wheel::OPS.with(|ops| ops.get())
+}
+
 /// A structure which handles conversion from Instants to u64 timestamps.
 #[derive(Debug, Clone)]
 struct ClockTime {
@@ -108,34 +130,29 @@ impl ClockTime {
         }
     }
 
+    /// The tick a timer for the instant `t` expires at: `t` rounded up to the end of its
+    /// millisecond.
+    #[inline]
     pub(self) fn deadline_to_tick(&self, t: Instant) -> u64 {
-        // Round up to the end of a ms
-        self.instant_to_tick(t + Duration::from_nanos(999_999))
+        self.instant_to_ticks(t).1
     }
 
-    pub(self) fn instant_to_tick(&self, t: Instant) -> u64 {
-        // round up
-        let dur: Duration = t
-            .checked_duration_since(self.start_time)
-            .unwrap_or_else(|| Duration::from_secs(0));
-        let ms = dur.as_millis();
-
-        ms.try_into().expect("Duration too far into the future")
-    }
-
-    /// `(instant_to_tick(t), deadline_to_tick(t))` with one subtraction: the tick rounded down
-    /// and rounded up.
+    /// The tick of the instant `t`, rounded down and rounded up, with one subtraction. An
+    /// instant before the start is tick 0; one that is more milliseconds away than a `u64`
+    /// holds is the last tick.
+    #[inline]
     pub(self) fn instant_to_ticks(&self, t: Instant) -> (u64, u64) {
         let dur: Duration = t
             .checked_duration_since(self.start_time)
             .unwrap_or_else(|| Duration::from_secs(0));
-        let ms: u64 = dur
-            .as_millis()
-            .try_into()
-            .expect("Duration too far into the future");
-        let partial = dur.subsec_nanos() % 1_000_000 != 0;
+        let ms = dur
+            .as_secs()
+            .saturating_mul(1000)
+            .saturating_add(dur.subsec_millis() as u64);
+        // A started millisecond counts for the deadline tick.
+        let partial = dur.subsec_nanos() > dur.subsec_millis() * 1_000_000;
 
-        (ms, ms + partial as u64)
+        (ms, ms.saturating_add(partial as u64))
     }
 
     pub(self) fn tick_to_duration(&self, t: u64) -> Duration {
@@ -143,7 +160,7 @@ impl ClockTime {
     }
 
     pub(self) fn now(&self) -> u64 {
-        self.instant_to_tick(self.clock.now())
+        self.instant_to_ticks(self.clock.now()).0
     }
 }
 
@@ -254,6 +271,19 @@ impl Handle {
         }
     }
 
+    /// `deadline_to_tick(recent())`: the coarse clock as a tick, rounded up. At least 1.
+    #[inline]
+    pub(crate) fn recent_tick(&self) -> u64 {
+        let inner = self.get();
+        match inner.recent_tick.get() {
+            0 => {
+                inner.read_clock();
+                inner.recent_tick.get()
+            }
+            tick => tick,
+        }
+    }
+
     /// The coarse clock, see [`Instant::recent`].
     #[inline]
     pub(crate) fn recent(&self) -> Instant {
@@ -285,8 +315,12 @@ impl Handle {
             let Some(entry) = entry else {
                 break;
             };
-            if let Some(waker) = unsafe { entry.fire() } {
-                waker.wake();
+            let (waker, wake) = unsafe { entry.fire() };
+            if let Some(waker) = waker {
+                if wake {
+                    waker.wake();
+                }
+                // Else a disarmed `Deadline` left the wheel: its waker is dropped here.
             }
         }
         let next = inner.wheel.borrow().poll_at();
@@ -329,7 +363,7 @@ impl Handle {
                     }
                     None
                 }
-                Err((entry, super::error::InsertError::Elapsed)) => entry.fire(),
+                Err((entry, super::error::InsertError::Elapsed)) => entry.fire().0,
             }
         };
 
