@@ -25,32 +25,36 @@ impl<A> AsyncWriteRentExt for A
 where
     A: AsyncWriteRent + ?Sized,
 {
-    async fn write_all<T: IoBuf + 'static>(&mut self, buf: T) -> BufResult<usize, T> {
+    async fn write_all<T: IoBuf + 'static>(&mut self, mut buf: T) -> BufResult<usize, T> {
         let len = buf.bytes_init();
         if len == 0 {
             return (Ok(0), buf);
         }
         // The first write goes out on the buffer as it is: one write usually takes all of it
         // (a small reply), and then no `Slice` is built and the loop below is never entered.
-        let (result, mut buf) = self.write(buf).await;
-        // `result` is consumed by every arm, so nothing of it lives across the loop's awaits.
-        let mut written = match result {
-            Ok(n) if n >= len => return (Ok(n), buf),
-            Ok(0) => {
-                return (
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "failed to write whole buffer",
-                    )),
-                    buf,
-                )
-            }
-            Ok(n) => n,
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::Interrupted {
-                    return (Err(e), buf);
+        let mut written = {
+            // In its own scope (and consumed by every arm), so that the result is not kept in
+            // the future across the awaits of the loop below.
+            let result;
+            (result, buf) = self.write(buf).await;
+            match result {
+                Ok(n) if n >= len => return (Ok(n), buf),
+                Ok(0) => {
+                    return (
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "failed to write whole buffer",
+                        )),
+                        buf,
+                    )
                 }
-                0
+                Ok(n) => n,
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::Interrupted {
+                        return (Err(e), buf);
+                    }
+                    0
+                }
             }
         };
         // A short write: send the rest.
