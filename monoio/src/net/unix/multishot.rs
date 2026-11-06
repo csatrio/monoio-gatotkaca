@@ -13,6 +13,7 @@ use crate::{
             recv_multi::{self, Bundle, RecvBundleStream, RecvMultiOp},
         },
         raw::BufRing,
+        shared_fd::SharedFd,
     },
     io::stream::Stream,
     net::{tcp::RecvStream, AcceptFlags},
@@ -27,6 +28,44 @@ impl UnixListener {
     pub fn accept_multi(&self, flags: AcceptFlags) -> io::Result<UnixAcceptStream> {
         AcceptMultiOp::new(&self.fd, flags.bits()).map(|op| UnixAcceptStream { op })
     }
+
+    /// Wait for at least one connection, then return every connection already accepted (up to
+    /// `max`) from one poll, with a multishot accept kept armed in the listener. Same rules as
+    /// [`TcpListener::accept_batch`](crate::net::TcpListener::accept_batch).
+    pub async fn accept_batch(
+        &self,
+        max: usize,
+        flags: AcceptFlags,
+    ) -> io::Result<Vec<(UnixStream, SocketAddr)>> {
+        let mut dst = Vec::new();
+        self.accept_batch_into(&mut dst, max, flags).await?;
+        Ok(dst)
+    }
+
+    /// [`accept_batch`](Self::accept_batch) appending to `dst`; returns how many were
+    /// appended (at least 1).
+    pub async fn accept_batch_into(
+        &self,
+        dst: &mut Vec<(UnixStream, SocketAddr)>,
+        max: usize,
+        flags: AcceptFlags,
+    ) -> io::Result<usize> {
+        self.batch
+            .accept(&self.fd, flags.bits(), max, |fd| push_with_addr(dst, fd))
+            .await
+    }
+}
+
+/// Push a new connection with its peer address; skip (close) it if `getpeername` fails.
+fn push_with_addr(dst: &mut Vec<(UnixStream, SocketAddr)>, fd: SharedFd) -> bool {
+    let stream = UnixStream::from_shared_fd(fd);
+    match stream.peer_addr() {
+        Ok(addr) => {
+            dst.push((stream, addr));
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Connections accepted by [`UnixListener::accept_multi`]. Behaves like
@@ -37,6 +76,32 @@ pub struct UnixAcceptStream {
 }
 
 impl UnixAcceptStream {
+    /// Wait for at least one connection, then append every connection already accepted (up
+    /// to `max`) with its peer address to `dst` in one poll, see
+    /// [`AcceptStream::next_batch`](crate::net::tcp::AcceptStream::next_batch).
+    pub async fn next_batch(
+        &mut self,
+        dst: &mut Vec<(UnixStream, SocketAddr)>,
+        max: usize,
+    ) -> io::Result<usize> {
+        std::future::poll_fn(|cx| self.op.poll_batch(cx, max, |fd| push_with_addr(dst, fd))).await
+    }
+
+    /// Like [`next_batch`](Self::next_batch), without peer addresses.
+    pub async fn next_stream_batch(
+        &mut self,
+        dst: &mut Vec<UnixStream>,
+        max: usize,
+    ) -> io::Result<usize> {
+        std::future::poll_fn(|cx| {
+            self.op.poll_batch(cx, max, |fd| {
+                dst.push(UnixStream::from_shared_fd(fd));
+                true
+            })
+        })
+        .await
+    }
+
     /// Poll for the next connection, without its peer address.
     pub fn poll_next_stream(
         &mut self,

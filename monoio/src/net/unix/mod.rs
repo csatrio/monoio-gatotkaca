@@ -22,7 +22,7 @@ pub use split::{UnixOwnedReadHalf, UnixOwnedWriteHalf};
 pub use stream::UnixStream;
 
 /// Buffers received by [`UnixStream::recv_multi`] (the same type as for TCP).
-pub use crate::net::tcp::{RecvBundleStream, RecvStream};
+pub use crate::net::tcp::{MultiRecvReader, RecvBundleStream, RecvStream};
 
 pub(crate) fn path_offset(sockaddr: &libc::sockaddr_un) -> usize {
     let base = sockaddr as *const _ as usize;

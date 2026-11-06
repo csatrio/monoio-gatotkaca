@@ -1,6 +1,7 @@
 //! Multishot accept (`IORING_ACCEPT_MULTISHOT`, Linux 5.19+).
 
 use std::{
+    cell::{Cell, RefCell},
     io,
     rc::Rc,
     task::{Context, Poll},
@@ -55,9 +56,32 @@ impl OpAble for AcceptMulti {
 }
 
 /// The accept loop shared by the TCP and Unix listeners: yields the accepted fds.
-pub(crate) struct AcceptMultiOp(MultishotOp<AcceptMulti>);
+///
+/// Re-arms itself when the kernel ends the multishot after a connection without an error (it
+/// does so when it can't post another CQE, e.g. on a full CQ): the next poll submits a new
+/// multishot accept, so the caller sees one uninterrupted stream. An error ends it (yielded
+/// once, then `None`); so does a cancel.
+pub(crate) struct AcceptMultiOp {
+    // `None` once a re-arm failed to submit.
+    op: Option<MultishotOp<AcceptMulti>>,
+    // The kernel ended the multishot after a connection: submit it again on the next poll.
+    rearm: Cell<bool>,
+    // `cancel` was called: never re-arm.
+    cancelled: Cell<bool>,
+    // An error `poll_batch` met after it had taken connections: returned by the next poll.
+    pending_err: Option<io::Error>,
+}
 
 impl AcceptMultiOp {
+    fn from_op(op: MultishotOp<AcceptMulti>) -> Self {
+        Self {
+            op: Some(op),
+            rearm: Cell::new(false),
+            cancelled: Cell::new(false),
+            pending_err: None,
+        }
+    }
+
     /// Start a multishot accept on `fd`, with `SOCK_*` `flags` for the new sockets.
     pub(crate) fn new(fd: &SharedFd, flags: libc::c_int) -> io::Result<Self> {
         let data = AcceptMulti {
@@ -65,7 +89,9 @@ impl AcceptMultiOp {
             flags,
             direct: None,
         };
-        MultishotOp::submit(data).map(Self).map_err(|(e, _)| e)
+        MultishotOp::submit(data)
+            .map(Self::from_op)
+            .map_err(|(e, _)| e)
     }
 
     /// Start a multishot direct accept on `fd`: the sockets go into kernel-allocated slots of
@@ -86,42 +112,199 @@ impl AcceptMultiOp {
             flags: flags & !libc::SOCK_CLOEXEC,
             direct: Some(table),
         };
-        MultishotOp::submit(data).map(Self).map_err(|(e, _)| e)
+        MultishotOp::submit(data)
+            .map(Self::from_op)
+            .map_err(|(e, _)| e)
+    }
+
+    /// The `SOCK_*` flags set on every accepted socket.
+    pub(crate) fn flags(&self) -> Option<libc::c_int> {
+        self.op.as_ref().map(|op| op.data().flags)
     }
 
     /// Next accepted fd, owned by the caller. An error ends the accept loop when the kernel
     /// ends the multishot (it does for most errors); `-ECANCELED` after a cancel ends it
-    /// silently with `None`.
+    /// silently with `None`. A connection without `F_MORE` makes the next poll re-arm.
     pub(crate) fn poll_next_fd(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<io::Result<SharedFd>>> {
-        let Some(cqe) = ready!(self.0.poll_next(cx)) else {
+        if let Some(e) = self.pending_err.take() {
+            return Poll::Ready(Some(Err(e)));
+        }
+        if self.rearm.replace(false) {
+            let Some(op) = self.op.take() else {
+                return Poll::Ready(None);
+            };
+            // The final CQE was taken, so the data is free.
+            let Ok(data) = op.into_data() else {
+                unreachable!("re-arm before the final CQE")
+            };
+            match MultishotOp::submit(data) {
+                Ok(op) => self.op = Some(op),
+                Err((e, _)) => return Poll::Ready(Some(Err(e))),
+            }
+        }
+        let Some(op) = self.op.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let Some(cqe) = ready!(op.poll_next(cx)) else {
             return Poll::Ready(None);
         };
         Poll::Ready(match cqe.result() {
-            Ok(res) => match &self.0.data().direct {
-                // A direct accept: `res` is the slot the kernel picked, now ours.
-                Some(table) => {
-                    table.adopt_kernel_slot();
-                    Some(Ok(SharedFd::new_direct(FixedSlot {
-                        table: table.clone(),
-                        slot: res,
-                    })))
+            Ok(res) => {
+                if !cqe.more() && !self.cancelled.get() {
+                    self.rearm.set(true);
                 }
-                // `SharedFd::new` takes ownership (it never fails today).
-                None => Some(SharedFd::new(res as _)),
-            },
+                match &op.data().direct {
+                    // A direct accept: `res` is the slot the kernel picked, now ours.
+                    Some(table) => {
+                        table.adopt_kernel_slot();
+                        Some(Ok(SharedFd::new_direct(FixedSlot {
+                            table: table.clone(),
+                            slot: res,
+                        })))
+                    }
+                    // `SharedFd::new` takes ownership (it never fails today).
+                    None => Some(SharedFd::new(res as _)),
+                }
+            }
             Err(e) if !cqe.more() && e.raw_os_error() == Some(libc::ECANCELED) => None,
             Err(e) => Some(Err(e)),
         })
     }
 
-    pub(crate) fn cancel(&self) {
-        self.0.cancel()
+    /// Wait for at least one connection, then take every connection already queued, up to
+    /// `max` (at least 1), in this one poll. `push` gets each fd and returns whether it was kept
+    /// (a connection it drops does not count). `Ok(0)` only once the accept ended. An error
+    /// after some connections is kept and returned by the next poll.
+    pub(crate) fn poll_batch(
+        &mut self,
+        cx: &mut Context<'_>,
+        max: usize,
+        mut push: impl FnMut(SharedFd) -> bool,
+    ) -> Poll<io::Result<usize>> {
+        let max = max.max(1);
+        let mut n = 0;
+        while n < max {
+            match self.poll_next_fd(cx) {
+                Poll::Pending if n == 0 => return Poll::Pending,
+                Poll::Pending | Poll::Ready(None) => break,
+                Poll::Ready(Some(Err(e))) => {
+                    if n == 0 {
+                        return Poll::Ready(Err(e));
+                    }
+                    self.pending_err = Some(e);
+                    break;
+                }
+                Poll::Ready(Some(Ok(fd))) => {
+                    if push(fd) {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        Poll::Ready(Ok(n))
     }
 
+    /// Stop accepting (AsyncCancel); no re-arm after it.
+    pub(crate) fn cancel(&self) {
+        self.cancelled.set(true);
+        self.rearm.set(false);
+        if let Some(op) = &self.op {
+            op.cancel()
+        }
+    }
+
+    /// Whether the accept ended (`poll_next_fd` returns `None` from now on).
     pub(crate) fn is_finished(&self) -> bool {
-        self.0.is_finished()
+        if self.rearm.get() || self.pending_err.is_some() {
+            return false;
+        }
+        match &self.op {
+            Some(op) => op.is_finished(),
+            None => true,
+        }
+    }
+}
+
+/// The multishot accept a listener keeps for `accept_batch`: armed by the first call, kept
+/// between calls (connections the kernel accepts in between are queued, not lost), and
+/// re-created by the next call after it ended (after an error was returned).
+#[derive(Default)]
+pub(crate) struct BatchAcceptor {
+    op: RefCell<Option<AcceptMultiOp>>,
+    busy: Cell<bool>,
+}
+
+/// Clears `BatchAcceptor::busy` when an `accept` future completes or is dropped.
+struct BusyGuard<'a>(&'a Cell<bool>);
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+impl BatchAcceptor {
+    /// Accept at least one and up to `max` connections on `fd` (see
+    /// `AcceptMultiOp::poll_batch`). Never returns `Ok(0)`.
+    pub(crate) async fn accept(
+        &self,
+        fd: &SharedFd,
+        flags: libc::c_int,
+        max: usize,
+        mut push: impl FnMut(SharedFd) -> bool,
+    ) -> io::Result<usize> {
+        if self.busy.replace(true) {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "another task is in accept_batch on this listener",
+            ));
+        }
+        let _guard = BusyGuard(&self.busy);
+        let mut fresh = false;
+        loop {
+            {
+                let mut op = self.op.borrow_mut();
+                match &*op {
+                    Some(armed) if !armed.is_finished() => {
+                        if armed.flags() != Some(flags) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "accept_batch called with other flags than the armed accept",
+                            ));
+                        }
+                    }
+                    _ => {
+                        *op = Some(AcceptMultiOp::new(fd, flags)?);
+                        fresh = true;
+                    }
+                }
+            }
+            // The borrow is only held within a poll: `busy` keeps other tasks out, and dropping
+            // this future leaves the accept armed with its queued connections.
+            let res = std::future::poll_fn(|cx| match self.op.borrow_mut().as_mut() {
+                Some(op) => op.poll_batch(cx, max, &mut push),
+                None => Poll::Ready(Ok(0)),
+            })
+            .await;
+            match res {
+                // A new accept that ends without a connection or an error: don't spin.
+                Ok(0) if fresh => {
+                    *self.op.borrow_mut() = None;
+                    return Err(io::Error::other("multishot accept ended at once"));
+                }
+                Ok(0) => *self.op.borrow_mut() = None,
+                Ok(n) => return Ok(n),
+                Err(e) => {
+                    let mut op = self.op.borrow_mut();
+                    if op.as_ref().is_some_and(|op| op.is_finished()) {
+                        *op = None;
+                    }
+                    return Err(e);
+                }
+            }
+        }
     }
 }
