@@ -497,8 +497,8 @@ seed (r3-base)
 | seed | done (`957f8c5`, tag `r3-base`) |
 | wave 0 | done (tag `r3-wave0`): r3-stats, r3-repro, r3-probe; lead added `reqresp --bulk-work` |
 | G0 | done ([round3/G0.md](round3/G0.md)): KV2–KV5 hold, KV1 partly (cap since 6.13, wake-up run capped at `min_complete`); D1 reproduced in direction (`defer` leaves task work after 47% of waiting enters, `coop` 2%); D2 = one accept per round on the bench under `coop`'s one-round-per-sweep regime (run 122: p99 7.1 s → 22 ms with `acceptmulti`), no driver fix; baselines recorded |
-| wave 1 | not started |
-| G1 | not started |
+| wave 1 | done (tag `r3-wave1`): r3-slot, r3-op, r3-drain (variant A; B removed after the quiet slot), r3-bufring, r3-eager (+ its guard diffs), r3-direct, r3-timer (without the fresh list); fixups: inline hints, one waker vtable address |
+| G1 | done ([round3/G1.md](round3/G1.md)): D1, S1, D2, T1, O1, B1 (72 KiB buffers), K1 all pass; one configuration `defer:…:wset72:drain2:eagerack` passes G3's bounds on MIX, R2000 and R8 |
 | wave 2 | not started |
 | G2 | not started |
 | release, G3 | not started |
