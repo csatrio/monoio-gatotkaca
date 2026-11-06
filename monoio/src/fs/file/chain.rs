@@ -5,7 +5,11 @@ use io_uring::opcode;
 use super::File;
 use crate::{
     buf::IoBufMut,
-    driver::{raw::ChainOp, shared_fd::sqe_fd, CURRENT},
+    driver::{
+        raw::ChainOp,
+        shared_fd::{sqe_fd, TxFd},
+        CURRENT,
+    },
     net::TcpStream,
     BufResult,
 };
@@ -53,8 +57,10 @@ impl File {
             .flags(libc::MSG_NOSIGNAL | libc::MSG_WAITALL)
             .build());
         // The chain owns both fds (kept open until it finished) and the buffer, whose memory
-        // does not move with it (`IoBufMut` contract).
-        let data = (self.fd.clone(), stream.shared_fd().clone(), buf);
+        // does not move with it (`IoBufMut` contract). The socket's handle is a `TxFd`: the
+        // chain counts as a send in flight on the stream until its last CQE, so `try_send`
+        // and `send_eager` do not overtake it.
+        let data = (self.fd.clone(), TxFd::new(stream.shared_fd().clone()), buf);
         let sqes = crate::uring::link([read, send]);
         let op = match CURRENT.with(|inner| ChainOp::submit_in(inner, sqes, data)) {
             Ok(op) => op,

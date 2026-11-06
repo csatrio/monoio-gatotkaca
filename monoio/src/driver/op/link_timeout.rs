@@ -12,7 +12,7 @@ use io_uring::{opcode, types::Timespec};
 use super::{submit::SubmitResult, Completion, Op, OpAble, OpKind};
 use crate::{
     buf::{IoBuf, IoBufMut},
-    driver::shared_fd::sqe_fd,
+    driver::shared_fd::{sqe_fd, RxFd, TxFd},
     driver::{self, shared_fd::SharedFd, uring::UringInner, util::timespec},
     BufResult,
 };
@@ -65,8 +65,8 @@ pub(crate) fn untimed<T>(complete: Completion<Timed<T>>) -> Completion<T> {
 
 /// `recv` for [`Timed`]: the whole buffer capacity, no flags.
 pub(crate) struct Recv<T> {
-    /// Keeps the socket open while the op is in flight.
-    fd: SharedFd,
+    /// Keeps the socket open while the op is in flight, and counts as a receive in flight.
+    fd: RxFd,
     buf: T,
 }
 
@@ -83,8 +83,8 @@ impl<T: IoBufMut> OpAble for Recv<T> {
 
 /// `send` with `MSG_NOSIGNAL` for [`Timed`]: the initialized bytes of the buffer.
 pub(crate) struct Send<T> {
-    /// Keeps the socket open while the op is in flight.
-    fd: SharedFd,
+    /// Keeps the socket open while the op is in flight, and counts as a send in flight.
+    fd: TxFd,
     buf: T,
 }
 
@@ -106,6 +106,7 @@ pub(crate) async fn recv_with_timeout<T: IoBufMut>(
     buf: T,
     timeout: Duration,
 ) -> BufResult<usize, T> {
+    let fd = RxFd::new(fd);
     let op = match Op::submit_with_timeout(Recv { fd, buf }, timeout) {
         Ok(op) => op,
         Err((e, data)) => return (Err(e), data.buf),
@@ -126,6 +127,7 @@ pub(crate) async fn send_with_timeout<T: IoBuf>(
     buf: T,
     timeout: Duration,
 ) -> BufResult<usize, T> {
+    let fd = TxFd::new(fd);
     let op = match Op::submit_with_timeout(Send { fd, buf }, timeout) {
         Ok(op) => op,
         Err((e, data)) => return (Err(e), data.buf),

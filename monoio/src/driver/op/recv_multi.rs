@@ -15,7 +15,7 @@ pub(crate) use crate::driver::buf_ring::Bundle;
 use crate::{
     driver::{
         raw::{BufRing, Cqe, SelectedBuf},
-        shared_fd::{sqe_fd, SharedFd},
+        shared_fd::{sqe_fd, RxFd, SharedFd},
         uring::{PreTake, Taken},
     },
     io::stream::Stream,
@@ -24,7 +24,9 @@ use crate::{
 /// Multishot recv: one CQE per received chunk, in one buffer of `ring` (or, with `bundle`, in
 /// several).
 pub(crate) struct RecvMulti {
-    fd: SharedFd,
+    /// Counts as a receive in flight on the socket (`try_recv` is refused) for as long as the
+    /// data lives: while the multishot is armed, and until the stream that owns it is dropped.
+    fd: RxFd,
     ring: BufRing,
     bundle: bool,
 }
@@ -137,7 +139,7 @@ impl RecvMultiOp {
             check_bundles(ring)?;
         }
         let data = RecvMulti {
-            fd: fd.clone(),
+            fd: RxFd::new(fd.clone()),
             ring: ring.clone(),
             bundle,
         };
@@ -506,7 +508,8 @@ impl Drop for RecvMultiOp {
 
 /// Single-shot bundle recv: one CQE, its data in one or more buffers of `ring`.
 pub(crate) struct RecvBundle {
-    fd: SharedFd,
+    /// Counts as a receive in flight on the socket.
+    fd: RxFd,
     ring: BufRing,
 }
 
@@ -521,7 +524,7 @@ impl OpAble for RecvBundle {
 pub(crate) async fn recv_bundle(fd: &SharedFd, ring: &BufRing) -> io::Result<Bundle> {
     check_bundles(ring)?;
     let op = Op::submit_with(RecvBundle {
-        fd: fd.clone(),
+        fd: RxFd::new(fd.clone()),
         ring: ring.clone(),
     })?;
     let done = op.await;
