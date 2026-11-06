@@ -123,8 +123,9 @@ impl BufRingOptions {
     /// before the runtime enters the kernel, or when you call [`BufRing::publish`].
     ///
     /// Until it is published a recycled buffer looks unavailable to the kernel; this is always
-    /// safe, it can only cause `ENOBUFS` sooner. Note: the per-tick publish needs driver
-    /// support; until the driver calls it, use [`BufRing::publish`].
+    /// safe, it can only cause `ENOBUFS` sooner. The driver publishes before every
+    /// `io_uring_enter` it makes, and also where `skip_empty_enter` skips one; call
+    /// [`BufRing::publish`] only to publish earlier than that.
     pub fn batch_publish(mut self, on: bool) -> Self {
         self.batch_publish = on;
         self
