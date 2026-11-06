@@ -264,6 +264,68 @@ impl<D> RuntimeBuilder<D> {
         self
     }
 
+    /// Bounded drain for [`defer_taskrun`](Self::defer_taskrun) rings (off by default; `0` is
+    /// off). After a waiting `io_uring_enter` returned and its completions were reaped, the
+    /// driver enters again, without waiting, while the kernel flags pending task work
+    /// (`IORING_SQ_TASKRUN`), at most `max` times, and reaps after each. Only then the ready
+    /// tasks run.
+    ///
+    /// Why: a `DEFER_TASKRUN` ring runs completions only inside `io_uring_enter`, and a wait
+    /// stops as soon as it has the one completion it waits for (an enter that slept delivers
+    /// exactly one; one that did not sleep runs at most 20 items, twice if it also submitted).
+    /// Completions that become ready a moment later would wait for a whole round of tasks.
+    ///
+    /// - One drain enter delivers at most 20 completions on Linux 6.13 and later (the kernel
+    ///   runs at most 20 task-work items per run; an item is one step of one operation, and a
+    ///   few steps post no completion). Older kernels run everything pending in one enter. So
+    ///   one park delivers at most about `20 * max` completions more than without the drain.
+    /// - Each drain enter is one syscall, made only when the kernel flags work: a park that
+    ///   left nothing behind costs one load of the flag.
+    /// - The bound keeps a flood of arrivals from starving the tasks: after `max` enters the
+    ///   tasks run, whatever is still pending, and the next enter picks that up.
+    /// - It never waits (no timeout, no [`min_wait`](Self::min_wait)), and it runs only after
+    ///   a park that waited, not on the submit between task rounds.
+    /// - A drain enter that brings no completion ends the drain.
+    ///
+    /// When to use it: a few busy request/response connections next to bulk work on a
+    /// `defer_taskrun` ring. The bulk completions end every wait early, and the requests that
+    /// arrive just after it lose a round. For that case it replaces `min_wait`, which collects
+    /// the same completions by sleeping: use one or the other (after a batching wait the
+    /// kernel often leaves the flag set with nothing pending, which costs the drain one empty
+    /// enter per park). `max = 1` already catches most of them there; 2 to 4 leaves room for
+    /// a burst.
+    ///
+    /// With many connections ready at once (hundreds or more) there is always work left, so
+    /// every drain enter comes back with a full batch and each round simply gets `20 * max`
+    /// more completions. Next to other tasks that shifts the round towards the connections.
+    /// With nothing else to do it only makes the rounds longer, which costs a little
+    /// throughput (a few percent at 2000 connections with `max = 4`): keep `max` small.
+    ///
+    /// No effect unless the ring has both `IORING_SETUP_DEFER_TASKRUN` and
+    /// `IORING_SETUP_TASKRUN_FLAG` (`defer_taskrun()` sets both; a ring built through
+    /// [`uring_builder`](Self::uring_builder) needs both set there): without the flag the
+    /// driver cannot see whether work is left, and on other rings completions do not wait for
+    /// an enter. With the `metrics` feature, `DriverStats::drain_enters` counts the extra
+    /// enters and `enter_left_taskrun` the waits that left work.
+    #[must_use]
+    pub fn drain_taskrun(mut self, max: u32) -> Self {
+        self.opts.drain_taskrun(max);
+        self
+    }
+
+    /// Experimental variant of [`drain_taskrun`](Self::drain_taskrun), kept for comparison: the
+    /// drain enters are made *before* the completions of the wait are reaped, each with
+    /// `min_complete` = the completions already in the CQ. That never sleeps (that many exist)
+    /// and raises the kernel's limit per enter to max(20, that number), so the backlog taken
+    /// per syscall doubles: 20, 40, 80, ... The CQ is reaped once, after the last enter. The
+    /// later of the two calls wins. Same conditions as `drain_taskrun`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn drain_taskrun_pre_tick(mut self, max: u32) -> Self {
+        self.opts.drain_taskrun_pre_tick(max);
+        self
+    }
+
     /// Skip `io_uring_enter` between task rounds when no SQE is queued and the kernel flags no
     /// pending task work or CQ overflow. Completions are still reaped.
     ///

@@ -82,6 +82,42 @@ pub(crate) struct DriverOptions {
     pub(crate) min_wait_batch: u32,
     /// Skip `io_uring_enter` in [`Driver::submit`] when there is nothing to submit.
     pub(crate) skip_empty_enter: bool,
+    /// Bounded drain of deferred task work after a waiting enter.
+    drain: TaskrunDrain,
+}
+
+impl DriverOptions {
+    /// `RuntimeBuilder::drain_taskrun`.
+    pub(crate) fn drain_taskrun(&mut self, max: u32) {
+        self.drain = match max {
+            0 => TaskrunDrain::Off,
+            max => TaskrunDrain::AfterTick(max),
+        };
+    }
+
+    /// `RuntimeBuilder::drain_taskrun_pre_tick`.
+    pub(crate) fn drain_taskrun_pre_tick(&mut self, max: u32) {
+        self.drain = match max {
+            0 => TaskrunDrain::Off,
+            max => TaskrunDrain::BeforeTick(max),
+        };
+    }
+}
+
+/// What `inner_park` does after its waiting enter when the kernel still flags task work
+/// (`IORING_SQ_TASKRUN`). Only ever on on a `DEFER_TASKRUN` ring with `TASKRUN_FLAG`, see
+/// [`EnterConfig::new`]. Both bounds are a number of extra `io_uring_enter` calls per park.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TaskrunDrain {
+    /// One enter per park (the default).
+    #[default]
+    Off,
+    /// After the first tick: `enter(GETEVENTS, min_complete = 0)` then `tick()`, while the flag
+    /// is set. Each enter runs at most 20 task-work items (Linux 6.13+).
+    AfterTick(u32),
+    /// Before the first tick: `enter(GETEVENTS, min_complete = unreaped CQEs)` while the flag is
+    /// set, then the one tick. Each enter runs at most max(20, unreaped CQEs) items.
+    BeforeTick(u32),
 }
 
 /// Counters of an [`IoUringDriver`], see [`IoUringDriver::stats`]. Needs the `metrics` feature.
@@ -93,7 +129,7 @@ pub(crate) struct DriverOptions {
 #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DriverStats {
-    /// `io_uring_enter` calls that only submit.
+    /// `io_uring_enter` calls that only submit (the drain enters of `drain_enters` included).
     pub enter_submit: u64,
     /// `io_uring_enter` calls that wait for completions.
     pub enter_wait: u64,
@@ -106,6 +142,14 @@ pub struct DriverStats {
     /// `taskrun_flag` (which `defer_taskrun()` sets), since the kernel never raises the flag
     /// there.
     pub enter_left_taskrun: u64,
+    /// Extra, non-waiting `io_uring_enter` calls made by
+    /// [`drain_taskrun`](crate::RuntimeBuilder::drain_taskrun) after a waiting enter that left
+    /// task work (also counted in `enter_submit`). At most `max` per park, so
+    /// `drain_enters / enter_left_taskrun` is the average drain length. The CQEs such an enter
+    /// delivers are reaped before the tasks run again: in `op_ticks_by_opcode` they count for
+    /// the tick of the park (bucket 0 for an op submitted by that park's enter), and each drain
+    /// pass adds its own entry to `cqes_per_tick`. Always 0 without `drain_taskrun`.
+    pub drain_enters: u64,
     /// SQEs the kernel consumed (sum of the `io_uring_enter` results).
     pub sqes_submitted: u64,
     /// CQEs reaped.
@@ -168,7 +212,7 @@ pub struct DriverStats {
 
 /// `DriverStats` is all `u64`s: this many. Checked against the struct in metrics builds, so the
 /// `metrics_off` test can tell without the type that the driver holds no counters.
-const DRIVER_STATS_U64S: usize = 20 + 7 + 64 + 4 * 64;
+const DRIVER_STATS_U64S: usize = 21 + 7 + 64 + 4 * 64;
 #[cfg(feature = "metrics")]
 const _: () = assert!(lifecycle::OP_TICK_BUCKETS == 4);
 #[cfg(feature = "metrics")]
@@ -193,6 +237,7 @@ impl Default for DriverStats {
             enter_wait: 0,
             enter_skipped: 0,
             enter_left_taskrun: 0,
+            drain_enters: 0,
             sqes_submitted: 0,
             cqes_reaped: 0,
             cqes_per_tick: [0; 7],
@@ -233,7 +278,8 @@ struct RsrcUpdate {
     data: u64,
 }
 
-/// How the driver enters the ring, fixed when the ring is built.
+/// How the driver enters the ring, fixed when the ring is built (except the batching wait, see
+/// [`EnterConfig::set_min_wait`]).
 struct EnterConfig {
     /// `IORING_SETUP_*` flags of the ring.
     setup_flags: u32,
@@ -244,6 +290,8 @@ struct EnterConfig {
     min_wait_batch: u32,
     /// `Driver::submit` may skip `io_uring_enter` when the SQ is empty.
     skip_empty_enter: bool,
+    /// Drain after a waiting enter; `Off` unless the ring is DEFER_TASKRUN with TASKRUN_FLAG.
+    drain: TaskrunDrain,
 }
 
 impl EnterConfig {
@@ -261,12 +309,21 @@ impl EnterConfig {
                 || setup_flags & (SETUP_COOP_TASKRUN | SETUP_DEFER_TASKRUN) == 0);
 
         // The batching wait needs IORING_FEAT_MIN_TIMEOUT (6.12+); ignored otherwise.
-        let (min_wait_usec, min_wait_batch) = match opts.min_wait {
-            Some(d) if params.is_feature_min_timeout() && opts.min_wait_batch > 1 => (
-                d.as_micros().clamp(1, u32::MAX as u128) as u32,
-                opts.min_wait_batch,
-            ),
-            _ => (0, 0),
+        let (min_wait_usec, min_wait_batch) = if params.is_feature_min_timeout() {
+            Self::min_wait_values(opts.min_wait, opts.min_wait_batch)
+        } else {
+            (0, 0)
+        };
+
+        // The drain relies on two things only this kind of ring has: completions are run
+        // nowhere but inside an enter with GETEVENTS (DEFER_TASKRUN), and the kernel says when
+        // some are left (TASKRUN_FLAG). On a COOP_TASKRUN ring any kernel entry of the thread
+        // runs all of them, so there is nothing to drain.
+        const DRAINABLE: u32 = SETUP_DEFER_TASKRUN | SETUP_TASKRUN_FLAG;
+        let drain = if setup_flags & DRAINABLE == DRAINABLE {
+            opts.drain
+        } else {
+            TaskrunDrain::Off
         };
 
         // Registration fails on kernels before 5.18; we then keep using the plain fd.
@@ -282,7 +339,37 @@ impl EnterConfig {
             min_wait_usec,
             min_wait_batch,
             skip_empty_enter,
+            drain,
         }
+    }
+
+    /// `(min_wait_usec, min_wait_batch)` for a batching wait of `wait` for `batch` CQEs; `(0, 0)`
+    /// (off) for `None` or a batch below 2, which is what a plain wait does anyway.
+    fn min_wait_values(wait: Option<Duration>, batch: u32) -> (u32, u32) {
+        match wait {
+            Some(d) if batch > 1 => (d.as_micros().clamp(1, u32::MAX as u128) as u32, batch),
+            _ => (0, 0),
+        }
+    }
+
+    /// Change the batching wait at run time (`uring::set_min_wait`). `supported` is
+    /// `IORING_FEAT_MIN_TIMEOUT`; turning it off always works.
+    fn set_min_wait(
+        &mut self,
+        supported: bool,
+        wait: Option<Duration>,
+        batch: u32,
+    ) -> io::Result<()> {
+        let (usec, batch) = Self::min_wait_values(wait, batch);
+        if usec != 0 && !supported {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "min_wait needs IORING_FEAT_MIN_TIMEOUT (Linux 6.12+)",
+            ));
+        }
+        self.min_wait_usec = usec;
+        self.min_wait_batch = batch;
+        Ok(())
     }
 
     /// A DEFER_TASKRUN ring without the TASKRUN flag: every enter must get events, since we
@@ -628,12 +715,35 @@ impl IoUringDriver {
             .awake
             .store(true, std::sync::atomic::Ordering::Release);
 
+        // `drain_taskrun`: only after a wait. The submit-only branch (`sync`: a foreign waker
+        // made a task ready, so the park did not wait) is the cold path under another name, and
+        // like `Driver::submit` it does not drain: a task is ready already, the round starts
+        // now, and the next enter follows it.
+        let drain = if need_wait {
+            inner.cfg.drain
+        } else {
+            TaskrunDrain::Off
+        };
+        // Variant B: collect more completions into the CQ before it is reaped.
+        #[allow(unused_variables)]
+        let pre_drained = match drain {
+            TaskrunDrain::BeforeTick(max) => inner.drain_before_tick(max),
+            _ => 0,
+        };
+
         // Process CQ
         inner.tick()?;
         // Task work the kernel queued after (or left over from) the wait we just returned from.
-        metric!(if need_wait && inner.uring.submission().taskrun() {
-            inner.stats.enter_left_taskrun += 1;
-        });
+        // (A pre-tick drain ran only because the wait left some.)
+        metric!(
+            if need_wait && (pre_drained > 0 || inner.uring.submission().taskrun()) {
+                inner.stats.enter_left_taskrun += 1;
+            }
+        );
+        // Variant A: fetch what the wait left behind, so the tasks see it in this round.
+        if let TaskrunDrain::AfterTick(max) = drain {
+            inner.drain_after_tick(max);
+        }
         drop_deferred(&self.inner);
         super::raw::deliver(&self.inner);
 
@@ -711,6 +821,14 @@ impl UringInner {
 
     fn tick(&mut self) -> io::Result<()> {
         metric!(self.tick = self.tick.wrapping_add(1));
+        self.reap();
+        Ok(())
+    }
+
+    /// Handle the CQEs in the CQ: the body of a tick. A drain pass of `drain_taskrun` calls it
+    /// directly: its CQEs belong to the tick of the park (no task ran in between), so the tick
+    /// counter behind `op_ticks_by_opcode` stays.
+    fn reap(&mut self) {
         #[cfg(feature = "metrics")]
         let mut n = 0_u64;
         // CQEs are taken in batches so that the op slots of the next CQEs can be prefetched
@@ -753,7 +871,6 @@ impl UringInner {
             let bucket = (u64::BITS - n.leading_zeros()).min(6) as usize;
             self.stats.cqes_per_tick[bucket] += 1;
         );
-        Ok(())
     }
 
     /// Dispatch one CQE by its `user_data`.
@@ -819,12 +936,101 @@ impl UringInner {
         sq.is_empty() && !sq.taskrun() && !sq.cq_overflow()
     }
 
+    /// `uring::set_min_wait`.
+    pub(crate) fn set_min_wait(&mut self, wait: Option<Duration>, batch: u32) -> io::Result<()> {
+        let supported = self.uring.params().is_feature_min_timeout();
+        self.cfg.set_min_wait(supported, wait, batch)
+    }
+
+    /// `drain_taskrun` (variant A), after the first tick of a park that waited: while the
+    /// kernel flags task work, enter without waiting and reap, at most `max` times.
+    ///
+    /// Kernel facts (`docs/performance-improvement/round3/r3-probe.md`, KV1): on a
+    /// DEFER_TASKRUN ring `enter(to_submit = 0, min_complete = 0, GETEVENTS)` runs one batch of
+    /// task work (at most 20 items on Linux 6.13+, everything before) and returns without
+    /// sleeping; the flag is set again when items are left.
+    ///
+    /// An enter that brings no CQE ends the drain: there is nothing new for the tasks, and the
+    /// flag may be stale. The kernel clears it once per run, but a run asked for more events
+    /// than it has handled (`min_complete` above 1: the batching wait, or the pre-tick drain)
+    /// loops, and an item queued during that loop sets the flag again and is then handled by
+    /// the same run (`__io_run_local_work`: `atomic_andnot` sits before the `again:` label).
+    /// The flag then stays set with nothing pending until the next run.
+    ///
+    /// Best effort: an enter that fails ends the drain. Nothing is lost by that (queued SQEs and
+    /// pending task work stay where they are) and the next enter of the loop reports the error
+    /// if it lasts.
+    fn drain_after_tick(&mut self, max: u32) {
+        let mut n = 0;
+        while n < max && self.uring.submission().taskrun() {
+            if self.enter_with(0, None, true).is_err() || self.uring.completion().is_empty() {
+                break;
+            }
+            self.reap();
+            n += 1;
+        }
+    }
+
+    /// `drain_taskrun_pre_tick` (variant B), between the waiting enter of a park and its tick:
+    /// while the kernel flags task work, enter with `min_complete` = the CQEs that are in the
+    /// CQ, at most `max` times. Returns the number of enters made.
+    ///
+    /// Why this never sleeps (KV1 of r3-probe.md, probe lines [A], [D], [E]): the kernel runs
+    /// task work when the wait begins and then returns at once if the CQ holds at least
+    /// `min_complete` CQEs. It holds at least as many as we just counted: only this thread reaps
+    /// the CQ (and does not between the count and the enter), and the kernel only adds. No
+    /// timeout and no batching wait are passed (`enter_with(.., drain = true)`).
+    ///
+    /// Why the count: one run handles at most max(20, `min_complete`) items, so the backlog
+    /// taken per syscall doubles (20, 40, 80, ...) instead of staying at 20. Up to 20 CQEs the
+    /// count changes nothing, so 0 is passed (variant A's enter): a run that is asked for more
+    /// events than it handles can leave the flag set with nothing pending, see
+    /// [`drain_after_tick`](Self::drain_after_tick).
+    ///
+    /// The drain stops when an enter brought no CQE (a stale flag, see there), and when the
+    /// next run could overflow the CQ (it adds up to max(20, len) CQEs, one per item as a
+    /// rule): the tick that follows empties it. Best effort like `drain_after_tick`.
+    fn drain_before_tick(&mut self, max: u32) -> u32 {
+        /// `IO_LOCAL_TW_DEFAULT_MAX`: what a run handles whatever `min_complete` is.
+        const RUN: usize = 20;
+        let mut n = 0;
+        while n < max && self.uring.submission().taskrun() {
+            let cq = self.uring.completion();
+            let (len, capacity) = (cq.len(), cq.capacity());
+            drop(cq);
+            if len + len.max(RUN) > capacity {
+                break;
+            }
+            let min_complete = if len > RUN { len as u32 } else { 0 };
+            if self.enter_with(min_complete, None, true).is_err() {
+                break;
+            }
+            n += 1;
+            if self.uring.completion().len() == len {
+                break;
+            }
+        }
+        n
+    }
+
     /// One `io_uring_enter`: submit the queued SQEs and wait for `want` CQEs, at most until `ts`.
     ///
     /// Same flags as `Submitter::submit_and_wait`/`submit_with_args` of `io-uring`, plus the
     /// registered ring fd, GETEVENTS for a DEFER_TASKRUN ring without the TASKRUN flag, and the
     /// batching wait. Returns the number of SQEs the kernel consumed.
+    #[inline]
     fn enter(&mut self, want: u32, ts: Option<&Timespec>) -> io::Result<usize> {
+        self.enter_with(want, ts, false)
+    }
+
+    /// [`enter`](Self::enter), or with `drain` a drain enter of `drain_taskrun`: GETEVENTS, so
+    /// the kernel runs deferred task work, and `want` goes to the kernel as it is. Such an
+    /// enter never sleeps as long as `want` is at most the number of CQEs that are in the CQ and
+    /// not reaped (0 included): the kernel runs task work once, then returns because that many
+    /// CQEs exist (`io_cqring_wait`: `if (__io_cqring_events_user(ctx) >= min_events) return
+    /// 0;`). It takes no timeout and no batching wait, so `EXT_ARG` is never set for it.
+    fn enter_with(&mut self, want: u32, ts: Option<&Timespec>, drain: bool) -> io::Result<usize> {
+        debug_assert!(!drain || ts.is_none());
         // Let the kernel see buffers recycled into batch-mode buffer rings.
         super::buf_ring::flush_pending();
 
@@ -838,6 +1044,7 @@ impl UringInner {
         let params = self.uring.params();
         let mut flags = EnterFlags::empty();
         if want > 0
+            || drain
             || params.is_setup_iopoll()
             || cq_overflow
             || taskrun
@@ -856,7 +1063,12 @@ impl UringInner {
         }
 
         let mut want = want;
-        let min_wait = if want > 0 { self.cfg.min_wait_usec } else { 0 };
+        // The batching wait is for waiting enters only: a drain enter must come back at once.
+        let min_wait = if want > 0 && !drain {
+            self.cfg.min_wait_usec
+        } else {
+            0
+        };
         if min_wait != 0 {
             want = self.cfg.min_wait_batch;
         }
@@ -882,7 +1094,10 @@ impl UringInner {
             self.uring.as_raw_fd()
         };
 
-        metric!(if want > 0 {
+        metric!(if drain {
+            self.stats.drain_enters += 1;
+            self.stats.enter_submit += 1;
+        } else if want > 0 {
             self.stats.enter_wait += 1;
         } else {
             self.stats.enter_submit += 1;

@@ -364,6 +364,26 @@ pub unsafe fn with_ring<R>(f: impl FnOnce(&mut IoUring) -> R) -> R {
     CURRENT.with(|inner| inner.with_ring(f))
 }
 
+/// Change the batching wait of the current runtime's driver at run time: from the next park on, a
+/// waiting `io_uring_enter` waits for `batch` CQEs, or for `wait` to pass with at least one CQE
+/// ready. Same meaning and rules as
+/// [`RuntimeBuilder::min_wait`](crate::RuntimeBuilder::min_wait), which sets the initial value:
+/// `None`, or a `batch` below 2, turns it off (a plain wait returns with the first CQE anyway).
+///
+/// A good `batch` is often something the application knows per round, e.g. the number of
+/// connections with a reply in flight. The call is two stores: cheap enough to make every round.
+///
+/// # Errors
+/// [`Unsupported`](io::ErrorKind::Unsupported) when a wait is asked for and the kernel lacks
+/// `IORING_FEAT_MIN_TIMEOUT` (before Linux 6.12); the setting is unchanged then. (The builder
+/// method ignores the setting on such kernels instead.) Turning it off always succeeds.
+///
+/// # Panics
+/// Panics if called outside of a monoio runtime.
+pub fn set_min_wait(wait: Option<Duration>, batch: u32) -> io::Result<()> {
+    CURRENT.with(|inner| inner.set_min_wait(wait, batch))
+}
+
 const EXTERNAL_PREFIX: u64 = 0b10 << 62;
 
 /// The largest id accepted by [`user_data`].
@@ -533,6 +553,13 @@ impl IoUringDriver {
         self.handle().clear_cqe_hook()
     }
 
+    /// Change the batching wait of this driver. See [`set_min_wait`](fn@set_min_wait).
+    ///
+    /// Unlike the free function, this works outside of the runtime, e.g. before `block_on`.
+    pub fn set_min_wait(&self, wait: Option<Duration>, batch: u32) -> io::Result<()> {
+        self.handle().set_min_wait(wait, batch)
+    }
+
     /// Run `f` with this driver's [`IoUring`]. See [`with_ring`](fn@with_ring) for the contract.
     ///
     /// # Safety
@@ -591,6 +618,13 @@ impl Inner {
 
     fn clear_cqe_hook(&self) {
         unsafe { (*self.0.get()).external.set(None) }
+    }
+
+    fn set_min_wait(&self, wait: Option<Duration>, batch: u32) -> io::Result<()> {
+        // No other reference to the driver state is alive: the driver calls out only to wakers
+        // (which just queue tasks) and to the hook, which runs after the state is released (see
+        // `deliver`).
+        unsafe { (*self.0.get()).set_min_wait(wait, batch) }
     }
 
     pub(super) fn with_ring<R>(&self, f: impl FnOnce(&mut IoUring) -> R) -> R {
