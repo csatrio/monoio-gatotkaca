@@ -6,7 +6,11 @@ use std::{
 };
 
 use super::{OpAble, OpKind};
-use crate::driver::{self, raw::Cqe, uring::UringInner};
+use crate::driver::{
+    self,
+    raw::Cqe,
+    uring::{PreTake, Taken, UringInner},
+};
 
 /// A multishot operation in flight.
 ///
@@ -58,6 +62,32 @@ impl<T: OpAble + 'static> MultishotOp<T> {
             _ => self.index = usize::MAX,
         }
         Poll::Ready(next)
+    }
+
+    /// [`poll_next`](Self::poll_next), with the buffers the driver took when it reaped the CQE
+    /// (only after [`set_pretake`](Self::set_pretake)).
+    pub(crate) fn poll_next_taken(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<(Cqe, Option<Taken>)>> {
+        if self.index == usize::MAX {
+            return Poll::Ready(None);
+        }
+        let next = ready!(UringInner::poll_multi_taken(&self.driver.0, self.index, cx));
+        match &next {
+            Some((cqe, _)) if cqe.more() => {}
+            // The final CQE: the driver freed the slot.
+            _ => self.index = usize::MAX,
+        }
+        Poll::Ready(next)
+    }
+
+    /// Let the driver take the provided buffers of each CQE when it reaps it, in CQ order
+    /// (see [`PreTake`]). Call it right after the submit.
+    pub(crate) fn set_pretake(&self, pre: PreTake) {
+        if self.index != usize::MAX {
+            UringInner::set_pretake(&self.driver.0, self.index, pre);
+        }
     }
 
     /// The final CQE was returned by `poll_next`.

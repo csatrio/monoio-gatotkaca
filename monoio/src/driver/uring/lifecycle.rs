@@ -22,6 +22,7 @@ use std::{
 use super::ignored::IgnoredData;
 use crate::{
     driver::{
+        buf_ring::{BufRing, Bundle, SelectedBuf},
         op::{CompletionMeta, MaybeFd, OpAble, OpKind},
         raw::Cqe,
     },
@@ -91,6 +92,34 @@ impl<T: OpAble> Discard for Discarder<T> {
     }
 }
 
+/// Take the provided buffers of each CQE of a multishot op when the driver reaps it, instead of
+/// when the consumer polls (see [`MultiState::pretake`]).
+pub(crate) struct PreTake {
+    ring: BufRing,
+    bundle: bool,
+}
+
+impl PreTake {
+    pub(crate) fn new(ring: BufRing, bundle: bool) -> Self {
+        Self { ring, bundle }
+    }
+
+    #[inline]
+    fn take(&self, cqe: Cqe) -> Taken {
+        if self.bundle {
+            Taken::Bundle(self.ring.take_bundle(cqe))
+        } else {
+            Taken::Buf(self.ring.take(cqe))
+        }
+    }
+}
+
+/// What [`PreTake`] took for one CQE.
+pub(crate) enum Taken {
+    Buf(Option<SelectedBuf>),
+    Bundle(Bundle),
+}
+
 /// State of a multishot operation.
 #[derive(Default)]
 struct MultiState {
@@ -98,6 +127,14 @@ struct MultiState {
     /// CQEs not yet taken by the handle. Unbounded: the kernel keeps posting while the consumer
     /// does not poll. Its allocation is reused for the whole life of the op.
     queue: VecDeque<Cqe>,
+    /// With `pretake`: the buffers of the CQEs in `queue`, one entry per CQE. Declared before
+    /// `pretake` so the views drop before its ring handle.
+    taken: VecDeque<Taken>,
+    /// Take the buffers at reap time. Needed for incremental rings shared by several ops: the
+    /// offset of a piece of a buffer comes from the order of the CQEs on the ring, and a
+    /// partly used buffer may only go back to the ring once every CQE that points into it was
+    /// taken. Consumers poll in their own order, so the driver takes them, in CQ order.
+    pretake: Option<PreTake>,
     /// The final CQE (without `F_MORE`) is in `queue` or was taken.
     finished: bool,
     /// Set once the handle is dropped: owns the op data and discards every further CQE.
@@ -235,6 +272,9 @@ impl Ref<'_, MaybeFdLifecycle> {
                     #[cfg(any(test, feature = "metrics"))]
                     queued: Some(0),
                 };
+            }
+            if let Some(pre) = &state.pretake {
+                state.taken.push_back(pre.take(cqe));
             }
             state.queue.push_back(cqe);
             state.finished |= !more;
@@ -505,15 +545,26 @@ impl Ref<'_, MaybeFdLifecycle> {
 
     /// Next CQE of a multishot op. `Ready(None)` once the final CQE was taken. Taking the final
     /// CQE frees the slot.
-    pub(crate) fn poll_multi(mut self, cx: &mut Context<'_>) -> Poll<Option<Cqe>> {
+    pub(crate) fn poll_multi(self, cx: &mut Context<'_>) -> Poll<Option<Cqe>> {
+        self.poll_multi_taken(cx)
+            .map(|next| next.map(|(cqe, _)| cqe))
+    }
+
+    /// [`poll_multi`](Self::poll_multi), with the buffers taken at reap time if the op has a
+    /// [`PreTake`].
+    pub(crate) fn poll_multi_taken(
+        mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<(Cqe, Option<Taken>)>> {
         let Lifecycle::Multi(state) = &mut self.lifecycle else {
             return Poll::Ready(None);
         };
         if let Some(cqe) = state.queue.pop_front() {
+            let taken = state.taken.pop_front();
             if !cqe.more() {
                 self.remove();
             }
-            return Poll::Ready(Some(cqe));
+            return Poll::Ready(Some((cqe, taken)));
         }
         if state.finished {
             self.remove();
@@ -533,6 +584,11 @@ impl Ref<'_, MaybeFdLifecycle> {
             return true;
         };
         state.waker = None;
+        if state.pretake.is_some() {
+            // Already taken: dropping them releases the buffers.
+            state.taken.clear();
+            state.queue.clear();
+        }
         match data.as_mut() {
             Some(data) => state.queue.drain(..).for_each(|cqe| data.discard_cqe(cqe)),
             None => state.queue.clear(),
@@ -557,9 +613,22 @@ impl Ref<'_, MaybeFdLifecycle> {
         if !state.finished {
             return false;
         }
+        if state.pretake.is_some() {
+            state.taken.clear();
+            state.queue.clear();
+        }
         state.queue.drain(..).for_each(|cqe| data.discard_cqe(cqe));
         self.remove();
         true
+    }
+
+    /// Take the provided buffers of every later CQE of this multishot op at reap time. Set it
+    /// right after the submit, before the driver can reap a CQE of the op.
+    pub(crate) fn set_pretake(mut self, pre: PreTake) {
+        if let Lifecycle::Multi(state) = &mut self.lifecycle {
+            debug_assert!(state.queue.is_empty());
+            state.pretake = Some(pre);
+        }
     }
 
     /// Whether the kernel posted the final CQE of a multishot op.
