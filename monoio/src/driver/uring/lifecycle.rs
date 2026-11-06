@@ -122,7 +122,9 @@ pub(crate) struct Dropped {
     /// The kernel may still be running the op: an `AsyncCancel` may end it sooner.
     #[cfg_attr(not(feature = "async-cancel"), allow(dead_code))]
     pub(crate) cancel: bool,
-    /// The op data was kept in the slot: `Some(true)` inline, `Some(false)` boxed.
+    /// The op data was kept in the slot: `Some(true)` inline, `Some(false)` boxed. Only for
+    /// the `ignored_*` counters (and tests).
+    #[cfg(any(test, feature = "metrics"))]
     pub(crate) kept_inline: Option<bool>,
 }
 
@@ -132,7 +134,9 @@ pub(crate) struct Completed {
     /// A finished slot holding the data of a dropped op. Drop it once the driver no longer holds
     /// its own state: the drop may call back into the driver (a `SharedFd` closing, ...).
     pub(crate) deferred: Option<MaybeFdLifecycle>,
-    /// For a multishot op: the length of its CQE queue after this CQE.
+    /// For a multishot op: the length of its CQE queue after this CQE. Only for the multishot
+    /// counters (and tests).
+    #[cfg(any(test, feature = "metrics"))]
     pub(crate) queued: Option<usize>,
 }
 
@@ -166,11 +170,13 @@ impl Ref<'_, MaybeFdLifecycle> {
                 if more {
                     return Completed {
                         deferred: None,
+                        #[cfg(any(test, feature = "metrics"))]
                         queued: Some(0),
                     };
                 }
                 return Completed {
                     deferred: Some(self.remove()),
+                    #[cfg(any(test, feature = "metrics"))]
                     queued: Some(0),
                 };
             }
@@ -181,6 +187,7 @@ impl Ref<'_, MaybeFdLifecycle> {
             }
             return Completed {
                 deferred: None,
+                #[cfg(any(test, feature = "metrics"))]
                 queued: Some(state.queue.len()),
             };
         }
@@ -264,6 +271,7 @@ impl Ref<'_, MaybeFdLifecycle> {
             }
             None => Completed {
                 deferred: Some(self.remove()),
+                #[cfg(any(test, feature = "metrics"))]
                 queued: None,
             },
         }
@@ -312,15 +320,23 @@ impl Ref<'_, MaybeFdLifecycle> {
     /// The `Op` of this slot is dropped. Frees the slot if the op is finished, else keeps
     /// `data` in it until the final CQE.
     pub(crate) fn drop_op<T: 'static>(mut self, data: &mut Option<T>) -> Dropped {
+        #[cfg(any(test, feature = "metrics"))]
         let mut kept_inline = None;
+        #[cfg_attr(not(any(test, feature = "metrics")), allow(unused_mut))]
         let mut keep = |data: &mut Option<T>| -> IgnoredData {
             match data.take() {
                 Some(data) => {
-                    kept_inline = Some(IgnoredData::fits::<T>());
+                    #[cfg(any(test, feature = "metrics"))]
+                    {
+                        kept_inline = Some(IgnoredData::fits::<T>());
+                    }
                     IgnoredData::new(data)
                 }
                 None => {
-                    kept_inline = Some(true);
+                    #[cfg(any(test, feature = "metrics"))]
+                    {
+                        kept_inline = Some(true);
+                    }
                     IgnoredData::empty()
                 }
             }
@@ -349,6 +365,7 @@ impl Ref<'_, MaybeFdLifecycle> {
         };
         Dropped {
             cancel,
+            #[cfg(any(test, feature = "metrics"))]
             kept_inline,
         }
     }

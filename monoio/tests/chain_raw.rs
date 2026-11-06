@@ -32,11 +32,13 @@ fn timespec(d: Duration) -> Box<types::Timespec> {
 
 #[monoio::test]
 async fn nop_chain() {
+    #[cfg(feature = "metrics")]
     let before = monoio::driver_stats().chains_submitted;
     let op = unsafe { uring::submit_chain(uring::link([nop(), nop(), nop()]), "data") }.unwrap();
     let (cqes, data) = op.await;
     assert_eq!(data, "data");
     assert!(cqes.iter().all(|c| c.res() == 0), "{cqes:?}");
+    #[cfg(feature = "metrics")]
     assert_eq!(monoio::driver_stats().chains_submitted, before + 1);
 }
 
@@ -109,11 +111,13 @@ async fn chain_on_a_nearly_full_sq_is_not_split() {
         unsafe { uring::with_ring(|r| r.submission().len()) },
         capacity - 1
     );
+    #[cfg(feature = "metrics")]
     let flushes = monoio::driver_stats().sq_full_flushes;
 
     let mut buf = vec![0u8; 8];
     let sqes = uring::link([bad_read(&mut buf), nop()]);
     let op = unsafe { uring::submit_chain(sqes, buf) }.unwrap();
+    #[cfg(feature = "metrics")]
     assert!(monoio::driver_stats().sq_full_flushes > flushes);
     // Both chain SQEs are queued together, after the flush.
     assert_eq!(unsafe { uring::with_ring(|r| r.submission().len()) }, 2);
@@ -191,6 +195,7 @@ async fn link_timeout_in_a_chain() {
 #[monoio::test]
 async fn submit_with_timeout_fires() {
     let (a, _b) = UnixStream::pair().unwrap();
+    #[cfg(feature = "metrics")]
     let before = monoio::driver_stats().link_timeouts;
     let mut buf = vec![0u8; 8];
     let entry = opcode::Recv::new(types::Fd(a.as_raw_fd()), buf.as_mut_ptr(), 8).build();
@@ -199,12 +204,14 @@ async fn submit_with_timeout_fires() {
         .await;
     assert_eq!(cqe.res(), -libc::ECANCELED);
     // The timeout's CQE may come in a later tick.
+    #[cfg(feature = "metrics")]
     for _ in 0..20 {
         if monoio::driver_stats().link_timeouts > before {
             break;
         }
         raw_sleep(Duration::from_millis(1)).await;
     }
+    #[cfg(feature = "metrics")]
     assert_eq!(monoio::driver_stats().link_timeouts, before + 1);
 }
 
@@ -212,6 +219,7 @@ async fn submit_with_timeout_fires() {
 async fn submit_with_timeout_completes_in_time() {
     let (a, mut b) = UnixStream::pair().unwrap();
     b.write_all(b"hello").unwrap();
+    #[cfg(feature = "metrics")]
     let before = monoio::driver_stats().link_timeouts;
     let mut buf = vec![0u8; 8];
     let entry = opcode::Recv::new(types::Fd(a.as_raw_fd()), buf.as_mut_ptr(), 8).build();
@@ -221,6 +229,7 @@ async fn submit_with_timeout_completes_in_time() {
     assert_eq!(cqe.res(), 5);
     assert_eq!(&buf[..5], b"hello");
     raw_sleep(Duration::from_millis(1)).await;
+    #[cfg(feature = "metrics")]
     assert_eq!(monoio::driver_stats().link_timeouts, before);
 }
 

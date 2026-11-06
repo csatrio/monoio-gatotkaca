@@ -24,6 +24,7 @@ async fn std_thread_to_runtime_in_order() {
     assert_eq!(rx.recv().await, None);
     sender.join().unwrap();
     // Far fewer wakeups than messages.
+    #[cfg(feature = "metrics")]
     assert!(
         rx.wakeups() >= 1 && rx.wakeups() < N / 10,
         "{}",
@@ -74,6 +75,7 @@ async fn batch_wakes_once() {
         tx
     });
     let tx = t.join().unwrap();
+    #[cfg(feature = "metrics")]
     assert_eq!(rx.wakeups(), 0);
     for i in 0..100 {
         assert_eq!(rx.recv().await, Some(i));
@@ -81,6 +83,7 @@ async fn batch_wakes_once() {
     // Not waiting (queue non-empty or never found empty since): no write.
     tx.send(100).unwrap();
     tx.send(101).unwrap();
+    #[cfg(feature = "metrics")]
     assert_eq!(rx.wakeups(), 0);
     assert_eq!(rx.recv().await, Some(100));
     assert_eq!(rx.recv().await, Some(101));
@@ -93,13 +96,16 @@ async fn batch_wakes_once() {
         thread::sleep(Duration::from_millis(20));
     });
     assert_eq!(rx.recv().await, Some(0));
+    #[cfg(feature = "metrics")]
     assert_eq!(rx.wakeups(), 1);
     for i in 1..50 {
         assert_eq!(rx.recv().await, Some(i));
     }
     assert_eq!(rx.recv().await, None);
+    #[cfg(feature = "metrics")]
     assert_eq!(rx.wakeups(), 2);
     // A plain thread wakes through the eventfd.
+    #[cfg(feature = "metrics")]
     assert_eq!(rx.stats().eventfd_wakeups, 2);
     t.join().unwrap();
 }

@@ -46,6 +46,7 @@ async fn recv_several_messages_then_cancel() {
     }
     assert_eq!(got, b"onetwothree");
     assert!(!op.is_finished());
+    #[cfg(feature = "metrics")]
     assert!(monoio::driver_stats().multishot_cqes >= 3);
 
     // Not finished: the data stays with the op.
@@ -82,6 +83,7 @@ async fn cqes_queue_while_not_polled() {
         got.extend_from_slice(&ring.take(cqe).unwrap());
     }
     assert_eq!(got, b"abc");
+    #[cfg(feature = "metrics")]
     assert!(monoio::driver_stats().multishot_queue_high_water >= 2);
 }
 

@@ -1,4 +1,5 @@
 //! Driver statistics (`IoUringDriver::stats`, `monoio::driver_stats`).
+#![cfg(feature = "metrics")]
 
 use monoio::{
     io::{AsyncReadRentExt, AsyncWriteRentExt},
@@ -117,4 +118,17 @@ async fn dropped_read_counts_cancel() {
     assert_eq!(s.cancels_pushed, 1, "{s:?}");
     assert_eq!(s.cancels_lost, 0);
     drop(client);
+}
+
+// The counters live in the driver state; `metrics_off.rs` checks the other build.
+#[test]
+fn driver_state_holds_the_counters() {
+    use monoio::__private::{DRIVER_STATS_SIZE, URING_INNER_HAS_STATS, URING_INNER_SIZE};
+    const { assert!(URING_INNER_HAS_STATS) };
+    assert_eq!(
+        DRIVER_STATS_SIZE,
+        std::mem::size_of::<monoio::DriverStats>()
+    );
+    const { assert!(URING_INNER_SIZE > DRIVER_STATS_SIZE) };
+    eprintln!("UringInner: {URING_INNER_SIZE} bytes (DriverStats: {DRIVER_STATS_SIZE} bytes)");
 }

@@ -23,9 +23,13 @@ use std::{
 
 pub(crate) use self::fixed_files::register_fixed_files;
 use self::op::{CompletionMeta, Op, OpAble};
+#[doc(hidden)]
+pub use self::uring::layout;
 pub(crate) use self::uring::DriverOptions;
+#[cfg(feature = "metrics")]
+pub use self::uring::DriverStats;
+pub use self::uring::IoUringDriver;
 use self::uring::UringInner;
-pub use self::uring::{DriverStats, IoUringDriver};
 
 /// Unpark a runtime of another thread.
 pub(crate) mod unpark {
@@ -79,18 +83,24 @@ pub trait Driver {
 
 scoped_thread_local!(pub(crate) static CURRENT: Inner);
 
-/// The counters of the current thread's driver, see [`IoUringDriver::stats`].
+/// The counters of the current thread's driver, see [`IoUringDriver::stats`]. Needs the
+/// `metrics` feature.
 ///
 /// # Panics
 /// Panics if called outside of a monoio runtime.
+#[cfg(feature = "metrics")]
+#[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
 pub fn driver_stats() -> DriverStats {
     CURRENT.with(|inner| unsafe { (*inner.0.get()).stats() })
 }
 
 /// Reset the counters of the current thread's driver, see [`IoUringDriver::reset_stats`].
+/// Needs the `metrics` feature.
 ///
 /// # Panics
 /// Panics if called outside of a monoio runtime.
+#[cfg(feature = "metrics")]
+#[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
 pub fn reset_driver_stats() {
     CURRENT.with(|inner| unsafe { (*inner.0.get()).reset_stats() })
 }

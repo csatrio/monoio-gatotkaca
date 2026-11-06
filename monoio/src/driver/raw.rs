@@ -169,9 +169,8 @@ pub unsafe fn submit<T: Unpin + 'static>(entry: squeue::Entry, data: T) -> io::R
 ///
 /// If the operation did not complete within `timeout`, the kernel cancels it and its CQE carries
 /// `-ECANCELED` (some operations that cannot be interrupted complete normally instead). The
-/// timeout's own CQE is handled by the driver (counted in
-/// [`DriverStats::link_timeouts`](crate::DriverStats::link_timeouts) when it fired). This needs
-/// no timer: it works without `enable_timer`.
+/// timeout's own CQE is handled by the driver (counted in `DriverStats::link_timeouts` when it
+/// fired, with the `metrics` feature). This needs no timer: it works without `enable_timer`.
 ///
 /// # Safety
 /// Same as [`submit`](fn@submit). Also, the SQE must not set `IO_LINK`, `IO_HARDLINK` or
@@ -248,7 +247,7 @@ impl<T: 'static> OpAble for RawMultiSqe<T> {
 /// returns `None`.
 ///
 /// The queue is unbounded: while nobody polls, every CQE the kernel posts is kept (see
-/// [`DriverStats::multishot_queue_high_water`](crate::DriverStats::multishot_queue_high_water)).
+/// `DriverStats::multishot_queue_high_water`, with the `metrics` feature).
 /// The kernel itself stops a multishot op when it runs out of resources (`ENOBUFS` for an empty
 /// buffer ring, CQ overflow).
 ///

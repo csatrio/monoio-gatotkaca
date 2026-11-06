@@ -5,7 +5,6 @@
 /// Runs the statements only with the `metrics` feature; expands to nothing otherwise.
 ///
 /// `metric!(inner.stats.enter_wait += 1);`
-#[allow(unused_macros)]
 macro_rules! metric {
     ($($body:tt)*) => {
         #[cfg(feature = "metrics")]

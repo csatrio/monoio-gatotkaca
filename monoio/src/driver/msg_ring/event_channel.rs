@@ -6,6 +6,8 @@
 //!   rings once: through `MSG_RING` from a ring thread (see `driver::doorbell`), with an
 //!   eventfd write otherwise. A burst of messages costs one wakeup.
 
+#[cfg(feature = "metrics")]
+use std::sync::atomic::AtomicU64;
 use std::{
     fmt,
     future::{poll_fn, Future},
@@ -13,7 +15,7 @@ use std::{
     marker::PhantomData,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     sync::{
-        atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{fence, AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     task::Poll,
@@ -93,6 +95,7 @@ impl EventChannelBuilder {
             // SAFETY: `fd` is a fresh fd we own.
             efd: Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }),
             bell: Mutex::new(None),
+            #[cfg(feature = "metrics")]
             counters: Counters::default(),
         });
         let receiver = EventReceiver {
@@ -107,6 +110,7 @@ impl EventChannelBuilder {
     }
 }
 
+#[cfg(feature = "metrics")]
 #[derive(Default)]
 struct Counters {
     eventfd_wakeups: AtomicU64,
@@ -127,6 +131,7 @@ struct Shared<T> {
     /// The receiver's bell, set once it first waited on a ring. Locked only to wake and to
     /// (re)bind, never per message.
     bell: Mutex<Option<BellAddr>>,
+    #[cfg(feature = "metrics")]
     counters: Counters,
 }
 
@@ -148,13 +153,14 @@ impl<T> Shared<T> {
         let bell = self.bell.lock().unwrap_or_else(|e| e.into_inner()).clone();
         match bell {
             Some(addr) if doorbell::ring_from_current(&addr, &self.efd) => {
-                self.counters.ring_wakeups.fetch_add(1, Ordering::Relaxed);
+                metric!(self.counters.ring_wakeups.fetch_add(1, Ordering::Relaxed));
             }
             _ => {
                 doorbell::write_eventfd(&self.efd);
-                self.counters
+                metric!(self
+                    .counters
                     .eventfd_wakeups
-                    .fetch_add(1, Ordering::Relaxed);
+                    .fetch_add(1, Ordering::Relaxed));
             }
         }
     }
@@ -215,7 +221,7 @@ impl<T: Send> EventSender<T> {
             return Err(SendError::Disconnected(value));
         }
         if let Err(value) = shared.queue.push(value) {
-            shared.counters.full.fetch_add(1, Ordering::Relaxed);
+            metric!(shared.counters.full.fetch_add(1, Ordering::Relaxed));
             return Err(SendError::Full(value));
         }
         shared.wake_if_armed();
@@ -254,14 +260,22 @@ impl<T> fmt::Debug for EventSender<T> {
 
 type EventRead = RawOp<(Box<[u8; 8]>, Arc<OwnedFd>)>;
 
-/// Counters of an [`event_channel`].
+/// State and counters of an [`event_channel`]. The counters (all fields but `capacity`) need
+/// the `metrics` feature.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EventChannelStats {
     /// Wakeups by eventfd write (senders off a ring thread, or a failed `MSG_RING`).
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
     pub eventfd_wakeups: u64,
     /// Wakeups by `MSG_RING` from a ring thread, or rung directly on the receiver's ring.
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
     pub ring_wakeups: u64,
     /// Sends that failed with [`SendError::Full`].
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
     pub full: u64,
     /// Message slots currently mapped.
     pub capacity: u32,
@@ -394,18 +408,24 @@ impl<T: Send + 'static> EventReceiver<T> {
     }
 
     /// Wakeups so far (eventfd plus ring): one per wait that a message (or the last sender's
-    /// drop) ended. A measure of how well messages are batched.
+    /// drop) ended. A measure of how well messages are batched. Needs the `metrics` feature.
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
     pub fn wakeups(&self) -> u64 {
         let s = self.stats();
         s.eventfd_wakeups + s.ring_wakeups
     }
 
-    /// Counters of this channel.
+    /// The state (and, with the `metrics` feature, the counters) of this channel.
     pub fn stats(&self) -> EventChannelStats {
+        #[cfg(feature = "metrics")]
         let c = &self.shared.counters;
         EventChannelStats {
+            #[cfg(feature = "metrics")]
             eventfd_wakeups: c.eventfd_wakeups.load(Ordering::Relaxed),
+            #[cfg(feature = "metrics")]
             ring_wakeups: c.ring_wakeups.load(Ordering::Relaxed),
+            #[cfg(feature = "metrics")]
             full: c.full.load(Ordering::Relaxed),
             capacity: self.shared.queue.capacity(),
         }

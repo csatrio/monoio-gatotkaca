@@ -47,6 +47,7 @@ const REGISTER_RING_FDS: libc::c_uint = 20;
 const UNREGISTER_RING_FDS: libc::c_uint = 21;
 
 /// `IORING_CQE_F_NOTIF`: the notification CQE of a zero-copy send.
+#[cfg(feature = "metrics")]
 const CQE_F_NOTIF: u32 = 1 << 3;
 
 /// How often a full SQ is flushed before pushing an SQE gives up.
@@ -75,11 +76,13 @@ pub(crate) struct DriverOptions {
     pub(crate) skip_empty_enter: bool,
 }
 
-/// Counters of an [`IoUringDriver`], see [`IoUringDriver::stats`].
+/// Counters of an [`IoUringDriver`], see [`IoUringDriver::stats`]. Needs the `metrics` feature.
 ///
 /// They count from the creation of the driver or the last
 /// [`reset_stats`](IoUringDriver::reset_stats). Kernel async worker (io-wq) punts are not visible
 /// here: use the `io_uring:io_uring_queue_async_work` tracepoint for those.
+#[cfg(feature = "metrics")]
+#[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DriverStats {
     /// `io_uring_enter` calls that only submit.
@@ -102,8 +105,9 @@ pub struct DriverStats {
     pub cancels_pushed: u64,
     /// Cancels dropped because the SQ stayed full.
     pub cancels_lost: u64,
-    /// CQEs the kernel dropped because the CQ was full. This is the kernel's own counter, read at
-    /// every tick; [`reset_stats`](IoUringDriver::reset_stats) does not clear it.
+    /// CQEs the kernel dropped because the CQ was full. This is the kernel's own counter, read
+    /// by [`stats`](IoUringDriver::stats); [`reset_stats`](IoUringDriver::reset_stats) does not
+    /// clear it.
     pub cq_overflow: u64,
     /// Operations submitted by the driver (including `uring::submit`), indexed by the SQE opcode
     /// (`opcode::Nop::CODE`, ...). Opcodes from 63 up share the last slot. SQEs pushed through
@@ -135,6 +139,24 @@ pub struct DriverStats {
     pub ignored_boxed: u64,
 }
 
+/// `DriverStats` is all `u64`s: this many. Checked against the struct in metrics builds, so the
+/// `metrics_off` test can tell without the type that the driver holds no counters.
+const DRIVER_STATS_U64S: usize = 19 + 7 + 64;
+#[cfg(feature = "metrics")]
+const _: () = assert!(std::mem::size_of::<DriverStats>() == DRIVER_STATS_U64S * 8);
+
+/// Sizes for the `metrics_off` / `driver_stats` tests. Not API.
+#[doc(hidden)]
+pub mod layout {
+    /// `size_of::<DriverStats>()` (whether or not the type is compiled in).
+    pub const DRIVER_STATS_SIZE: usize = super::DRIVER_STATS_U64S * 8;
+    /// `size_of` the driver's inner state, which holds the counters with `metrics`.
+    pub const URING_INNER_SIZE: usize = std::mem::size_of::<super::UringInner>();
+    /// Whether the driver state holds a `DriverStats` (the `metrics` feature).
+    pub const URING_INNER_HAS_STATS: bool = cfg!(feature = "metrics");
+}
+
+#[cfg(feature = "metrics")]
 impl Default for DriverStats {
     fn default() -> Self {
         DriverStats {
@@ -309,7 +331,12 @@ pub(crate) struct UringInner {
     /// Enter settings.
     cfg: EnterConfig,
 
+    /// SQEs the kernel consumed (sum of the `io_uring_enter` results), never reset. State, not
+    /// a counter: `msg_ring_nowait` uses it to know when its SQEs were consumed.
+    sqes_consumed: u64,
+
     /// Counters, see [`IoUringDriver::stats`].
+    #[cfg(feature = "metrics")]
     stats: DriverStats,
 
     /// Finished slots of dropped ops, dropped by [`drop_deferred`] once the driver holds no
@@ -344,6 +371,8 @@ impl IoUringDriver {
             cfg: EnterConfig::new(&uring, opts),
             uring,
             external: Default::default(),
+            sqes_consumed: 0,
+            #[cfg(feature = "metrics")]
             stats: DriverStats::default(),
             deferred: Vec::new(),
             doorbells: Default::default(),
@@ -386,6 +415,8 @@ impl IoUringDriver {
             // Wake order does not matter: skip reversing each batch.
             waker_consumer: super::lf_queue::Consumer::unordered(),
             external: Default::default(),
+            sqes_consumed: 0,
+            #[cfg(feature = "metrics")]
             stats: DriverStats::default(),
             deferred: Vec::new(),
             doorbells: Default::default(),
@@ -404,15 +435,21 @@ impl IoUringDriver {
         Inner(self.inner.clone())
     }
 
-    /// The driver's counters (cheap: a copy of a few plain integers).
+    /// The driver's counters (cheap: a copy of a few plain integers, plus one read of the
+    /// kernel's CQ overflow counter). Needs the `metrics` feature.
     ///
     /// With the timer enabled, reach it with `runtime.driver().inner().stats()`; inside the
     /// runtime, [`crate::driver_stats`] works too.
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
     pub fn stats(&self) -> DriverStats {
         unsafe { (*self.inner.get()).stats() }
     }
 
-    /// Reset the counters to zero (except [`DriverStats::cq_overflow`]).
+    /// Reset the counters to zero (except [`DriverStats::cq_overflow`]). Needs the `metrics`
+    /// feature.
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
     pub fn reset_stats(&self) {
         unsafe { (*self.inner.get()).reset_stats() }
     }
@@ -429,7 +466,7 @@ impl IoUringDriver {
         debug_assert!(sq.capacity() >= need);
         if sq.len() + need > sq.capacity() {
             drop(sq);
-            inner.stats.sq_full_flushes += 1;
+            metric!(inner.stats.sq_full_flushes += 1);
             inner.submit()?;
         }
         Ok(())
@@ -572,7 +609,7 @@ impl Driver for IoUringDriver {
         if inner.nothing_to_enter() {
             // No enter, but the kernel may still pick buffers from task work.
             super::buf_ring::flush_pending();
-            inner.stats.enter_skipped += 1;
+            metric!(inner.stats.enter_skipped += 1);
         } else {
             inner.submit()?;
         }
@@ -600,40 +637,47 @@ impl Driver for IoUringDriver {
 }
 
 impl UringInner {
-    pub(super) fn stats(&self) -> DriverStats {
+    #[cfg(feature = "metrics")]
+    pub(super) fn stats(&mut self) -> DriverStats {
+        // The kernel's own counter: read on demand, not on every tick.
+        self.stats.cq_overflow = self.uring.completion().overflow() as u64;
         self.stats
     }
 
+    #[cfg(feature = "metrics")]
     pub(super) fn reset_stats(&mut self) {
-        self.stats = DriverStats {
-            cq_overflow: self.stats.cq_overflow,
-            ..DriverStats::default()
-        };
+        // `cq_overflow` is read from the kernel by `stats`, so it is never cleared.
+        self.stats = DriverStats::default();
+    }
+
+    /// SQEs the kernel consumed so far (never reset).
+    pub(crate) fn sqes_consumed(&self) -> u64 {
+        self.sqes_consumed
     }
 
     fn tick(&mut self) -> io::Result<()> {
         let cq = self.uring.completion();
-        self.stats.cq_overflow = cq.overflow() as u64;
 
+        #[cfg(feature = "metrics")]
         let mut n = 0_u64;
         for cqe in cq {
-            n += 1;
+            metric!(n += 1);
             let index = cqe.user_data();
             match index {
                 #[cfg(feature = "sync")]
                 EVENTFD_USERDATA => self.eventfd_installed = false,
                 // Operations of this driver: `user_data` is a slab index.
                 _ if index >> 62 == 0 => {
-                    if cqe.flags() & CQE_F_NOTIF != 0 {
+                    metric!(if cqe.flags() & CQE_F_NOTIF != 0 {
                         self.stats.zc_notifs += 1;
-                    }
+                    });
                     // SAFETY: the CQE comes from the kernel for the op at `index`.
                     let done = unsafe { self.ops.complete(index as _, cqe.result(), cqe.flags()) };
-                    if let Some(queued) = done.queued {
+                    metric!(if let Some(queued) = done.queued {
                         self.stats.multishot_cqes += 1;
                         let hw = &mut self.stats.multishot_queue_high_water;
                         *hw = (*hw).max(queued as u64);
-                    }
+                    });
                     if let Some(slot) = done.deferred {
                         self.deferred.push(slot);
                     }
@@ -646,6 +690,7 @@ impl UringInner {
                 }
                 // A link timeout of the driver: `-ETIME` means it fired (and cancelled its op),
                 // `-ECANCELED` that the op completed first.
+                #[cfg(feature = "metrics")]
                 LINK_TIMEOUT_USERDATA if cqe.result() == -libc::ETIME => {
                     self.stats.link_timeouts += 1
                 }
@@ -653,10 +698,12 @@ impl UringInner {
                 _ => (),
             }
         }
-        self.stats.cqes_reaped += n;
-        // Buckets 0, 1, 2-3, 4-7, ...: the bit length of `n`.
-        let bucket = (u64::BITS - n.leading_zeros()).min(6) as usize;
-        self.stats.cqes_per_tick[bucket] += 1;
+        metric!(
+            self.stats.cqes_reaped += n;
+            // Buckets 0, 1, 2-3, 4-7, ...: the bit length of `n`.
+            let bucket = (u64::BITS - n.leading_zeros()).min(6) as usize;
+            self.stats.cqes_per_tick[bucket] += 1;
+        );
         Ok(())
     }
 
@@ -733,11 +780,11 @@ impl UringInner {
             self.uring.as_raw_fd()
         };
 
-        if want > 0 {
+        metric!(if want > 0 {
             self.stats.enter_wait += 1;
         } else {
             self.stats.enter_submit += 1;
-        }
+        });
         // `arg` (and the timespec it points to) outlives the call.
         let ret = unsafe {
             libc::syscall(
@@ -753,7 +800,8 @@ impl UringInner {
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
-        self.stats.sqes_submitted += ret as u64;
+        self.sqes_consumed += ret as u64;
+        metric!(self.stats.sqes_submitted += ret as u64);
         Ok(ret as usize)
     }
 
@@ -780,7 +828,7 @@ impl UringInner {
             if free(self) >= n {
                 return Ok(());
             }
-            self.stats.sq_full_flushes += 1;
+            metric!(self.stats.sq_full_flushes += 1);
             if self.cfg.setup_flags & SETUP_SQPOLL != 0 {
                 // The SQ thread consumes SQEs on its own; wait until it did.
                 self.uring.submitter().squeue_wait()?;
@@ -799,7 +847,7 @@ impl UringInner {
     /// cancel instead of failing.
     fn push_cancel(&mut self, index: usize) {
         if self.reserve_sqe().is_err() {
-            self.stats.cancels_lost += 1;
+            metric!(self.stats.cancels_lost += 1);
             return;
         }
         // Reaping CQEs to make room may have completed (and freed) the operation.
@@ -811,9 +859,9 @@ impl UringInner {
             .user_data(u64::MAX);
         // Can't fail: `reserve_sqe` made room.
         if unsafe { self.uring.submission().push(&cancel) }.is_ok() {
-            self.stats.cancels_pushed += 1;
+            metric!(self.stats.cancels_pushed += 1);
         } else {
-            self.stats.cancels_lost += 1;
+            metric!(self.stats.cancels_lost += 1);
         }
     }
 
@@ -824,7 +872,7 @@ impl UringInner {
                 Err(ref e)
                     if matches!(e.kind(), io::ErrorKind::Other | io::ErrorKind::ResourceBusy) =>
                 {
-                    self.stats.busy_retries += 1;
+                    metric!(self.stats.busy_retries += 1);
                     self.tick()?;
                 }
                 #[cfg(not(feature = "unstable"))]
@@ -835,7 +883,7 @@ impl UringInner {
                     // https://github.com/tokio-rs/io-uring/blob/01c83bbce965d4aaf93ebfaa08c3aa8b7b0f5335/src/sys/mod.rs#L32
                     // So we can use https://doc.rust-lang.org/nightly/std/io/struct.Error.html#method.raw_os_error
                     // to get the raw error code.
-                    self.stats.busy_retries += 1;
+                    metric!(self.stats.busy_retries += 1);
                     self.tick()?;
                 }
                 e => return e.map(|_| ()),
@@ -859,11 +907,13 @@ impl UringInner {
             }
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
-        let opcode = (sqe.get_opcode() as usize).min(63);
-        self.stats.ops_by_opcode[opcode] += 1;
-        if T::KIND == OpKind::ZeroCopy {
-            self.stats.zc_sends += 1;
-        }
+        metric!(
+            let opcode = (sqe.get_opcode() as usize).min(63);
+            self.stats.ops_by_opcode[opcode] += 1;
+            if T::KIND == OpKind::ZeroCopy {
+                self.stats.zc_sends += 1;
+            }
+        );
 
         // The SQE is visible to the kernel once the tail is published. We don't enter now: the
         // runtime submits on `park` (or `submit`) when it waits for IO.
@@ -892,10 +942,12 @@ impl UringInner {
             }
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
-        for sqe in &sqes {
-            self.stats.ops_by_opcode[(sqe.get_opcode() as usize).min(63)] += 1;
-        }
-        self.stats.chains_submitted += 1;
+        metric!(
+            for sqe in &sqes {
+                self.stats.ops_by_opcode[(sqe.get_opcode() as usize).min(63)] += 1;
+            }
+            self.stats.chains_submitted += 1;
+        );
         Ok(slots)
     }
 
@@ -921,6 +973,7 @@ impl UringInner {
             .build()
             .user_data(LINK_TIMEOUT_USERDATA);
 
+        #[cfg(feature = "metrics")]
         let opcode = (sqe.get_opcode() as usize).min(63);
 
         // Can't fail after `reserve_sqes`; if it does, free the slot again.
@@ -930,7 +983,7 @@ impl UringInner {
             }
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
-        self.stats.ops_by_opcode[opcode] += 1;
+        metric!(self.stats.ops_by_opcode[opcode] += 1);
         Ok(index)
     }
 
@@ -1026,11 +1079,11 @@ impl UringInner {
         }
         if let Some(lifecycle) = inner.ops.slab.get(index) {
             let dropped = lifecycle.drop_op(data);
-            match dropped.kept_inline {
+            metric!(match dropped.kept_inline {
                 Some(true) => inner.stats.ignored_inline += 1,
                 Some(false) => inner.stats.ignored_boxed += 1,
                 None => {}
-            }
+            });
             #[cfg(feature = "async-cancel")]
             if dropped.cancel && !_skip_cancel {
                 inner.push_cancel(index);
@@ -1100,7 +1153,7 @@ impl UringInner {
         // Can't fail: `reserve_sqe` made room.
         unsafe { inner.uring.submission().push(&cancel) }
             .map_err(|_| io::Error::from_raw_os_error(libc::EBUSY))?;
-        inner.stats.cancel_fd_pushed += 1;
+        metric!(inner.stats.cancel_fd_pushed += 1);
         Ok(())
     }
 

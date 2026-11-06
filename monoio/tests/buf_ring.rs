@@ -261,6 +261,7 @@ async fn batch_publish_needs_a_publish() {
     let second = ring.take(recv_one(&a, &ring).await).unwrap();
     let freed = [first.bid(), second.bid()];
     drop((first, second));
+    #[cfg(feature = "metrics")]
     assert_eq!(ring.stats().recycled, 2);
     ring.publish();
 
@@ -286,6 +287,7 @@ async fn batch_publish_is_flushed_by_the_driver() {
         let buf = ring.take(recv_one(&a, &ring).await).unwrap();
         assert_eq!(&*buf, msg);
     }
+    #[cfg(feature = "metrics")]
     assert_eq!(ring.stats().enobufs, 0);
 }
 
@@ -311,6 +313,7 @@ async fn kernel_allocated_ring() {
         let buf = ring.take(recv_one(&a, &ring).await).unwrap();
         assert_eq!(&*buf, msg.as_bytes());
     }
+    #[cfg(feature = "metrics")]
     assert_eq!(ring.stats().recycled, 6);
 }
 
@@ -380,6 +383,7 @@ async fn incremental_buffer_holds_several_messages() {
         assert_eq!((b1.offset(), &**b1), (10, &[b'b'; 20][..]));
     }
     assert_eq!(ring.stats().in_use, 1);
+    #[cfg(feature = "metrics")]
     assert_eq!(ring.stats().taken, 2);
 
     // 40 more bytes: 34 finish the first buffer, the rest goes to the second one.
@@ -415,12 +419,15 @@ async fn incremental_buffer_holds_several_messages() {
     assert_eq!(second.1.offset(), 0);
     assert!(uring::cqueue::buffer_more(second.0.flags()));
     assert_eq!(ring.stats().in_use, 2);
+    #[cfg(feature = "metrics")]
     assert_eq!(ring.stats().recycled, 0);
 
     // Dropping all views of the first buffer recycles it; the second stays with the kernel.
     views.retain(|(_, b)| b.bid() != first);
+    #[cfg(feature = "metrics")]
     assert_eq!(ring.stats().recycled, 1);
     drop(views);
+    #[cfg(feature = "metrics")]
     assert_eq!(ring.stats().recycled, 1);
     assert_eq!(ring.stats().in_use, 0);
 
@@ -473,11 +480,13 @@ async fn detach_copies_and_recycles_at_once() {
     assert_eq!(ring.stats().in_use, 1);
     assert_eq!(buf.detach(), b"hello");
     assert_eq!(ring.stats().in_use, 0);
+    #[cfg(feature = "metrics")]
     assert_eq!(ring.stats().recycled, 1);
 
     b.write_all(b"bytes").unwrap();
     let buf = ring.take(recv_one(&a, &ring).await).unwrap();
     assert_eq!(buf.into_bytes(), &b"bytes"[..]);
+    #[cfg(feature = "metrics")]
     assert_eq!(ring.stats().recycled, 2);
 }
 
@@ -495,12 +504,17 @@ async fn stats_count_use_and_enobufs() {
     assert!(ring.take(recv_one(&a, &ring).await).is_none());
 
     let stats = ring.stats();
-    assert_eq!((stats.in_use, stats.high_water), (2, 2));
+    assert_eq!(stats.in_use, 2);
+    #[cfg(feature = "metrics")]
+    assert_eq!(stats.high_water, 2);
+    #[cfg(feature = "metrics")]
     assert_eq!((stats.taken, stats.enobufs, stats.recycled), (2, 1, 0));
 
     drop(first);
     let stats = ring.stats();
-    assert_eq!((stats.in_use, stats.high_water, stats.recycled), (1, 2, 1));
+    assert_eq!(stats.in_use, 1);
+    #[cfg(feature = "metrics")]
+    assert_eq!((stats.high_water, stats.recycled), (2, 1));
     drop(second);
 }
 
@@ -572,5 +586,6 @@ async fn mixed_single_and_bundle_receives_with_scrambled_recycling() {
     assert!(got == sent, "data corrupted");
     assert!(bundles_seen > 0);
     assert_eq!(ring.stats().in_use, 0);
+    #[cfg(feature = "metrics")]
     assert_eq!(ring.stats().taken, ring.stats().recycled);
 }

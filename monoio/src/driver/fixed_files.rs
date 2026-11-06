@@ -62,7 +62,8 @@ struct FileIndexRange {
     resv: u64,
 }
 
-/// Counters of the current ring's fixed file table, see [`fixed_file_stats`].
+/// State and counters of the current ring's fixed file table, see [`fixed_file_stats`]. The
+/// counters (`high_water`, `exhausted`) need the `metrics` feature.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FixedFileStats {
@@ -73,6 +74,8 @@ pub struct FixedFileStats {
     /// by an `accept_direct` that has not completed.
     pub in_use: u32,
     /// The highest `in_use` seen.
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
     pub high_water: u32,
     /// Slots the kernel allocates (multishot direct accept):
     /// [`with_fixed_files_kernel_alloc`](crate::RuntimeBuilder::with_fixed_files_kernel_alloc).
@@ -80,6 +83,8 @@ pub struct FixedFileStats {
     /// Kernel-allocated slots owned by a stream (or whose close is in flight).
     pub kernel_in_use: u32,
     /// Requests for a runtime slot that found the table full.
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
     pub exhausted: u64,
 }
 
@@ -237,12 +242,12 @@ impl FileTable {
             Some(slot) => {
                 self.update_stats(|s| {
                     s.in_use += 1;
-                    s.high_water = s.high_water.max(s.in_use);
+                    metric!(s.high_water = s.high_water.max(s.in_use));
                 });
                 Ok(slot)
             }
             None => {
-                self.update_stats(|s| s.exhausted += 1);
+                metric!(self.update_stats(|s| s.exhausted += 1));
                 Err(io::Error::from_raw_os_error(libc::ENFILE))
             }
         }

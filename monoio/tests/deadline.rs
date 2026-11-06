@@ -24,6 +24,7 @@ async fn pair() -> (TcpStream, StdTcpStream) {
 #[monoio::test]
 async fn read_times_out_and_returns_the_buffer() {
     let (stream, _peer) = pair().await;
+    #[cfg(feature = "metrics")]
     let before = monoio::driver_stats().link_timeouts;
     let start = Instant::now();
     let (res, buf) = stream
@@ -35,6 +36,7 @@ async fn read_times_out_and_returns_the_buffer() {
     assert_eq!(buf.capacity(), 64);
 
     // The timeout's own CQE is counted once it was reaped.
+    #[cfg(feature = "metrics")]
     for _ in 0..20 {
         if monoio::driver_stats().link_timeouts > before {
             break;
@@ -43,6 +45,7 @@ async fn read_times_out_and_returns_the_buffer() {
             .read_with_deadline(Vec::with_capacity(1), Duration::from_millis(1))
             .await;
     }
+    #[cfg(feature = "metrics")]
     assert!(monoio::driver_stats().link_timeouts > before);
 }
 
