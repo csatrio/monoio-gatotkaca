@@ -14,6 +14,8 @@ pub mod macros;
 #[doc(hidden)]
 pub use monoio_macros::select_priv_declare_output_enum;
 #[macro_use]
+mod metrics;
+#[macro_use]
 mod driver;
 pub(crate) mod builder;
 pub(crate) mod runtime;

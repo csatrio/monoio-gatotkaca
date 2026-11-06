@@ -75,6 +75,8 @@ macros = ["monoio-macros"]
 sync = ["threadpool", "once_cell"]
 # enable bind cpu set
 utils = ["nix"]
+# compile in the runtime counters (driver_stats, runtime_stats, pool counters); off: no instrumentation on hot paths
+metrics = []
 # enable debug if you want to know what runtime does
 debug = ["tracing"]
 # signal enables setting ctrl_c handler

@@ -8,6 +8,10 @@ version = "0.0.0"
 # If you copy one of the examples into a new project, you should be using
 # [dependencies] instead. In additional, if you want to know how runtime
 # works, you can enable "debug" feature.
+[features]
+# forward the runtime counters (`cargo run -p monoio-examples --features metrics --example ..`)
+metrics = ["monoio/metrics"]
+
 [dev-dependencies]
 monoio = { workspace = true, features = [
     "async-cancel",
