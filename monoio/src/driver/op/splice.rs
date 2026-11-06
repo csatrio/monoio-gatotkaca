@@ -5,14 +5,18 @@ use std::io;
 use io_uring::opcode;
 
 use super::{super::shared_fd::SharedFd, Op, OpAble};
-use crate::driver::shared_fd::sqe_fd;
+use crate::driver::shared_fd::{sqe_fd, RxFd, TxFd};
 
 /// A splice between two fds. An offset of `-1` means "use (and advance) the fd's own position";
 /// it must be `-1` for the pipe end.
+///
+/// Either end may be a stream socket: the splice counts as a receive in flight on `fd_in` and
+/// as a send in flight on `fd_out` (see `InFlight` in `shared_fd.rs`), so `try_recv` /
+/// `try_send` on that socket are refused meanwhile. On a file or a pipe the count is unused.
 pub(crate) struct Splice {
-    fd_in: SharedFd,
+    fd_in: RxFd,
     off_in: i64,
-    fd_out: SharedFd,
+    fd_out: TxFd,
     off_out: i64,
     len: u32,
 }
@@ -43,9 +47,9 @@ impl Op<Splice> {
         len: u32,
     ) -> io::Result<Op<Splice>> {
         Op::submit_with(Splice {
-            fd_in: fd_in.clone(),
+            fd_in: RxFd::new(fd_in.clone()),
             off_in,
-            fd_out: fd_out.clone(),
+            fd_out: TxFd::new(fd_out.clone()),
             off_out,
             len,
         })
