@@ -254,6 +254,33 @@ impl BatchAcceptor {
         fd: &SharedFd,
         flags: libc::c_int,
         max: usize,
+        push: impl FnMut(SharedFd) -> bool,
+    ) -> io::Result<usize> {
+        self.run(fd, flags, false, max, push).await
+    }
+
+    /// Like [`accept`](Self::accept) on a multishot *direct* accept: `push` gets direct-only
+    /// fds in kernel-allocated slots of the current ring's fixed file table. Fails like
+    /// `AcceptMultiOp::new_direct` without them. Use one acceptor per kind: an armed accept is
+    /// never switched to the other.
+    pub(crate) async fn accept_direct(
+        &self,
+        fd: &SharedFd,
+        flags: libc::c_int,
+        max: usize,
+        push: impl FnMut(SharedFd) -> bool,
+    ) -> io::Result<usize> {
+        // What `new_direct` arms with, so that the flags of later calls compare equal.
+        self.run(fd, flags & !libc::SOCK_CLOEXEC, true, max, push)
+            .await
+    }
+
+    async fn run(
+        &self,
+        fd: &SharedFd,
+        flags: libc::c_int,
+        direct: bool,
+        max: usize,
         mut push: impl FnMut(SharedFd) -> bool,
     ) -> io::Result<usize> {
         if self.busy.replace(true) {
@@ -277,7 +304,11 @@ impl BatchAcceptor {
                         }
                     }
                     _ => {
-                        *op = Some(AcceptMultiOp::new(fd, flags)?);
+                        *op = Some(if direct {
+                            AcceptMultiOp::new_direct(fd, flags)?
+                        } else {
+                            AcceptMultiOp::new(fd, flags)?
+                        });
                         fresh = true;
                     }
                 }

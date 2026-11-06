@@ -52,7 +52,9 @@ use crate::{
 /// ```
 ///
 /// [`accept_batch`](Self::accept_batch) / [`accept_batch_into`](Self::accept_batch_into)
-/// keep the multishot accept inside the listener. To own it, use
+/// keep the multishot accept inside the listener;
+/// [`accept_batch_direct_into`](Self::accept_batch_direct_into) is the same loop with
+/// direct-only streams (no fd, no syscall per connection). To own it, use
 /// [`accept_multi`](Self::accept_multi) and [`AcceptStream::next_batch`](super::AcceptStream::next_batch)
 /// (or `next()` per connection: still no SQE per connection, and queued connections are taken
 /// one per poll without waiting for a new round trip). Both re-arm themselves when the kernel
@@ -62,6 +64,8 @@ pub struct TcpListener {
     sys_listener: Option<std::net::TcpListener>,
     meta: UnsafeCell<ListenerMeta>,
     batch: BatchAcceptor,
+    // The multishot direct accept of `accept_batch_direct`.
+    batch_direct: BatchAcceptor,
 }
 
 impl TcpListener {
@@ -73,6 +77,7 @@ impl TcpListener {
             sys_listener: Some(sys_listener),
             meta: UnsafeCell::new(ListenerMeta::default()),
             batch: BatchAcceptor::default(),
+            batch_direct: BatchAcceptor::default(),
         }
     }
 
@@ -116,6 +121,62 @@ impl TcpListener {
         self.batch
             .accept(&self.fd, flags.bits(), max, |fd| {
                 super::multishot::push_with_addr(dst, fd)
+            })
+            .await
+    }
+
+    /// [`accept_batch`](Self::accept_batch) on a multishot *direct* accept: every connection
+    /// goes straight into a kernel-allocated slot of the fixed file table and comes out as a
+    /// direct-only [`TcpStream`] (no fd, see [`TcpStream::is_direct`]). Per connection this
+    /// costs no syscall at all: no `accept4`, no `io_uring_register` (as
+    /// [`register_fixed`](TcpStream::register_fixed) does), no `getpeername`; and every op on
+    /// the stream skips the kernel's fd lookup.
+    ///
+    /// Same contract as [`accept_batch`](Self::accept_batch): the first call arms a multishot
+    /// accept that stays armed in the listener, a call returns at least one and up to `max`
+    /// connections, everything already accepted in one poll; one task at a time
+    /// (`ResourceBusy`); the same `flags` on every call while it is armed (`InvalidInput`
+    /// otherwise; `CLOEXEC` is ignored); an error ends the multishot, is returned after the
+    /// connections taken before it, and the next call arms a new one. It is armed separately
+    /// from the one of `accept_batch`; used together, the two compete for connections.
+    ///
+    /// Differences:
+    /// - Needs [`RuntimeBuilder::with_fixed_files_kernel_alloc`](crate::RuntimeBuilder::with_fixed_files_kernel_alloc)
+    ///   (Linux 6.0+): `Unsupported` without it, like
+    ///   [`accept_multi_direct`](Self::accept_multi_direct).
+    /// - No peer addresses: the kernel reports none with a multishot accept, and a
+    ///   direct-only stream cannot ask ([`TcpStream::peer_addr`] fails).
+    /// - When all kernel slots are taken the accept ends with `ENFILE`, **and the kernel
+    ///   closes the connection it had just accepted** (it has no slot to put it in). Size the
+    ///   kernel range for the most connections you serve, and do not call again at once after
+    ///   `ENFILE`: slots come back when streams are closed
+    ///   ([`fixed_file_stats`](crate::uring::fixed_file_stats)).
+    /// - Socket options and a full shutdown go through the ring:
+    ///   [`TcpStream::set_nodelay_async`], [`TcpStream::set_sockopt`],
+    ///   [`TcpStream::shutdown_with`].
+    pub async fn accept_batch_direct(
+        &self,
+        max: usize,
+        flags: AcceptFlags,
+    ) -> io::Result<Vec<TcpStream>> {
+        let mut dst = Vec::new();
+        self.accept_batch_direct_into(&mut dst, max, flags).await?;
+        Ok(dst)
+    }
+
+    /// [`accept_batch_direct`](Self::accept_batch_direct) appending to `dst` (not cleared), so
+    /// a loop that drains one `Vec` allocates nothing. Returns how many were appended (at
+    /// least 1).
+    pub async fn accept_batch_direct_into(
+        &self,
+        dst: &mut Vec<TcpStream>,
+        max: usize,
+        flags: AcceptFlags,
+    ) -> io::Result<usize> {
+        self.batch_direct
+            .accept_direct(&self.fd, flags.bits(), max, |fd| {
+                dst.push(TcpStream::from_shared_fd(fd));
+                true
             })
             .await
     }
