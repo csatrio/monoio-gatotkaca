@@ -227,6 +227,10 @@ never sleeps; [F] after a sleep exactly `min_complete` items (1, 8, 64) although
    the last one ([A]). By the source it can be set for a moment with no work left (an item added while a run
    starts), which costs one empty enter (about 0.26 µs, [H]), never the reverse for work a run left behind.
    So `while n < max && sq.taskrun()` is the right loop condition.
+   **Lead's note after r3-drain:** this holds for `min_complete <= 1`. A run that was asked for more events
+   than it handled (`min_wait`, or a drain with `min_complete = cq.len()`) loops inside the kernel, and an
+   item queued during that loop sets the flag and is handled by the same run, so the flag can stay set with
+   nothing pending (r3-drain.md: most drain enters after `minwait80` came back empty).
 4. **`want = cq.len()` is valid, with two conditions.**
    - It never sleeps as long as `want` ≤ the CQEs that are in the CQ and not reaped ([D], [E]), and it runs up
      to max(20, `want`) items.

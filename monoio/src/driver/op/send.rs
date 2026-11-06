@@ -37,10 +37,14 @@ const EAGER_POLL_FIRST: u32 = 1 << 31;
 const EAGER_SENT: u32 = EAGER_POLL_FIRST - 1;
 
 impl<T: IoBuf> Op<Send<T>> {
+    // Inlined into the caller's future: whether these land inline decided 1-3% of the user
+    // instructions per request in round 3 (r3-op, r3-slot, r3-eager notes).
+    #[inline(always)]
     pub(crate) fn send(fd: SharedFd, buf: T) -> SubmitResult<Self, T> {
         Self::send_with_flags(fd, buf, 0)
     }
 
+    #[inline(always)]
     pub(crate) fn send_with_flags(
         fd: SharedFd,
         buf: T,

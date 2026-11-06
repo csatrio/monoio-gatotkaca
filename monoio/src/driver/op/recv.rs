@@ -37,11 +37,14 @@ pub(crate) struct Recv<T> {
 const RECVSEND_POLL_FIRST: u16 = 1 << 0;
 
 impl<T: IoBufMut> Op<Recv<T>> {
+    // Inlined into the caller's future, see `Op::send`.
+    #[inline(always)]
     pub(crate) fn recv(fd: SharedFd, buf: T) -> SubmitResult<Self, T> {
         Self::recv_with(fd, buf, 0, false)
     }
 
     /// Receive with `MSG_*` flags; `poll_first` sets `IORING_RECVSEND_POLL_FIRST`.
+    #[inline(always)]
     pub(crate) fn recv_with(
         fd: SharedFd,
         buf: T,

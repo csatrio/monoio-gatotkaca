@@ -59,8 +59,9 @@ one server core
                        its stream chunks; may exceed --chunk)
   --think US           client pause between a reply and its next frame, microseconds (default 0)
   --path P             plain | pipe | mshot | eager | pair (default pipe)
-  --deadline D         none | timeout (default none)
-  --ring a,b,..        coop, defer, skipenter, ringfd, fixedfd, minwait<us> (default: none)
+  --deadline D         none | timeout | coarse | timeoutpin | deadline | nonepin (default none)
+  --ring a,b,..        coop, defer, skipenter, ringfd, fixedfd, minwait<us>, drain<N>, draincq<N>
+                       (default: none)
   --entries N          server ring entries (default 4096)
   --cq N               server completion queue size (default: 2 x entries)
   --bufring N,SZ       path mshot: buffers in the ring and their size (default 4096,16k)
@@ -412,11 +413,8 @@ fn main() {
     let fixedfd = a.ring.iter().any(|r| r == "fixedfd");
     // Both ends of every connection are in this process; a fixed file table may not be
     // larger than the limit either.
-    let need = (2 * (a.conns + a.bulk) + 64).max(if fixedfd {
-        accept::FIXED_FILES as usize + 64
-    } else {
-        0
-    });
+    let tables = usize::from(fixedfd) + usize::from(a.direct);
+    let need = (2 * (a.conns + a.bulk) + 64).max(tables * accept::FIXED_FILES as usize + 64);
     match measure::raise_nofile(need as u64) {
         Ok(None) => {}
         Ok(Some((old, new))) => eprintln!("reqresp: raised RLIMIT_NOFILE from {old} to {new}"),
@@ -434,6 +432,7 @@ fn main() {
             },
         ),
         ("deadline", a.deadline.name().to_string()),
+        ("accept", if a.direct { "direct" } else { "fd" }.to_string()),
         ("conns", a.conns.to_string()),
         (
             "sizes",

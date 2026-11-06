@@ -93,11 +93,23 @@ where
     S: Schedule,
 {
     let ptr = header as *const ();
-    let vtable = &RawWakerVTable::new(
+    RawWaker::new(ptr, vtable::<T, S>())
+}
+
+/// One vtable address per task type. `Waker::will_wake` compares the vtable pointer, and a
+/// promoted constant inlined at two call sites (`waker_ref`, `clone_waker`) got two addresses,
+/// so `will_wake` was false for the same task and every re-poll of an in-flight op or timer
+/// cloned a waker and dropped one.
+#[inline(never)]
+fn vtable<T, S>() -> &'static RawWakerVTable
+where
+    T: Future,
+    S: Schedule,
+{
+    &RawWakerVTable::new(
         clone_waker::<T, S>,
         wake_by_val::<T, S>,
         wake_by_ref::<T, S>,
         drop_waker::<T, S>,
-    );
-    RawWaker::new(ptr, vtable)
+    )
 }
