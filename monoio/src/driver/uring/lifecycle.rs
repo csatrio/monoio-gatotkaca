@@ -107,7 +107,41 @@ struct MultiState {
 pub(crate) struct MaybeFdLifecycle {
     is_fd: bool,
     kind: OpKind,
+    /// The SQE opcode, recorded at submit for `op_ticks_by_opcode`; [`NO_TICKS`] once the first
+    /// CQE was measured (or never recorded).
+    #[cfg(feature = "metrics")]
+    #[allow(dead_code)] // read by the driver/uring/mod.rs hook (W1-file request)
+    opcode: u8,
+    /// The driver tick counter when the SQE was pushed.
+    #[cfg(feature = "metrics")]
+    #[allow(dead_code)] // see `opcode`
+    submit_tick: u32,
     lifecycle: Lifecycle,
+}
+
+/// `MaybeFdLifecycle::opcode` when there is nothing (more) to measure.
+#[cfg(feature = "metrics")]
+const NO_TICKS: u8 = u8::MAX;
+
+/// Buckets of [`op_ticks_bucket`]: completed in the first tick after the submitting enter, one
+/// tick later, 2-3 ticks later, 4 or more.
+#[cfg(feature = "metrics")]
+#[allow(dead_code)] // used by the driver/uring/mod.rs hook (W1-file request)
+pub(crate) const OP_TICK_BUCKETS: usize = 4;
+
+/// The bucket for an op pushed while the tick counter was `submit` and reaped in tick `now`
+/// (the counter is bumped at the start of each tick, so the first tick that can see the CQE of
+/// an inline op is `submit + 1`). Wrapping-safe.
+#[cfg(feature = "metrics")]
+#[inline]
+#[allow(dead_code)] // see `OP_TICK_BUCKETS`
+pub(crate) fn op_ticks_bucket(submit: u32, now: u32) -> usize {
+    match now.wrapping_sub(submit).saturating_sub(1) {
+        0 => 0,
+        1 => 1,
+        2 | 3 => 2,
+        _ => 3,
+    }
 }
 
 /// The first CQE of a zero-copy send, see [`Ref::poll_zc_first`].
@@ -150,8 +184,36 @@ impl MaybeFdLifecycle {
         Self {
             is_fd,
             kind,
+            #[cfg(feature = "metrics")]
+            opcode: NO_TICKS,
+            #[cfg(feature = "metrics")]
+            submit_tick: 0,
             lifecycle,
         }
+    }
+
+    /// Record the opcode and the driver's tick counter at submit (`metrics` only).
+    #[cfg(feature = "metrics")]
+    #[inline]
+    #[allow(dead_code)] // called by the driver/uring/mod.rs hook (W1-file request)
+    pub(crate) fn set_submit_tick(&mut self, opcode: u32, tick: u32) {
+        // Opcodes from 63 up share the last slot, like `ops_by_opcode`.
+        self.opcode = opcode.min(63) as u8;
+        self.submit_tick = tick;
+    }
+
+    /// For the first CQE of the op: `(opcode, bucket)` of its completion latency in ticks, see
+    /// [`op_ticks_bucket`]. `None` for later CQEs (zero-copy notification, further multishot
+    /// CQEs) and for slots without a recorded submit. Call before `Ref::complete`.
+    #[cfg(feature = "metrics")]
+    #[inline]
+    #[allow(dead_code)] // see `set_submit_tick`
+    pub(crate) fn take_op_ticks(&mut self, now: u32) -> Option<(usize, usize)> {
+        if self.opcode == NO_TICKS {
+            return None;
+        }
+        let opcode = std::mem::replace(&mut self.opcode, NO_TICKS) as usize;
+        Some((opcode, op_ticks_bucket(self.submit_tick, now)))
     }
 }
 
@@ -937,6 +999,29 @@ mod tests {
         assert_eq!(dropped.kept_inline, Some(true));
         unsafe { slab.get(key).unwrap().complete(0, 0) };
         assert!(slab.get(key).is_none());
+    }
+
+    /// Tick-latency buckets: same tick, 1, 2-3, 4+; only the first CQE counts.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn op_ticks_buckets() {
+        use super::op_ticks_bucket;
+        assert_eq!(op_ticks_bucket(5, 5), 0);
+        assert_eq!(op_ticks_bucket(5, 6), 0);
+        assert_eq!(op_ticks_bucket(5, 7), 1);
+        assert_eq!(op_ticks_bucket(5, 8), 2);
+        assert_eq!(op_ticks_bucket(5, 9), 2);
+        assert_eq!(op_ticks_bucket(5, 10), 3);
+        assert_eq!(op_ticks_bucket(u32::MAX, 0), 0);
+        assert_eq!(op_ticks_bucket(u32::MAX - 1, 2), 2);
+
+        let mut slab = Slab::new();
+        let key = insert_zc(&mut slab);
+        assert_eq!(slab.get(key).unwrap().take_op_ticks(1), None);
+        slab.get(key).unwrap().set_submit_tick(26, 1);
+        assert_eq!(slab.get(key).unwrap().take_op_ticks(4), Some((26, 2)));
+        assert_eq!(slab.get(key).unwrap().take_op_ticks(9), None);
+        assert_eq!(super::OP_TICK_BUCKETS, 4);
     }
 
     /// The slot size the inline data costs.

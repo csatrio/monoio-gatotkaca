@@ -510,6 +510,11 @@ impl File {
     /// the background, but there is no guarantee as to **when** the close
     /// operation will complete.
     ///
+    /// Closing by fd (`IORING_OP_CLOSE`) runs the filesystem's `->flush` hook; on filesystems
+    /// that have one (f2fs, NFS, FUSE, ...) io_uring punts the close to an io-wq worker. A
+    /// direct-only file ([`OpenOptions::open_direct`]) is closed by removing its fixed-table
+    /// slot, which always runs inline.
+    ///
     /// # Examples
     ///
     /// ```no_run
