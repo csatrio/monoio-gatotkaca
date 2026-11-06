@@ -26,7 +26,9 @@ pub struct RuntimeStats {
     pub submits: u64,
     /// `park()` calls: the ready queue was empty and the runtime waited for completions.
     pub parks: u64,
-    /// Total nanoseconds spent inside `park()` (waiting for and reaping completions).
+    /// Total nanoseconds spent inside `park()`: time inside the waiting `io_uring_enter` (and
+    /// reaping the completions). It includes inline submission work done by the kernel in that
+    /// enter (e.g. the socket sends of the submitted SQEs), so it is not idle time.
     pub park_ns: u64,
     /// Nanoseconds spent outside `park()`, measured from the end of one park to the start of the
     /// next (and from the start of `block_on` to the first park). Time after the last park of a
@@ -48,13 +50,13 @@ pub struct RuntimeStats {
     pub tasks_spawned: u64,
     /// Spawned tasks whose future completed (aborted or dropped tasks are not counted).
     pub tasks_completed: u64,
-    /// Wakers handed in from other threads (`sync` only). Always 0 for now: the count needs a
-    /// hook in the driver's park (filled in by a later package).
+    /// Wakers handed in from other threads (`sync` only), drained in `park()` and in the
+    /// cold-path `submit()`.
     pub remote_wakes: u64,
-    /// Cooperative yields forced by the scheduler. Reserved: always 0, filled in by later
-    /// packages.
+    /// Polls that returned `Pending` because the task's coop budget was spent
+    /// (`RuntimeBuilder::coop_budget`, `task::consume_budget`).
     pub coop_yields: u64,
-    /// Tasks polled from a LIFO slot. Reserved: always 0, filled in by later packages.
+    /// Tasks polled from the LIFO slot (`RuntimeBuilder::lifo_slot`).
     pub lifo_polls: u64,
 }
 

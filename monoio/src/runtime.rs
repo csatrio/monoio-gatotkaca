@@ -20,6 +20,8 @@ thread_local! {
         time_handle: None,
         blocking_handle: crate::blocking::BlockingHandle::Empty(crate::blocking::BlockingStrategy::Panic),
         task_budget: None,
+        coop_budget: None,
+        lifo_slot: false,
         #[cfg(feature = "metrics")]
         stats: Default::default(),
     };
@@ -48,6 +50,12 @@ pub(crate) struct Context {
     /// Tasks run before the driver is checked again; `None`: about twice the queue length.
     pub(crate) task_budget: Option<usize>,
 
+    /// Per-poll coop budget of each task, see `RuntimeBuilder::coop_budget`.
+    pub(crate) coop_budget: Option<u32>,
+
+    /// Run a task woken by the running task right after it, see `RuntimeBuilder::lifo_slot`.
+    pub(crate) lifo_slot: bool,
+
     /// Scheduler counters, see [`crate::RuntimeStats`].
     #[cfg(feature = "metrics")]
     pub(crate) stats: crate::runtime_stats::StatsCell,
@@ -65,6 +73,8 @@ impl Context {
             time_handle: None,
             blocking_handle,
             task_budget: None,
+            coop_budget: None,
+            lifo_slot: false,
             #[cfg(feature = "metrics")]
             stats: Default::default(),
         }
@@ -79,6 +89,8 @@ impl Context {
             tasks: TaskQueue::default(),
             time_handle: None,
             task_budget: None,
+            coop_budget: None,
+            lifo_slot: false,
             #[cfg(feature = "metrics")]
             stats: Default::default(),
         }
@@ -144,6 +156,10 @@ impl RemoteTargets {
     }
 }
 
+/// Most consecutive polls of LIFO-slot tasks after a task taken from the queue; the next
+/// slot task goes to the back of the queue (tokio's rule against ping-pong starvation).
+const LIFO_MAX_STREAK: u32 = 3;
+
 /// Monoio runtime
 pub struct Runtime<D> {
     pub(crate) context: Context,
@@ -197,6 +213,10 @@ impl<D> Runtime<D> {
 
                 let mut join = std::pin::pin!(join);
                 set_poll();
+                let coop = self.context.coop_budget;
+                let lifo = self.context.lifo_slot;
+                // A runtime without coop must not inherit a budget left by an earlier one.
+                crate::task::coop::set(crate::task::coop::UNCONSTRAINED);
                 // End of the latest park (start of the busy period), for `busy_ns`.
                 #[cfg(feature = "metrics")]
                 let mut busy_since = std::time::Instant::now();
@@ -212,22 +232,57 @@ impl<D> Runtime<D> {
                         #[cfg(feature = "metrics")]
                         let mut polled = 0u64;
                         // Consume all tasks(with max round to prevent io starvation)
-                        // (with an explicit budget of `n`, exactly `n` tasks run)
-                        let mut max_round = match self.context.task_budget {
-                            Some(n) => n.saturating_sub(1),
-                            None => self.context.tasks.len() * 2,
+                        // (with an explicit budget of `n`, exactly `n` tasks run, at least 1)
+                        let mut remaining = match self.context.task_budget {
+                            Some(n) => n.max(1),
+                            None => self.context.tasks.len() * 2 + 1,
                         };
-                        while let Some(t) = self.context.tasks.pop() {
-                            t.run();
+                        // Consecutive polls from the LIFO slot.
+                        let mut streak = 0u32;
+                        loop {
+                            let t = if lifo {
+                                match self.context.tasks.take_slot() {
+                                    Some(t) if streak < LIFO_MAX_STREAK => {
+                                        streak += 1;
+                                        metric!(self.context.stats.with(|s| s.lifo_polls += 1));
+                                        t
+                                    }
+                                    slot => {
+                                        streak = 0;
+                                        // Capped: the slot task goes to the back of the queue.
+                                        if let Some(t) = slot {
+                                            self.context.tasks.push(t);
+                                        }
+                                        match self.context.tasks.pop() {
+                                            Some(t) => t,
+                                            None => break,
+                                        }
+                                    }
+                                }
+                            } else {
+                                match self.context.tasks.pop() {
+                                    Some(t) => t,
+                                    None => break,
+                                }
+                            };
+                            if let Some(n) = coop {
+                                crate::task::coop::set(n);
+                            }
+                            if lifo {
+                                self.context.tasks.set_use_slot(true);
+                                t.run();
+                                self.context.tasks.set_use_slot(false);
+                            } else {
+                                t.run();
+                            }
                             metric!(polled += 1);
-                            if max_round == 0 {
+                            remaining -= 1;
+                            if remaining == 0 {
                                 // maybe there's a looping task
                                 metric!(if !self.context.tasks.is_empty() {
                                     self.context.stats.with(|s| s.budget_exhausted_rounds += 1);
                                 });
                                 break;
-                            } else {
-                                max_round -= 1;
                             }
                         }
                         metric!(self.context.stats.with(|s| {
@@ -237,6 +292,9 @@ impl<D> Runtime<D> {
 
                         // Check main future
                         while should_poll() {
+                            if let Some(n) = coop {
+                                crate::task::coop::set(n);
+                            }
                             // check if ready
                             if let std::task::Poll::Ready(t) = join.as_mut().poll(cx) {
                                 return t;

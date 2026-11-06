@@ -170,9 +170,13 @@ where
     type Output = Completion<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Coop budget (off: one TLS load). When spent, yield even if the result is ready: it
+        // stays in the op slot and is returned on the next poll.
+        let budget = ready!(crate::task::coop::poll_proceed(cx));
         let me = &mut *self;
         let data_mut = me.data.as_mut().expect("unexpected operation state");
         let meta = ready!(me.driver.poll_op::<T>(data_mut, me.index, cx));
+        crate::task::coop::consume(budget);
 
         me.index = usize::MAX;
         let data = me.data.take().expect("unexpected operation state");

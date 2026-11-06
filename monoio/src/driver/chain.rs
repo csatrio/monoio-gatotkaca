@@ -123,6 +123,8 @@ impl<T: Unpin + 'static, const N: usize> Future for ChainOp<T, N> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = &mut *self;
         assert!(me.data.is_some(), "ChainOp polled after completion");
+        // Coop budget: the whole chain counts as one result.
+        let budget = ready!(crate::task::coop::poll_proceed(cx));
         let mut pending = false;
         for (slot, cqe) in me.slots.iter_mut().zip(me.cqes.iter_mut()) {
             if *slot == usize::MAX {
@@ -144,6 +146,7 @@ impl<T: Unpin + 'static, const N: usize> Future for ChainOp<T, N> {
         if pending {
             return Poll::Pending;
         }
+        crate::task::coop::consume(budget);
         let data = me.data.take().expect("checked above");
         Poll::Ready((me.cqes, data))
     }
