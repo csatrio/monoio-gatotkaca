@@ -395,7 +395,7 @@ besides W1-sched's, and the lead applies them at merge.
 | seed | done (`a4de6cf`, tag `r2-base`) |
 | 0 | done (tag `r2-wave0`): W0-metrics, W0-rtstats, W0-repro; fixups: `remote_wakes` hook, runtime stats in `fairness` |
 | G0 | done ([round2/G0.md](round2/G0.md)): M1 = one accept per round (multishot accept fixes it); M2 = intra-round wakes wait a full traversal under a fixed budget; M4 = same cause as M1, W1-bufzc dropped; baseline: no regression vs 0.7.1 |
-| 1 | not started |
-| G1 + G2 | not started |
+| 1 | done (tag `r2-wave1`): W1-sched, W1-net, W1-file, W1-tpc; W1-bufzc dropped (G0); fixup: W1-file lifecycle hook, applied by hand |
+| G1 + G2 | done (G1 first half in [G0.md](round2/G0.md), [round2/G2.md](round2/G2.md)): M1, M2 (with `lifo_slot`), F1, M4 pass; M3 fails on proxy p99 (~40 ms vs ≤ 20) → W2-retry; F3 moved to wave 2 with M5 |
 | 2 | not started |
 | G3 | not started |
