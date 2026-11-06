@@ -14,7 +14,7 @@
 //!
 //! * [`Deadline`]: one timer that is armed and disarmed many times, for a deadline around every
 //!   request of a connection. Arming and disarming it are single stores; it uses the coarse clock
-//!   [`Instant::recent`]. [`timeout_coarse`] is [`timeout`] with that clock.
+//!   [`Instant::recent`]. [`timeout_coarse()`] is [`timeout()`] with that clock.
 //!
 //! These types are sufficient for handling a large number of scenarios
 //! involving time.
