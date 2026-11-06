@@ -1,7 +1,6 @@
 use std::{
     future::Future,
     io,
-    mem::ManuallyDrop,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -169,7 +168,7 @@ impl<T: OpAble> Op<T> {
     ///
     /// Once this returned `Ready` the op is finished: its slot is released and `index` is
     /// `usize::MAX`, so dropping the op no longer calls into the driver. The data is still in
-    /// the op; [`finish`](Self::finish) takes it out.
+    /// the op; [`take_finished`](Self::take_finished) takes it out.
     ///
     /// # Panics
     /// If polled again after `Ready`.
@@ -188,28 +187,27 @@ impl<T: OpAble> Op<T> {
         Poll::Ready(meta)
     }
 
-    /// Take a finished op (one whose [`poll_meta`](Self::poll_meta) returned `meta`) apart.
+    /// Take a finished op apart, in place: moves the data out and releases the driver handle
+    /// (inline), without running `Op::drop` and without moving the op.
     ///
-    /// Consumes the op without running `Op::drop`: the only thing left to release is the
-    /// driver handle, which is dropped here, inline.
+    /// # Safety
+    /// [`poll_meta`](Self::poll_meta) must have returned `Ready` for this op, and the caller
+    /// must not use or drop the op afterwards: it overwrites the op's place (`ptr::write`)
+    /// or forgets it.
     ///
     /// # Panics
-    /// If the op is not finished, or its data was taken already.
+    /// If the data was taken before; the op is then untouched and still dropped normally.
     #[inline]
-    pub(crate) fn finish(self, meta: CompletionMeta) -> Completion<T> {
-        if self.index != usize::MAX || self.data.is_none() {
-            // Unwinds through `Op::drop`, which keeps the data of an in-flight op alive.
+    pub(crate) unsafe fn take_finished(&mut self) -> T {
+        debug_assert!(self.index == usize::MAX);
+        if self.data.is_none() {
             unexpected_state();
         }
-        let me = ManuallyDrop::new(self);
-        // SAFETY: `me` is never dropped, so both fields are moved out exactly once (`index`
-        // needs no drop), and `data` was checked to be `Some`.
+        // SAFETY: by the contract nothing reads or drops the two fields again (`index` needs
+        // no drop), so each is moved out exactly once; `data` was checked to be `Some`.
         unsafe {
-            drop(std::ptr::read(&me.driver));
-            Completion {
-                data: std::ptr::read(&me.data).unwrap_unchecked(),
-                meta,
-            }
+            std::ptr::drop_in_place(&mut self.driver);
+            std::ptr::read(&self.data).unwrap_unchecked()
         }
     }
 }

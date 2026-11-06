@@ -178,15 +178,15 @@ impl<D: BufOp> OpFuture<D> {
         match state {
             State::Running(op) => {
                 let meta = ready!(op.poll_meta(cx));
-                // The op is finished (its slot is released). Move it out by value and take it
-                // apart: no drop glue runs for the op shell, and `Done` owns nothing.
-                let op = match std::mem::replace(state, State::Done) {
-                    State::Running(op) => op,
-                    // SAFETY: `state` was matched as `Running` above and is borrowed mutably
-                    // since; `poll_meta` cannot change the variant.
-                    _ => unsafe { std::hint::unreachable_unchecked() },
-                };
-                Poll::Ready(D::complete(op.finish(meta)))
+                // The op is finished (its slot is released). Take it apart where it is: no
+                // drop glue runs for the op shell, nothing but the data is moved, and `Done`
+                // owns nothing.
+                // SAFETY: `poll_meta` returned `Ready`; the op is not touched again and its
+                // place is overwritten right below without dropping what is left of it.
+                // Nothing in between can panic.
+                let data = unsafe { op.take_finished() };
+                unsafe { std::ptr::write(state, State::Done) };
+                Poll::Ready(D::complete(Completion { data, meta }))
             }
             State::Ready(..) => match std::mem::replace(state, State::Done) {
                 State::Ready(res, buf) => Poll::Ready((res, buf)),
