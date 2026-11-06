@@ -54,6 +54,8 @@ one server core
   --sizes a,b,..       frame sizes, cycled per connection (default 4k,16k,64k; k, m suffixes)
   --bulk M             bulk connections the server writes to without pause (default 0)
   --chunk SZ           bulk write size (default 32k)
+  --bulk-work N        user-space passes over each bulk chunk before it is sent (default 0;
+                       models a server that encrypts its stream chunks)
   --think US           client pause between a reply and its next frame, microseconds (default 0)
   --path P             plain | pipe | mshot | eager | pair (default pipe)
   --deadline D         none | timeout (default none)
@@ -73,6 +75,7 @@ struct Args {
     sizes: Vec<usize>,
     bulk: usize,
     chunk: usize,
+    bulk_work: u32,
     think: u64,
     path: Path,
     deadline: deadline::Mode,
@@ -130,6 +133,7 @@ fn args() -> Args {
         sizes: vec![4 << 10, 16 << 10, 64 << 10],
         bulk: 0,
         chunk: 32 << 10,
+        bulk_work: 0,
         think: 0,
         path: Path::Pipe,
         deadline: deadline::Mode::None,
@@ -156,6 +160,7 @@ fn args() -> Args {
             "--sizes" => a.sizes = v().split(',').map(|s| size(f, s)).collect(),
             "--bulk" => a.bulk = num(f, &v()),
             "--chunk" => a.chunk = size(f, &v()),
+            "--bulk-work" => a.bulk_work = num(f, &v()),
             "--think" => a.think = num(f, &v()),
             "--path" => {
                 let v = v();
@@ -314,10 +319,10 @@ fn server(
             accepted(&c);
             monoio::spawn(paths::conn(stream, c.clone()));
         }));
-        let (c, chunk) = (ctx.clone(), a.chunk);
+        let (c, chunk, work) = (ctx.clone(), a.chunk, a.bulk_work);
         monoio::spawn(accept::run(bulk_listener, accept_opts, move |stream| {
             accepted(&c);
-            monoio::spawn(bulk::serve(stream, chunk, c.clone()));
+            monoio::spawn(bulk::serve(stream, chunk, work, c.clone()));
         }));
 
         // Ramp: wait until every client connection is accepted, then warm up.
