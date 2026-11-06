@@ -66,11 +66,12 @@ fn check_bundles(ring: &BufRing) -> io::Result<()> {
 
 /// Submit a multishot recv. On an incremental ring the driver takes the buffers when it reaps
 /// each CQE: the pieces of one buffer go to many connections, and only the CQ order gives their
-/// offsets (and says when the buffer is free again).
+/// offsets (and says when the buffer is free again). On a ring with a working set it does so
+/// too: the ring then sees every buffer the kernel used, not only those the streams polled.
 fn submit(data: RecvMulti) -> Result<MultishotOp<RecvMulti>, (io::Error, RecvMulti)> {
     let pre = data
         .ring
-        .is_incremental()
+        .takes_at_reap()
         .then(|| PreTake::new(data.ring.clone(), data.bundle));
     let op = MultishotOp::submit(data)?;
     if let Some(pre) = pre {
@@ -86,6 +87,8 @@ type Got = (Cqe, Option<Taken>);
 pub(crate) struct RecvMultiOp {
     // `None` once a re-arm failed.
     op: Option<MultishotOp<RecvMulti>>,
+    // The ring the next (re-)arm receives into: the one of `op`, or the one `rearm_on` set.
+    ring: BufRing,
     // The peer closed (a 0-length CQE): yield `None` from now on.
     eof: bool,
     // The kernel ended the multishot after a chunk: submit it again on the next poll.
@@ -93,8 +96,20 @@ pub(crate) struct RecvMultiOp {
     // `cancel` was called: never re-arm.
     cancelled: Cell<bool>,
     // The last re-arm was after `ENOBUFS` and no data came since: another `ENOBUFS` means the
-    // ring is still empty, so it is reported instead of re-arming in a loop.
+    // ring is still empty, so it is reported (or waited for) instead of re-arming in a loop.
     enobufs_retry: Cell<bool>,
+    // `rearm_on` cancelled the recv to move it to `ring`: its end re-arms instead of ending
+    // the stream.
+    moving: Cell<bool>,
+    // The re-arm waits for a free buffer of `ring` (`OnEnobufs::Wait`). `Some(true)`: the
+    // recv armed at `armed_at` found the ring empty.
+    gate: Cell<Option<bool>>,
+    // The place among the waiters of `ring`, 0 if none.
+    wait_key: Cell<u64>,
+    // This stream claimed a free buffer of `ring` for its re-arm and has not seen a CQE since.
+    claimed: Cell<bool>,
+    // `BufRing::fill_seq` of `ring` at the last (re-)arm.
+    armed_at: Cell<u16>,
     // An error met by `poll_read_into` after it had copied data: returned by the next call.
     #[cfg(feature = "bytes")]
     pending_err: Option<io::Error>,
@@ -109,6 +124,8 @@ pub(crate) enum OnEnobufs {
     /// the re-armed recv hits `ENOBUFS` again before any data is it yielded, and the next poll
     /// re-arms again.
     Rearm,
+    /// Never yield it: re-arm once the ring has a free buffer (`next_rearm`).
+    Wait,
 }
 
 impl RecvMultiOp {
@@ -127,10 +144,16 @@ impl RecvMultiOp {
         let op = submit(data).map_err(|(e, _)| e)?;
         Ok(Self {
             op: Some(op),
+            ring: ring.clone(),
             eof: false,
             rearm: Cell::new(false),
             cancelled: Cell::new(false),
             enobufs_retry: Cell::new(false),
+            moving: Cell::new(false),
+            gate: Cell::new(None),
+            wait_key: Cell::new(0),
+            claimed: Cell::new(false),
+            armed_at: Cell::new(ring.fill_seq()),
             #[cfg(feature = "bytes")]
             pending_err: None,
         })
@@ -139,6 +162,66 @@ impl RecvMultiOp {
     fn data(&self) -> &RecvMulti {
         // Only called while the op is there (after `poll_next_cqe` yielded a CQE).
         self.op.as_ref().expect("recv op gone").data()
+    }
+
+    /// The ring the stream receives into (after `rearm_on`: the new one).
+    pub(crate) fn ring(&self) -> &BufRing {
+        &self.ring
+    }
+
+    /// Continue on `ring`, see [`RecvStream::rearm_on`](crate::net::tcp::RecvStream::rearm_on).
+    pub(crate) fn rearm_on(&mut self, ring: &BufRing) -> io::Result<()> {
+        if !ring.same_driver(&self.ring) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the buffer ring belongs to another runtime",
+            ));
+        }
+        if self.eof || self.cancelled.get() {
+            return Ok(());
+        }
+        let Some(op) = &self.op else {
+            return Ok(());
+        };
+        let ended = op.is_finished();
+        if ring.same_ring(&self.ring) && !ended {
+            // Receiving into it: nothing to move. Or on its way there: the cancel is best
+            // effort (it is dropped when the SQ stays full), so ask again.
+            if self.moving.get() {
+                op.cancel();
+            }
+            return Ok(());
+        }
+        // A wait for, or a claim on, a buffer of the old ring is void.
+        self.settle();
+        self.ring = ring.clone();
+        self.enobufs_retry.set(false);
+        if ended {
+            // The final CQE was taken (`ENOBUFS`, an error, or a re-arm is due anyway).
+            self.rearm.set(true);
+        } else {
+            // Still receiving into the old ring: end it. Its queued chunks are yielded first,
+            // and the new recv is submitted when its final CQE was taken.
+            self.moving.set(true);
+            op.cancel();
+        }
+        Ok(())
+    }
+
+    // Give up the wait for a free buffer and the claim on one.
+    fn settle(&self) {
+        self.gate.set(None);
+        self.unclaim();
+        self.ring.cancel_wait(self.wait_key.replace(0));
+    }
+
+    // The claim on a free buffer of `ring` ends, if there is one.
+    #[inline]
+    fn unclaim(&self) {
+        if self.claimed.get() {
+            self.claimed.set(false);
+            self.ring.unclaim();
+        }
     }
 
     /// Next CQE with data (`res > 0`). `None` after EOF, after a cancel, or after an error that
@@ -156,17 +239,36 @@ impl RecvMultiOp {
             if self.eof {
                 return Poll::Ready(None);
             }
-            if self.rearm.replace(false) {
+            if self.rearm.get() {
+                if let Some(empty) = self.gate.get() {
+                    // `OnEnobufs::Wait`: only with a free buffer. The claim keeps the others
+                    // that wait from re-arming for the same buffer.
+                    let empty_at = empty.then(|| self.armed_at.get());
+                    ready!(self.ring.poll_free(cx, &self.wait_key, empty_at));
+                    self.gate.set(None);
+                    self.ring.claim();
+                    self.claimed.set(true);
+                }
+                self.rearm.set(false);
+                self.moving.set(false);
                 let Some(op) = self.op.take() else {
+                    self.settle();
                     return Poll::Ready(None);
                 };
                 // The final CQE was taken, so the data is free.
-                let Ok(data) = op.into_data() else {
+                let Ok(mut data) = op.into_data() else {
                     unreachable!("re-arm before the final CQE")
                 };
+                if !data.ring.same_ring(&self.ring) {
+                    data.ring = self.ring.clone();
+                }
+                self.armed_at.set(self.ring.fill_seq());
                 match submit(data) {
                     Ok(op) => self.op = Some(op),
-                    Err((e, _)) => return Poll::Ready(Some(Err(e))),
+                    Err((e, _)) => {
+                        self.settle();
+                        return Poll::Ready(Some(Err(e)));
+                    }
                 }
             }
             let Some(op) = self.op.as_mut() else {
@@ -177,10 +279,21 @@ impl RecvMultiOp {
             };
             let res = cqe.res();
             let more = cqe.more();
+            if res <= 0 {
+                // The first CQE since a claim, and it got no buffer. (With data the claim
+                // ends once the buffer is taken, so that the ring counts it as in use.)
+                self.unclaim();
+            }
             return Poll::Ready(match res {
                 n if n > 0 => {
                     if !more && !self.cancelled.get() {
                         self.rearm.set(true);
+                        if on_enobufs == OnEnobufs::Wait {
+                            // The kernel ended the recv after a chunk. It does when the chunk
+                            // used the last free buffer (bundles): re-arming before a buffer
+                            // is free would only fetch an `ENOBUFS`.
+                            self.gate.set(Some(false));
+                        }
                     }
                     self.enobufs_retry.set(false);
                     Some(Ok((cqe, taken)))
@@ -194,16 +307,35 @@ impl RecvMultiOp {
                     }
                     None
                 }
-                n if n == -libc::ECANCELED && !more => None,
+                n if n == -libc::ECANCELED && !more => {
+                    if self.moving.get() && !self.cancelled.get() {
+                        // `rearm_on` ended it: continue on the new ring.
+                        self.rearm.set(true);
+                        continue;
+                    }
+                    None
+                }
                 n if n == -libc::ENOBUFS
                     && !more
-                    && on_enobufs == OnEnobufs::Rearm
+                    && (on_enobufs != OnEnobufs::Yield || self.moving.get())
                     && !self.cancelled.get() =>
                 {
                     // Counts ENOBUFS in the ring stats.
                     self.discard(cqe, taken);
                     self.rearm.set(true);
-                    if !self.enobufs_retry.replace(true) {
+                    if self.moving.get() {
+                        // The old ring ran dry before the cancel of `rearm_on` arrived: the
+                        // new ring is tried at once.
+                        continue;
+                    }
+                    let again = self.enobufs_retry.replace(true);
+                    if on_enobufs == OnEnobufs::Wait {
+                        // Re-arm when the ring has a free buffer. `again`: the recv armed at
+                        // `armed_at` got no data, so it found the ring empty.
+                        self.gate.set(Some(again));
+                        continue;
+                    }
+                    if !again {
                         // The caller copied its buffers out: they are free again.
                         continue;
                     }
@@ -234,20 +366,24 @@ impl RecvMultiOp {
 
     // The buffer of a non-bundle CQE.
     fn buf(&self, (cqe, taken): Got) -> Option<SelectedBuf> {
-        match taken {
+        let buf = match taken {
             Some(Taken::Buf(buf)) => buf,
             Some(Taken::Bundle(_)) => unreachable!("bundle taken for a plain recv"),
             None => self.data().ring.take(cqe),
-        }
+        };
+        self.unclaim();
+        buf
     }
 
     // The buffers of a bundle CQE.
     fn bundle(&self, (cqe, taken): Got) -> Bundle {
-        match taken {
+        let bundle = match taken {
             Some(Taken::Bundle(bundle)) => bundle,
             Some(Taken::Buf(_)) => unreachable!("buffer taken for a bundle recv"),
             None => self.data().ring.take_bundle(cqe),
-        }
+        };
+        self.unclaim();
+        bundle
     }
 
     /// Next filled buffer (not a bundle op), see `poll_next_cqe`.
@@ -346,6 +482,7 @@ impl RecvMultiOp {
     pub(crate) fn cancel(&self) {
         self.cancelled.set(true);
         self.rearm.set(false);
+        self.settle();
         if let Some(op) = &self.op {
             op.cancel()
         }
@@ -357,6 +494,13 @@ impl RecvMultiOp {
             None => true,
         };
         self.eof || !self.rearm.get() && op_done
+    }
+}
+
+impl Drop for RecvMultiOp {
+    fn drop(&mut self) {
+        // Leave the waiters of the ring, and pass on a wake or a claim it will not use.
+        self.settle();
     }
 }
 
@@ -426,6 +570,29 @@ impl RecvBundleStream {
     /// The next received bundle; `None` after EOF, cancel, or an error that ended the recv.
     pub async fn next(&mut self) -> Option<io::Result<Bundle>> {
         std::future::poll_fn(|cx| self.op.poll_next_bundle(cx, OnEnobufs::Yield)).await
+    }
+
+    /// Like [`next`](Self::next), but it never yields `ENOBUFS`: when the ring ran dry it
+    /// waits until a buffer is free and re-arms the recv, see
+    /// [`RecvStream::next_rearm`](crate::net::tcp::RecvStream::next_rearm).
+    pub async fn next_rearm(&mut self) -> Option<io::Result<Bundle>> {
+        std::future::poll_fn(|cx| self.op.poll_next_bundle(cx, OnEnobufs::Wait)).await
+    }
+
+    /// Poll form of [`next_rearm`](Self::next_rearm).
+    pub fn poll_next_rearm(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<Bundle>>> {
+        self.op.poll_next_bundle(cx, OnEnobufs::Wait)
+    }
+
+    /// Continue on another ring, see
+    /// [`RecvStream::rearm_on`](crate::net::tcp::RecvStream::rearm_on).
+    pub fn rearm_on(&mut self, ring: &BufRing) -> io::Result<()> {
+        self.op.rearm_on(ring)
+    }
+
+    /// The ring the stream receives into (after [`rearm_on`](Self::rearm_on): the new one).
+    pub fn ring(&self) -> &BufRing {
+        self.op.ring()
     }
 
     /// Copy the next received bundle(s) into `dst`, giving the buffers back to the ring at

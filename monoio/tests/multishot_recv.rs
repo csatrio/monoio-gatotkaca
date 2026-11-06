@@ -438,3 +438,353 @@ async fn single_shot_bundle_and_incremental_ring() {
     client.shutdown().await.unwrap();
     assert!(server.recv_bundle(&ring).await.unwrap().is_empty());
 }
+
+// ---- `next_rearm`, `rearm_on`, `ring` ----
+
+type RecvStream = monoio::net::tcp::RecvStream;
+type Done = std::rc::Rc<std::cell::Cell<bool>>;
+type NextTask = monoio::task::JoinHandle<(Option<Vec<u8>>, RecvStream)>;
+
+/// Runs `chunks.next_rearm()` in a task; `done` says whether it returned.
+fn next_in_task(mut chunks: RecvStream) -> (Done, NextTask) {
+    let done = Done::default();
+    let flag = done.clone();
+    let task = monoio::spawn(async move {
+        let next = chunks.next_rearm().await.map(|buf| buf.unwrap().to_vec());
+        flag.set(true);
+        (next, chunks)
+    });
+    (done, task)
+}
+
+#[monoio::test(timer_enabled = true)]
+async fn next_rearm_waits_for_a_free_buffer() {
+    let Some(ring) = ring(30, 2, 16) else { return };
+    let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let a = UnixStream::from_std(a).unwrap();
+
+    let mut chunks = a.recv_multi(&ring).unwrap();
+    assert_eq!(chunks.ring().group(), ring.group());
+    let mut held = Vec::new();
+    for msg in [&b"first"[..], b"second"] {
+        b.write_all(msg).unwrap();
+        let buf = match chunks.next_rearm().await.unwrap() {
+            Err(e) if unsupported(&e) => return,
+            r => r.unwrap(),
+        };
+        assert_eq!(&*buf, msg);
+        held.push(buf);
+    }
+
+    // Both buffers are held: the kernel ends the recv with ENOBUFS, which `next_rearm` does
+    // not show. It waits.
+    b.write_all(b"third").unwrap();
+    let (done, task) = next_in_task(chunks);
+    sleep(30).await;
+    assert!(!done.get());
+    assert!(!held.is_empty());
+    #[cfg(feature = "metrics")]
+    assert!(ring.stats().enobufs >= 1);
+    #[cfg(feature = "metrics")]
+    let enobufs = ring.stats().enobufs;
+
+    // A buffer comes back: the recv is armed again and delivers.
+    held.pop();
+    let (next, mut chunks) = task.await;
+    assert_eq!(next.as_deref(), Some(&b"third"[..]));
+    // It did not try again in between: nothing was freed.
+    #[cfg(feature = "metrics")]
+    assert_eq!(ring.stats().enobufs, enobufs);
+
+    // `next` and `next_rearm` mix; EOF ends both.
+    b.write_all(b"fourth").unwrap();
+    assert_eq!(&*chunks.next().await.unwrap().unwrap(), b"fourth");
+    drop(b);
+    assert!(chunks.next_rearm().await.is_none());
+    assert!(chunks.is_finished());
+    drop(held);
+    assert_eq!(ring.stats().in_use, 0);
+}
+
+#[monoio::test(timer_enabled = true)]
+async fn next_rearm_wait_ends_with_cancel_and_drop() {
+    let Some(ring) = ring(31, 1, 16) else { return };
+    let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let a = UnixStream::from_std(a).unwrap();
+    let mut chunks = a.recv_multi(&ring).unwrap();
+    b.write_all(b"one").unwrap();
+    let held = match chunks.next_rearm().await.unwrap() {
+        Err(e) if unsupported(&e) => return,
+        r => r.unwrap(),
+    };
+    b.write_all(b"two").unwrap();
+
+    // Waiting for the buffer: a dropped future loses nothing, and `cancel` ends the wait.
+    let waited = monoio::time::timeout(Duration::from_millis(30), chunks.next_rearm()).await;
+    assert!(waited.is_err());
+    assert!(!chunks.is_finished());
+    chunks.cancel();
+    assert!(chunks.next_rearm().await.is_none());
+    assert!(chunks.is_finished());
+    drop(chunks);
+
+    // A second stream that waits is dropped while it waits; the ring is not confused: the
+    // freed buffer serves a third one.
+    let mut waiting = a.recv_multi(&ring).unwrap();
+    let waited = monoio::time::timeout(Duration::from_millis(30), waiting.next_rearm()).await;
+    assert!(waited.is_err());
+    drop(waiting);
+    drop(held);
+    let mut chunks = a.recv_multi(&ring).unwrap();
+    assert_eq!(&*chunks.next_rearm().await.unwrap().unwrap(), b"two");
+    assert_eq!(ring.stats().in_use, 0);
+}
+
+#[monoio::test(timer_enabled = true)]
+async fn next_rearm_grows_a_working_set_instead_of_waiting() {
+    let opts = BufRing::options().working_set(1, 1);
+    let Ok(ring) = BufRing::with_options(32, 8, 16, opts) else {
+        return;
+    };
+    let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let a = UnixStream::from_std(a).unwrap();
+    let mut chunks = a.recv_multi(&ring).unwrap();
+    let mut held = Vec::new();
+    for i in 0..8u8 {
+        b.write_all(&[i; 16]).unwrap();
+        let buf = match chunks.next_rearm().await.unwrap() {
+            Err(e) if unsupported(&e) => return,
+            r => r.unwrap(),
+        };
+        assert_eq!(&*buf, &[i; 16]);
+        held.push(buf);
+        assert!(ring.published() > i as usize);
+    }
+    assert_eq!((ring.published(), ring.stats().in_use), (8, 8));
+}
+
+#[monoio::test(timer_enabled = true)]
+async fn bundle_next_rearm_waits_for_a_free_buffer() {
+    let Some(ring) = bundle_ring(33, 2, 16) else {
+        return;
+    };
+    let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let a = UnixStream::from_std(a).unwrap();
+
+    let mut bundles = a.recv_multi_bundle(&ring).unwrap();
+    assert_eq!(bundles.ring().group(), ring.group());
+    b.write_all(&pattern(32, 1)).unwrap();
+    let mut held = Vec::new();
+    let mut got = Vec::new();
+    while got.len() < 32 {
+        let bundle = bundles.next_rearm().await.unwrap().unwrap();
+        for buf in bundle {
+            got.extend_from_slice(&buf);
+            held.push(buf);
+        }
+    }
+    assert_eq!(got, pattern(32, 1));
+
+    b.write_all(b"more").unwrap();
+    let waited = monoio::time::timeout(Duration::from_millis(30), bundles.next_rearm()).await;
+    assert!(
+        waited.is_err(),
+        "next_rearm returned while the ring was empty"
+    );
+    drop(held);
+    assert_eq!(
+        bundles.next_rearm().await.unwrap().unwrap().detach(),
+        b"more"
+    );
+    drop(b);
+    assert!(bundles.next_rearm().await.is_none());
+    assert_eq!(ring.stats().in_use, 0);
+}
+
+#[monoio::test(timer_enabled = true)]
+async fn rearm_on_another_ring_after_enobufs() {
+    let Some(hot) = ring(34, 2, 16) else { return };
+    let spill = ring(35, 8, 16).unwrap();
+    let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let a = UnixStream::from_std(a).unwrap();
+
+    let mut chunks = a.recv_multi(&hot).unwrap();
+    let mut held = Vec::new();
+    let mut moved = false;
+    for i in 0..6u8 {
+        b.write_all(&[b'm', b'0' + i]).unwrap();
+        let buf = loop {
+            match chunks.next().await.expect("stream ended") {
+                Ok(buf) => break buf,
+                Err(e) if unsupported(&e) => return,
+                Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
+                    // The hot ring is used up: the stream ended, and continues on the
+                    // other ring.
+                    assert!(!moved && chunks.is_finished());
+                    chunks.rearm_on(&spill).unwrap();
+                    assert!(!chunks.is_finished());
+                    assert_eq!(chunks.ring().group(), spill.group());
+                    moved = true;
+                }
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert_eq!(&*buf, &[b'm', b'0' + i]);
+        held.push(buf);
+    }
+    assert!(moved);
+    assert_eq!((hot.stats().in_use, spill.stats().in_use), (2, 4));
+
+    // After `ENOBUFS` on the ring it uses, `rearm_on` with that ring re-arms in place.
+    let mut more = Vec::new();
+    for _ in 0..4 {
+        b.write_all(b"x").unwrap();
+        more.push(chunks.next().await.unwrap().unwrap());
+    }
+    b.write_all(b"last").unwrap();
+    let err = chunks.next().await.unwrap().unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::ENOBUFS));
+    drop(more);
+    chunks.rearm_on(&spill).unwrap();
+    assert_eq!(&*chunks.next().await.unwrap().unwrap(), b"last");
+
+    // After EOF it does nothing.
+    drop(b);
+    assert!(chunks.next().await.is_none());
+    chunks.rearm_on(&hot).unwrap();
+    assert!(chunks.next().await.is_none());
+    drop(held);
+    assert_eq!((hot.stats().in_use, spill.stats().in_use), (0, 0));
+
+    // A ring of another runtime is refused.
+    let other = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        .build()
+        .unwrap();
+    let foreign = BufRing::new_in(other.driver(), 36, 2, 16).unwrap();
+    let mut chunks = a.recv_multi(&hot).unwrap();
+    let err = chunks.rearm_on(&foreign).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(chunks.ring().group(), hot.group());
+}
+
+#[monoio::test(timer_enabled = true)]
+async fn rearm_on_while_receiving_keeps_the_order() {
+    let Some(old) = ring(37, 8, 16) else { return };
+    let new = ring(38, 8, 16).unwrap();
+    let (server, mut client) = tcp_pair().await;
+
+    let mut chunks = server.recv_multi(&old).unwrap();
+    client.write_all(b"a0".to_vec()).await.0.unwrap();
+    match chunks.next().await.unwrap() {
+        Err(e) if unsupported(&e) => return,
+        r => assert_eq!(&*r.unwrap(), b"a0"),
+    }
+    // Two chunks are queued in the old ring when the stream is moved.
+    for msg in [b"a1", b"a2"] {
+        client.write_all(msg.to_vec()).await.0.unwrap();
+        sleep(10).await;
+    }
+    chunks.rearm_on(&new).unwrap();
+    assert_eq!(chunks.ring().group(), new.group());
+    assert!(!chunks.is_finished());
+    // Calling it again changes nothing.
+    chunks.rearm_on(&new).unwrap();
+    // Sent before the cancel reaches the kernel: it arrives through one ring or the other,
+    // after the queued chunks.
+    client.write_all(b"b0".to_vec()).await.0.unwrap();
+
+    let mut got = Vec::new();
+    let mut held = Vec::new();
+    while got.len() < 6 {
+        let buf = chunks.next().await.expect("stream ended").unwrap();
+        got.extend_from_slice(&buf);
+        held.push(buf);
+    }
+    assert_eq!(got, b"a1a2b0");
+    // From now on everything comes from the new ring.
+    let before = new.stats().in_use;
+    for i in 0..5u8 {
+        client.write_all(vec![b'c', b'0' + i]).await.0.unwrap();
+        let buf = chunks.next().await.unwrap().unwrap();
+        assert_eq!(&*buf, &[b'c', b'0' + i]);
+        held.push(buf);
+    }
+    assert_eq!(new.stats().in_use, before + 5);
+    assert!(old.stats().in_use <= 3);
+    drop(held);
+    assert_eq!((old.stats().in_use, new.stats().in_use), (0, 0));
+
+    // The same through a random sequence of moves while data flows: nothing lost, nothing
+    // out of order.
+    let total = 64 * 1024;
+    let sent = pattern(total, 11);
+    let writer = monoio::spawn({
+        let sent = sent.clone();
+        async move {
+            let mut rng = Rng(777);
+            let mut off = 0;
+            while off < sent.len() {
+                let n = (1 + rng.next(900)).min(sent.len() - off);
+                let (res, _) = client.write_all(sent[off..off + n].to_vec()).await;
+                res.unwrap();
+                off += n;
+                if rng.next(3) == 0 {
+                    sleep(1).await;
+                }
+            }
+            client
+        }
+    });
+    let mut rng = Rng(4242);
+    let mut got = Vec::with_capacity(total);
+    let mut moves = 0;
+    while got.len() < total {
+        if rng.next(5) == 0 {
+            let to = if chunks.ring().group() == old.group() {
+                &new
+            } else {
+                &old
+            };
+            chunks.rearm_on(to).unwrap();
+            moves += 1;
+        }
+        let buf = chunks.next_rearm().await.expect("stream ended").unwrap();
+        got.extend_from_slice(&buf);
+    }
+    assert!(got == sent, "data lost or reordered across {moves} moves");
+    assert!(moves > 10);
+    drop(writer.await);
+    assert_eq!((old.stats().in_use, new.stats().in_use), (0, 0));
+}
+
+#[monoio::test(timer_enabled = true)]
+async fn bundle_rearm_on_another_ring() {
+    let Some(hot) = bundle_ring(39, 2, 16) else {
+        return;
+    };
+    let spill = ring(40, 16, 16).unwrap();
+    let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let a = UnixStream::from_std(a).unwrap();
+    let mut bundles = a.recv_multi_bundle(&hot).unwrap();
+    let sent = pattern(200, 5);
+    b.write_all(&sent).unwrap();
+    let mut got = Vec::new();
+    let mut held = Vec::new();
+    while got.len() < sent.len() {
+        match bundles.next().await.expect("stream ended") {
+            Ok(bundle) => {
+                for buf in bundle {
+                    got.extend_from_slice(&buf);
+                    held.push(buf);
+                }
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
+                bundles.rearm_on(&spill).unwrap();
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert_eq!(got, sent);
+    assert_eq!(bundles.ring().group(), spill.group());
+    assert_eq!(hot.stats().in_use, 2);
+}

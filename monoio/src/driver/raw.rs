@@ -27,7 +27,7 @@ use std::{
 // (and cannot end up with a mismatching `io_uring` version).
 pub use io_uring::{cqueue, opcode, squeue, types, IoUring, Probe};
 
-pub use super::buf_ring::{BufRing, BufRingOptions, BufRingStats, Bundle, SelectedBuf};
+pub use super::buf_ring::{BufRing, BufRingOptions, BufRingStats, Bundle, SelectedBuf, WaitFree};
 pub use super::chain::{link, ChainOp};
 pub use super::fixed_buf::{
     FixedBuf, FixedBufPool, FixedBufStats, FixedIoBuf, FrozenFixedBuf, ReadFixedFuture,

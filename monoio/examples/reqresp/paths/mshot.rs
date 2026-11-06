@@ -4,7 +4,14 @@
 //! The frame bytes are counted in place in the `SelectedBuf`s (no copy; only a length prefix
 //! is copied out, 4 bytes). The receive stays armed, so a frame costs one SQE (the reply)
 //! and one loop round. When the ring runs dry the kernel ends the receive with `ENOBUFS`:
-//! the connection yields once and calls `recv_multi` again.
+//! `next_rearm` waits for a free buffer and arms it again.
+//!
+//! `--wset INITIAL,STEP` gives the ring a working set (`BufRingOptions::working_set`): only
+//! `INITIAL` buffers are published at first, and the ring grows and shrinks with the demand.
+//!
+//! `enobufs` in the `RESULT` line is the ring's own counter, which only exists with the
+//! `metrics` feature (0 without it: `next_rearm` never shows an `ENOBUFS`). With `metrics`
+//! the state of the ring is also printed to stderr once a second (`BUFRING ...`).
 
 use std::io;
 
@@ -21,17 +28,29 @@ const BGID: u16 = 7;
 
 pub fn setup(ctx: &Ctx) -> io::Result<()> {
     let (entries, size) = ctx.cfg.bufring;
-    // === r3-bufring: `--wset INITIAL,STEP` ===
-    // Build the ring with `BufRing::with_options(BGID, entries, size,
-    // BufRing::options().working_set(initial, step))` when `ctx.cfg.wset` is set, and drop
-    // this check.
-    if ctx.cfg.wset.is_some() {
-        eprintln!("--wset: not available in this build");
-        std::process::exit(2);
+    let mut options = BufRing::options();
+    if let Some((initial, step)) = ctx.cfg.wset {
+        options = options.working_set(initial, step);
     }
-    let ring = BufRing::new(BGID, entries, size)?;
+    let ring = BufRing::with_options(BGID, entries, size, options)?;
+    #[cfg(feature = "metrics")]
+    monoio::spawn(report(ring.clone()));
     ctx.put_state(ring);
     Ok(())
+}
+
+/// Prints the ring's state once a second (the counters are sums since the start).
+#[cfg(feature = "metrics")]
+async fn report(ring: BufRing) {
+    loop {
+        monoio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let s = ring.stats();
+        eprintln!(
+            "BUFRING published={} in_use={} high_water={} enobufs={} taken={} recycled={} \
+             grown={} retired={}",
+            s.published, s.in_use, s.high_water, s.enobufs, s.taken, s.recycled, s.grown, s.retired
+        );
+    }
 }
 
 /// Finds the frame boundaries in the received chunks.
@@ -85,19 +104,18 @@ struct Rx {
 }
 
 pub async fn serve(stream: TcpStream, ctx: &Ctx) -> io::Result<()> {
-    let ring = ctx.state::<BufRing>().clone();
     let mut rx = Rx {
-        stream: stream.recv_multi(&ring)?,
+        stream: stream.recv_multi(ctx.state::<BufRing>())?,
         chunk: None,
         parser: Parser::default(),
     };
     let mut guard = Guard::new(ctx.cfg.deadline);
-    while guard.frame(frame(&stream, &ring, &mut rx, ctx)).await? {}
+    while guard.frame(frame(&stream, &mut rx, ctx)).await? {}
     Ok(())
 }
 
 /// Serves one frame. `Ok(false)`: the peer closed between two frames.
-async fn frame(stream: &TcpStream, ring: &BufRing, rx: &mut Rx, ctx: &Ctx) -> io::Result<bool> {
+async fn frame(stream: &TcpStream, rx: &mut Rx, ctx: &Ctx) -> io::Result<bool> {
     let total = loop {
         if let Some((chunk, at)) = &mut rx.chunk {
             let (used, done) = rx.parser.feed(&chunk[*at..], ctx.cfg.max_frame)?;
@@ -111,20 +129,16 @@ async fn frame(stream: &TcpStream, ring: &BufRing, rx: &mut Rx, ctx: &Ctx) -> io
             }
             continue;
         }
-        match rx.stream.next().await {
+        // When the ring is empty the kernel ends the receive (`ENOBUFS`): `next_rearm` waits
+        // for a free buffer and arms it again. No data is lost.
+        match rx.stream.next_rearm().await {
             Some(Ok(chunk)) => rx.chunk = Some((chunk, 0)),
-            Some(Err(e)) if e.raw_os_error() == Some(libc::ENOBUFS) => {
-                // The ring was empty and the kernel ended the receive. Let the other tasks
-                // release their buffers, then arm a new one. No data is lost.
-                let n = &ctx.count.enobufs;
-                n.set(n.get() + 1);
-                monoio::task::yield_now().await;
-                rx.stream = stream.recv_multi(ring)?;
-            }
             Some(Err(e)) => return Err(e),
             None => return eof(rx.parser.mid_frame()),
         }
     };
+    #[cfg(feature = "metrics")]
+    ctx.count.enobufs.set(rx.stream.ring().stats().enobufs);
 
     let (res, _) = stream.send_op(&REPLY[..]).await;
     let mut sent = res?;
