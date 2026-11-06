@@ -55,6 +55,10 @@ pub use io_uring::IoUring;
 #[cfg(feature = "macros")]
 pub use monoio_macros::{main, test, test_all};
 pub use runtime::{spawn, Runtime};
+#[cfg(feature = "metrics")]
+mod runtime_stats;
+#[cfg(feature = "metrics")]
+pub use runtime_stats::{reset_runtime_stats, runtime_stats, RuntimeStats};
 
 /// Start a monoio runtime.
 ///

@@ -75,6 +75,7 @@ Via builder or macro: `RuntimeBuilder::<IoUringDriver>::new().with_entries(n).en
 - `iowq_max_workers(bounded, unbounded)` (5.15+): caps `iou-wrk-*` threads (`0` keeps the current limit); `build()` fails if the kernel refuses. Rings sharing a wq via `attach_wq` share the cap, so set it on the primary.
 - `task_budget(n)`: run `n` ready tasks per round before checking the driver (default about 2× the queue length).
 - Stats (needs the `metrics` feature; without it these APIs don't exist): `IoUringDriver::stats()` / `reset_stats()` (with the timer: `rt.driver().inner().stats()`), or `monoio::driver_stats()` inside the runtime. A `DriverStats` copy: enter calls (submit/wait/skipped), SQEs submitted, CQEs reaped, CQEs-per-tick histogram, SQ-full flushes, EBUSY retries, cancels pushed/lost, the kernel CQ overflow counter (read when you call `stats()`), ops by opcode. io-wq punts are not visible; use the `io_uring:io_uring_queue_async_work` tracepoint.
+- Scheduler stats (feature `metrics`): `monoio::runtime_stats()` / `reset_runtime_stats()` inside the runtime, or `Runtime::stats()` / `reset_stats()`. A `RuntimeStats` copy: rounds, cold-path submits, parks with `park_ns`/`busy_ns`, tasks polled and a polls-per-round histogram, rounds cut by the budget, ready-queue length (last round) and high water, tasks spawned/completed. Plain thread-local adds plus two `Instant::now()` per park; without `metrics` none of it is compiled.
 
 ## Feature flags (`monoio/Cargo.toml`)
 Default: `async-cancel`, `bytes`, `macros`, `utils`.
