@@ -14,21 +14,24 @@ is based only on what the benchmark measured with 0.7.1. Read 0.7.1's source to 
 
 ## Summary
 
-| id | kind | priority | one line |
-|---|---|---|---|
-| M1 | fix | **P0** | ~6,200 small requests per run time out (10 s) behind 1 MiB streams at 4096 connections; tokio has none |
-| M2 | fix | **P0** | `task_budget(n)` collapses the proxy path to 28–44% of target with ~11 s median latency |
-| F1 | feature | **P0** | per-task cooperative budget (tokio-style coop) plus a public `yield_now()` |
-| M3 | fix | P1 | small-request p99 under bulk load is 1.5–2× tokio's (json 13.4 vs 8.7 ms, proxy 42.4 vs 21.5 ms) |
-| F2 | feature | P1 | runtime (scheduler) metrics next to `driver_stats()`: ready-queue depth, polls, ticks, busy time |
-| M4 | fix | P1 | `fixedbuf` and `zc` cause client timeouts while 4096 connections open |
-| M5 | investigate | P1 | many connections, small frames: 8–11% fewer frames per CPU-second than tokio |
-| M6 | investigate | P2 | `splice` stream: 12% less payload per CPU-second than tokio `sendfile`, p99 429 vs 11 ms, 16 threads |
-| M7 | investigate | P2 | 1–2 of 5 rounds with repl p99 about 4 ms (median 0.6 ms), frequency normal |
-| M8 | fix | P2 | SQPOLL on the loop's own CPU: −85% and timeouts; warn or refuse |
-| F3 | feature | P2 | a `recv_multi` adapter that fills a `BytesMut`, so a framed read loop can use multishot receive |
-| F4 | feature | P2 | thread-per-core helper (N pinned runtimes, per-core `SO_REUSEPORT` listeners) |
-| F5 | feature | P2 | file path without io-wq punts (CLOSE, splice) for cold-cache and per-request opens |
+Round-2 results: [ROUND2-PLAN.md](ROUND2-PLAN.md), per-gate notes in [round2/](round2/) (final gate:
+[round2/G3.md](round2/G3.md)), shipped in 0.8.0.
+
+| id | kind | priority | one line | round 2 status |
+|---|---|---|---|---|
+| M1 | fix | **P0** | ~6,200 small requests per run time out (10 s) behind 1 MiB streams at 4096 connections; tokio has none | done: `accept_batch_into` (G2, G3) |
+| M2 | fix | **P0** | `task_budget(n)` collapses the proxy path to 28–44% of target with ~11 s median latency | done: pair `task_budget` with `lifo_slot(true)` (G2) |
+| F1 | feature | **P0** | per-task cooperative budget (tokio-style coop) plus a public `yield_now()` | done: `coop_budget`, `yield_now`, `consume_budget`, `unconstrained` (G2) |
+| M3 | fix | P1 | small-request p99 under bulk load is 1.5–2× tokio's (json 13.4 vs 8.7 ms, proxy 42.4 vs 21.5 ms) | done: `small_io_priority` (G3: proxy p99 13.5 ms) |
+| F2 | feature | P1 | runtime (scheduler) metrics next to `driver_stats()`: ready-queue depth, polls, ticks, busy time | done: `runtime_stats()` (W0-rtstats) |
+| M4 | fix | P1 | `fixedbuf` and `zc` cause client timeouts while 4096 connections open | done: same cause as M1, no change (G0, G2) |
+| M5 | investigate | P1 | many connections, small frames: 8–11% fewer frames per CPU-second than tokio | done: within 8% (G3: −7.9% / −7.4%); rest is kernel per-request cost |
+| M6 | investigate | P2 | `splice` stream: 12% less payload per CPU-second than tokio `sendfile`, p99 429 vs 11 ms, 16 threads | answered: file splice always punts (W1-file) |
+| M7 | investigate | P2 | 1–2 of 5 rounds with repl p99 about 4 ms (median 0.6 ms), frequency normal | closed: not reproduced (W2-lead, G3) |
+| M8 | fix | P2 | SQPOLL on the loop's own CPU: −85% and timeouts; warn or refuse | done: `sqpoll(idle, cpu)` warns, `deny_sqpoll_conflict()` (G3) |
+| F3 | feature | P2 | a `recv_multi` adapter that fills a `BytesMut`, so a framed read loop can use multishot receive | done: `read_into`, `into_reader`; measured, no gain on M5 (G3) |
+| F4 | feature | P2 | thread-per-core helper (N pinned runtimes, per-core `SO_REUSEPORT` listeners) | done: `utils::ThreadPerCore` (G3 smoke) |
+| F5 | feature | P2 | file path without io-wq punts (CLOSE, splice) for cold-cache and per-request opens | done: `open_direct`, punt table (W1-file) |
 
 **If only one thing gets done:** M1 together with F1. Together they decide whether monoio can serve large files and
 many small requests on one core. M3 is probably the same root cause.
@@ -120,7 +123,7 @@ cargo build --release
 - Cell: 64 KiB × 4096, 0.7.1 with the timer fix.
 
 | variant | json % / p50 / p99 | proxy % / p50 / p99 | client timeouts |
-|---|---|---|---|
+|---|---|---|---|---|
 | monoio (default) | 93.4% / 6.5 ms / 11.7 ms | 93.3% / 12.3 ms / 34.8 ms | 0 |
 | `budget16` | 93.4% / 4.6 ms / 8.3 ms | **28.0% / 11.7 s / 14.2 s** | 0 |
 | `budget61` | 93.4% / 4.6 ms / 9.2 ms | **34.5% / 10.4 s / 13.0 s** | 0 |
@@ -201,7 +204,7 @@ cargo build --release
 - Data: `results/tuning/s3-w2`, run 84; 5 rounds, cell 64 KiB × 4096, all runs valid.
 
 | | tokio | monoio | verdict |
-|---|---|---|---|
+|---|---|---|---|---|
 | json p99 | 8.65 ms | 13.43 ms | tokio −36%, counts |
 | proxy p99 | 21.54 ms | 42.37 ms | tokio −49%, counts |
 | payload per CPU-second | 1,129 MB | 1,619 MB | monoio +43%, counts |
@@ -241,7 +244,7 @@ to the runner first (see "On our side"). It does not show the scheduler.
 **Evidence** (`results/tuning/s1-w2`, run 80, 1 round, 64 KiB × 4096):
 
 | variant | json client timeouts | proxy client timeouts | json/proxy p99 |
-|---|---|---|---|
+|---|---|---|---|---|
 | `fixedbuf` (512 × (head + chunk) registered, READ_FIXED for the stream) | 122 | 124 | 10.6 s |
 | `zc` (SEND_ZC for the stream) | 170 | 170 | 10.9 s |
 | default | 0 | 0 | 11.7 / 34.8 ms |
@@ -266,7 +269,7 @@ The stream itself was fine; the timeouts fall on small requests.
 - Load: 2000 connections, open-loop `POST /repl` of 4 KiB / 16 KiB, offered above capacity.
 
 | | tokio | monoio | verdict |
-|---|---|---|---|
+|---|---|---|---|---|
 | frames/s (4 KiB) | 107.4k | 98.9k | −7.9%, tie (just under 8%) |
 | payload per CPU-second (4 KiB) | 459 MB | 422 MB | tokio +8.2%, counts |
 | frames/s (16 KiB) | 79.2k | 71.8k | tokio +9.3%, counts |
