@@ -3,12 +3,16 @@
 
 mod cancel;
 mod deadline;
+mod eager;
 mod fixed;
 mod listener;
 mod multishot;
+mod pair;
+mod sockctl;
 mod split;
 mod stream;
 mod tfo;
+mod vectored;
 mod zero_copy;
 
 pub use crate::driver::op::{

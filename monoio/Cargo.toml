@@ -111,3 +111,9 @@ required-features = ["utils"]
 [[example]]
 name = "smallframes"
 required-features = ["bytes", "utils"]
+
+# request/response reproducer for round 3 (docs/performance-improvement/ROUND3-PLAN.md, r3-repro)
+[[example]]
+name = "reqresp"
+path = "examples/reqresp/main.rs"
+required-features = ["bytes", "utils"]

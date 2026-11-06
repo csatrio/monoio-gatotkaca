@@ -11,6 +11,7 @@ mod fixed_buf;
 pub(crate) mod fixed_files;
 pub(crate) mod lf_queue;
 mod msg_ring;
+pub(crate) mod msghdr_pool;
 pub mod raw;
 mod uring;
 mod util;

@@ -3,13 +3,17 @@
 
 mod cancel;
 mod datagram;
+mod eager;
 mod listener;
 mod multishot;
+mod pair;
 mod pipe;
+mod sockctl;
 mod socket_addr;
 mod split;
 mod stream;
 mod ucred;
+mod vectored;
 
 mod seq_packet;
 pub use datagram::UnixDatagram;

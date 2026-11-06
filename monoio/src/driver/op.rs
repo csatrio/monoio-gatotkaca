@@ -25,8 +25,10 @@ mod poll;
 pub(crate) mod recv;
 pub(crate) mod recv_multi;
 pub(crate) mod send;
+pub(crate) mod send_recv;
 pub(crate) mod send_zc;
 pub(crate) mod shutdown;
+pub(crate) mod sockopt;
 mod statx;
 mod submit;
 

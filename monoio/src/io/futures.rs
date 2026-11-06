@@ -112,8 +112,9 @@ pub(crate) trait BufOp: OpAble + Unpin + Sized + 'static {
 enum State<D: BufOp> {
     /// Submitted; the op owns the buffer.
     Running(Op<D>),
-    /// Submission failed; returned on the first poll.
-    Failed(io::Error, D::Buf),
+    /// Resolved without an op in flight (the submission failed, or the IO was done before the
+    /// future was made); returned on the first poll.
+    Ready(io::Result<usize>, D::Buf),
     /// The output was returned.
     Done,
 }
@@ -128,9 +129,18 @@ impl<D: BufOp> OpFuture<D> {
     fn new(submitted: Result<Op<D>, (io::Error, D::Buf)>) -> Self {
         let state = match submitted {
             Ok(op) => State::Running(op),
-            Err((e, buf)) => State::Failed(e, buf),
+            Err((e, buf)) => State::Ready(Err(e), buf),
         };
         Self { state }
+    }
+
+    /// A future that is already resolved: `(res, buf)` on its first poll, no op, no SQE.
+    #[inline]
+    #[allow(dead_code)]
+    fn ready(res: io::Result<usize>, buf: D::Buf) -> Self {
+        Self {
+            state: State::Ready(res, buf),
+        }
     }
 
     #[inline]
@@ -142,8 +152,8 @@ impl<D: BufOp> OpFuture<D> {
                 self.state = State::Done;
                 Poll::Ready(D::complete(completion))
             }
-            State::Failed(..) => match std::mem::replace(&mut self.state, State::Done) {
-                State::Failed(e, buf) => Poll::Ready((Err(e), buf)),
+            State::Ready(..) => match std::mem::replace(&mut self.state, State::Done) {
+                State::Ready(res, buf) => Poll::Ready((res, buf)),
                 _ => unreachable!(),
             },
             State::Done => panic!("op future polled after completion"),
@@ -167,7 +177,7 @@ impl<D: BufOp> OpFuture<D> {
     fn state_name(&self) -> &'static str {
         match self.state {
             State::Running(_) => "Running",
-            State::Failed(..) => "Failed",
+            State::Ready(..) => "Ready",
             State::Done => "Done",
         }
     }
@@ -186,6 +196,14 @@ macro_rules! named_future {
             #[inline]
             pub(crate) fn new(submitted: Result<Op<$data>, (io::Error, $T)>) -> Self {
                 Self(OpFuture::new(submitted))
+            }
+
+            /// A future that is already resolved: `(res, buf)` on its first poll, with no op
+            /// behind it.
+            #[inline]
+            #[allow(dead_code)]
+            pub(crate) fn ready(res: io::Result<usize>, buf: $T) -> Self {
+                Self(OpFuture::ready(res, buf))
             }
 
             /// Polls the op without pinning: the token-style API for hand-written state
