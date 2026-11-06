@@ -10,7 +10,8 @@
 //! `register_fixed` (on [`TcpStream`](crate::net::TcpStream), `TcpListener`, `UnixStream`,
 //! `File`) puts an open fd into a free slot (the fd stays open: "registered" mode), and
 //! [`TcpListener::accept_direct`](crate::net::TcpListener::accept_direct) lets the kernel install
-//! the new socket straight into a free slot (no fd at all: "direct-only" mode).
+//! the new socket straight into a free slot (no fd at all: "direct-only" mode), as does
+//! [`OpenOptions::open_direct`](crate::fs::OpenOptions::open_direct) for regular files.
 //! [`RuntimeBuilder::with_fixed_files_kernel_alloc`](crate::RuntimeBuilder::with_fixed_files_kernel_alloc)
 //! appends slots that the kernel allocates itself (`IORING_FILE_INDEX_ALLOC`, restricted to them
 //! with `IORING_REGISTER_FILE_ALLOC_RANGE`), which multishot direct accept needs. The two ranges
@@ -223,6 +224,12 @@ impl FileTable {
     /// Whether the kernel may allocate slots (multishot direct accept).
     pub(crate) fn has_kernel_range(&self) -> bool {
         self.kernel > 0
+    }
+
+    /// Whether [`alloc`](Self::alloc) would find a free runtime slot (does not count as a
+    /// failed request).
+    pub(crate) fn has_free_slot(&self) -> bool {
+        !self.free.borrow().is_empty()
     }
 
     fn update_stats(&self, f: impl FnOnce(&mut FixedFileStats)) {

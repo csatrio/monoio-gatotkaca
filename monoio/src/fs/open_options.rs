@@ -316,6 +316,60 @@ impl OpenOptions {
         )))
     }
 
+    /// Opens a file at `path` straight into the runtime's fixed file table, as a *direct-only*
+    /// [`File`] with no file descriptor (`IORING_OP_OPENAT` with `file_index`, Linux 5.19+).
+    ///
+    /// Needs [`RuntimeBuilder::with_fixed_files`](crate::RuntimeBuilder::with_fixed_files)
+    /// (`Unsupported` without a table). The slot is taken from the runtime's slots; when they are
+    /// all in use and the runtime also has kernel-allocated slots
+    /// ([`with_fixed_files_kernel_alloc`](crate::RuntimeBuilder::with_fixed_files_kernel_alloc)),
+    /// the kernel picks one of those (`IORING_FILE_INDEX_ALLOC`). With no free slot it fails with
+    /// `ENFILE` ("Too many open files in system"). A slot is free again when the file's close
+    /// completed.
+    ///
+    /// Why: every op on the file names the slot (`IOSQE_FIXED_FILE`, no fd lookup and refcount
+    /// per op), and closing it ([`File::close`] or drop) is `IORING_OP_CLOSE` on the slot, which
+    /// only removes the table entry. A close by fd runs the filesystem's `->flush` and is punted
+    /// to an io-wq worker on filesystems that have one (f2fs, NFS, FUSE, ...); a slot close
+    /// never is. For an open/read/close per request this keeps the whole path inline when the
+    /// path lookup is cached and the data is in the page cache.
+    ///
+    /// What works on a direct file: [`read_at`](File::read_at), [`read_exact_at`](File::read_exact_at),
+    /// [`read_fixed_at`](File::read_fixed_at), [`write_at`](File::write_at) and the other
+    /// positional ops, [`fadvise`](File::fadvise), [`sync_all`](File::sync_all),
+    /// [`read_at_then_send`](File::read_at_then_send) and splice. What doesn't:
+    /// [`as_raw_fd`](std::os::fd::AsRawFd::as_raw_fd) is `-1`, and
+    /// [`metadata`](File::metadata) returns `Unsupported` (io_uring's `STATX` takes no fixed
+    /// file; use [`fs::metadata`](crate::fs::metadata) on the path). The file belongs to the
+    /// ring that opened it: keep it on that runtime.
+    ///
+    /// `O_CLOEXEC` is not passed (the kernel rejects it for direct descriptors); the other
+    /// options and [`custom_flags`](OpenOptionsExt::custom_flags) apply as in
+    /// [`open`](Self::open). Dropping the future before it completes is safe: a file opened
+    /// anyway is closed.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use monoio::{fs::OpenOptions, IoUringDriver, RuntimeBuilder};
+    ///
+    /// let mut rt = RuntimeBuilder::<IoUringDriver>::new()
+    ///     .with_fixed_files(1024)
+    ///     .build()
+    ///     .unwrap();
+    /// rt.block_on(async {
+    ///     let file = OpenOptions::new().read(true).open_direct("foo.txt").await?;
+    ///     let (res, buf) = file.read_at(vec![0u8; 128 * 1024], 0).await;
+    ///     println!("read {} bytes", res?);
+    ///     file.close().await // a table update, never an io-wq punt
+    /// })
+    /// .unwrap();
+    /// ```
+    pub async fn open_direct(&self, path: impl AsRef<Path>) -> io::Result<File> {
+        let op = Op::open_direct(path.as_ref(), self)?;
+        Ok(File::from_shared_fd(op.finish().await?))
+    }
+
     pub(crate) fn access_mode(&self) -> io::Result<libc::c_int> {
         match (self.read, self.write, self.append) {
             (true, false, false) => Ok(libc::O_RDONLY),

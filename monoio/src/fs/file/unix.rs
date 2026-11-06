@@ -44,7 +44,19 @@ impl File {
     ///     Ok(())
     /// }
     /// ```
+    ///
+    /// io_uring always runs `STATX` in an io-wq worker (measured on Linux 7.0), so avoid it on
+    /// a per-request path.
+    ///
+    /// # Errors
+    ///
+    /// `Unsupported` for a direct-only file ([`is_direct`](Self::is_direct)): io_uring's
+    /// `STATX` resolves a path relative to a directory fd and does not take a fixed file, so
+    /// there is nothing to stat it with. Use [`fs::metadata`](crate::fs::metadata) on the path.
     pub async fn metadata(&self) -> io::Result<Metadata> {
+        if self.fd.is_direct() {
+            return Err(crate::driver::shared_fd::direct_only_error());
+        }
         metadata(self.fd.clone()).await
     }
 
@@ -61,13 +73,28 @@ impl File {
         self.fd.register_fixed()
     }
 
-    /// Whether the file is in the fixed file table.
+    /// Whether the file is in the fixed file table (registered, or direct-only).
     pub fn is_fixed(&self) -> bool {
         self.fd.fixed_slot().is_some()
+    }
+
+    /// Whether the file is direct-only: opened with
+    /// [`OpenOptions::open_direct`](crate::fs::OpenOptions::open_direct), it lives only in the
+    /// fixed file table and has no fd. [`as_raw_fd`](AsRawFd::as_raw_fd) then returns `-1` and
+    /// [`metadata`](Self::metadata) returns `Unsupported`; the positional ops, `fadvise`,
+    /// `sync_*`, splice and `read_at_then_send` work.
+    pub fn is_direct(&self) -> bool {
+        self.fd.is_direct()
+    }
+
+    /// The file's slot in the fixed file table, for hand-built SQEs with `types::Fixed`.
+    pub fn fixed_slot(&self) -> Option<u32> {
+        self.fd.fixed_slot()
     }
 }
 
 impl AsRawFd for File {
+    /// The file's fd; `-1` for a direct-only file ([`File::is_direct`]).
     fn as_raw_fd(&self) -> RawFd {
         self.fd.raw_fd()
     }

@@ -14,14 +14,14 @@ pub enum Advice {
     /// No special treatment (`POSIX_FADV_NORMAL`): the default readahead.
     Normal,
     /// The range will be read in order (`POSIX_FADV_SEQUENTIAL`): Linux doubles the readahead
-    /// window.
+    /// window. Inline (no io-wq punt).
     Sequential,
     /// The range will be read in random order (`POSIX_FADV_RANDOM`): Linux turns readahead off.
     Random,
     /// The range will be read only once (`POSIX_FADV_NOREUSE`). A no-op before Linux 6.3.
     NoReuse,
     /// The range will be needed soon (`POSIX_FADV_WILLNEED`): Linux starts reading it into the
-    /// page cache in the background.
+    /// page cache in the background. io_uring runs it in an io-wq worker.
     WillNeed,
     /// The range will not be needed soon (`POSIX_FADV_DONTNEED`): Linux drops its clean pages
     /// from the page cache.
@@ -48,6 +48,20 @@ impl File {
     ///
     /// `len == 0` means "up to the end of the file". It is only a hint: the kernel may ignore it,
     /// and it never changes what reads return.
+    ///
+    /// # Which advice, and what it costs
+    ///
+    /// - `Normal`, `Sequential`, `Random` only set the file's readahead mode and run inline
+    ///   (well under a microsecond). `Sequential` doubles the readahead window of this open file
+    ///   (to 2 × the device's `read_ahead_kb`, often 2 × 128 KiB). For a file read front to back
+    ///   in 128 KiB chunks from a cold cache, the first read then starts readahead of the next
+    ///   chunk too, so later reads find it in flight or cached. On a cached file it changes
+    ///   nothing. The setting belongs to the open file, so it must be given again after every
+    ///   open.
+    /// - `WillNeed`, `DontNeed` (and `NoReuse`) do work (start readahead, drop pages) and io_uring
+    ///   always runs them in an io-wq worker: an `iou-wrk-*` hand-off per call (measured on Linux
+    ///   7.0, `tests/fs_punt_probe.rs`). `WillNeed` pays off for a cold range you will read
+    ///   later, issued early enough. Don't send it before each read of a cached file.
     ///
     /// # Errors
     ///

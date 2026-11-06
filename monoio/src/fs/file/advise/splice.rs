@@ -21,8 +21,24 @@ impl File {
     /// `TcpStream`) or [`Pipe::splice_to`]. A pipe holds 64 KiB by default, so one call moves at
     /// most that much.
     ///
-    /// io_uring runs a splice from a regular file in an io-wq worker (`iou-wrk-*` thread); cap
-    /// them with [`RuntimeBuilder::iowq_max_workers`](crate::RuntimeBuilder::iowq_max_workers).
+    /// # Always an io-wq punt
+    ///
+    /// io_uring never runs `IORING_OP_SPLICE` inline: its prep sets `REQ_F_FORCE_ASYNC` (the
+    /// splice code can block on the page cache and on pipe locks, and has no non-blocking issue
+    /// path), so every call is handed to an io-wq worker (`iou-wrk-*` thread), even when the
+    /// data is cached. `SPLICE_F_NONBLOCK` does not change that (it only affects the pipe side).
+    /// Measured on Linux 7.0 (f2fs and ext4, warm cache): 100% of splices punted, about one
+    /// worker context switch per call; see `tests/fs_punt_probe.rs`. The hand-off adds
+    /// latency, the workers' CPU is charged to the process, and under load io-wq starts many
+    /// workers (cap them with
+    /// [`RuntimeBuilder::iowq_max_workers`](crate::RuntimeBuilder::iowq_max_workers)).
+    ///
+    /// So splice is for large, cold files, where the read blocks anyway and the copy saved is
+    /// worth a worker. For files likely in the page cache, read into memory inline instead:
+    /// [`read_fixed_at`](Self::read_fixed_at) then `TcpStream::send_fixed`, or
+    /// [`read_at_then_send`](Self::read_at_then_send) (one linked chain). A warm buffered read
+    /// completes in the submitting `io_uring_enter`; a cold one completes from task work, still
+    /// without an io-wq worker.
     ///
     /// # Errors
     ///
@@ -66,7 +82,8 @@ impl File {
     /// Move up to `len` bytes from the read end of `pipe` into the file at `offset`
     /// (`IORING_OP_SPLICE`, Linux 5.7+, feature `splice`). Returns the number of bytes moved;
     /// `0` means the write end is closed and the pipe is empty. The file's own position is not
-    /// used or changed. Waits (in an io-wq worker) while the pipe is empty.
+    /// used or changed. Waits (in an io-wq worker) while the pipe is empty. Like
+    /// [`splice_to_pipe`](Self::splice_to_pipe), always runs in an io-wq worker.
     ///
     /// # Errors
     ///
