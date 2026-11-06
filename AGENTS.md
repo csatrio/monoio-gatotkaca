@@ -108,7 +108,7 @@ Default: `async-cancel`, `bytes`, `macros`, `utils`.
 | `tls-native` | `monoio::tls::native` (native-tls; OpenSSL on Linux, needs the OpenSSL dev package). |
 | `tls-native-alpn` | `tls-native` plus `TlsStream::alpn_protocol()` (OpenSSL ALPN). |
 | `tls-native-vendored` | `tls-native` with OpenSSL built from source. |
-| `metrics` | Compile the counters: `DriverStats`, `IoUringDriver::{stats, reset_stats}`, `monoio::{driver_stats, reset_driver_stats}`, and the counter fields of `BufRingStats`, `FixedBufStats`, `FixedFileStats`, `EventChannelStats` (plus `EventReceiver::wakeups`). Off: none of them exist and the hot paths carry no counter updates; pool state (`in_use`, `capacity`, ...) is always there. |
+| `metrics` | Compile the counters: `DriverStats`, `IoUringDriver::{stats, reset_stats}`, `monoio::{driver_stats, reset_driver_stats}`, and the counter fields of `BufRingStats`, `FixedBufStats`, `FixedFileStats`, `EventChannelStats` (plus `EventReceiver::wakeups`). Off: none of them exist and the hot paths carry no counter updates; pool state (`in_use`, `capacity`, ...) is always there. Measure performance on builds without it; use it only to diagnose. |
 | `debug` | Emit `tracing` events describing what the runtime does. For runtime development only. Examples need `tracing-subscriber` to show them. |
 | `unstable` | Enable nightly-only code paths (`io_error_more`, `lazy_cell`, `stmt_expr_attributes`, `thread_local`). Nightly toolchain required. |
 

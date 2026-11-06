@@ -2,6 +2,37 @@
 
 Releases of `adaptif-gatotkaca-monoio` (library name `monoio`), newest first. The fork starts from upstream [Monoio](https://github.com/bytedance/monoio) 0.2.4 (`8675e94`). Open work is in [TODO.md](TODO.md).
 
+## 0.8.0 (2026-11-07)
+Round 2 performance work, specified in [performance-improvement/ROUND2.md](performance-improvement/ROUND2.md), planned in [ROUND2-PLAN.md](performance-improvement/ROUND2-PLAN.md), measured in [round2/](performance-improvement/round2/) (final gate: [G3.md](performance-improvement/round2/G3.md)). Everything new is opt-in: a default builder schedules and submits as 0.7.1 did. Commits `a4de6cf`..HEAD.
+
+**Breaking**
+- Counters compile only with the new `metrics` feature. Without it `driver_stats()`, `reset_driver_stats()`, `DriverStats`, `IoUringDriver::{stats, reset_stats}`, `EventReceiver::wakeups()` and the counter fields of `BufRingStats` (`enobufs`, `high_water`, `taken`, `recycled`), `FixedBufStats` (`high_water`, `exhausted`), `EventChannelStats` (`eventfd_wakeups`, `ring_wakeups`, `full`) and `FixedFileStats::high_water` do not exist, and the hot paths carry no counter updates. Users of these add `features = ["metrics"]`. Pool state (`in_use`, `capacity`, ...) stays available.
+- `BufRingStats`, `FixedBufStats`, `FixedFileStats`, `EventChannelStats` and the new `RuntimeStats` are `#[non_exhaustive]`: no struct literals outside the crate.
+
+**Scheduler**
+- `monoio::task::yield_now()`, `task::consume_budget()`, `task::unconstrained(fut)`; `RuntimeBuilder::coop_budget(Some(n))`: a per-poll budget of ready op results (F1).
+- `RuntimeBuilder::lifo_slot(true)`: a task woken by the running task runs right after it. Pair it with `task_budget(n)`; a small budget alone starves waker hand-overs (M2: proxy at 28–36% of target without it, 95% with it).
+- `RuntimeBuilder::small_io_priority(Some(n))`: tasks woken by small completions (< `n` bytes) run before the ready queue, capped at half the round budget; a bulk completion keeps its task in the queue for its next 8 small wakes (M3). Recommended for small requests next to bulk streams: `task_budget(61)`, `lifo_slot(true)`, `small_io_priority(Some(16 * 1024))`. Measured (`--cells 64:4096`): proxy p99 41.3 → 13.5 ms (tokio 20.6), json p99 13.0 → 6.2 ms, payload −0.5%.
+- `RuntimeStats` via `monoio::runtime_stats()` / `reset_runtime_stats()` or `Runtime::stats()` (feature `metrics`): rounds, parks with busy/park time, polls per round, budget cuts, ready-queue length and high water, spawns, remote wakes, `coop_yields`, `lifo_polls`, `prio_polls` (F2).
+- Cheaper completion path: CQEs reaped in batches of 32 with prefetch, op slots removed without a refcount round trip (M5; user-space instructions per frame −5%).
+
+**Net**
+- `TcpListener`/`UnixListener::accept_batch_into(&mut vec, max, flags)` / `accept_batch`: keeps one multishot accept armed in the listener and returns everything queued in one poll. Removes the ~6,200 timeouts per run of a plain `accept()` loop at 4096 connections behind bulk streams (M1, M4). `AcceptStream::next_batch` / `next_stream_batch`.
+- `RecvStream::read_into(&mut BytesMut)` (also on `RecvBundleStream`) and `into_reader()` (`MultiRecvReader`, `AsyncReadRent`): multishot receive for framed read loops, one copy per byte, re-arms after `ENOBUFS` (F3).
+- Fix: `recv_multi` on an incremental (`IOU_PBUF_RING_INC`) ring shared by many connections stalled, because buffers were taken in poll order instead of CQ order. They are now taken at reap time.
+
+**Files**
+- `OpenOptions::open_direct(path)`: opens a regular file straight into a fixed-file slot; close is a slot removal, never an io-wq punt. `File::is_direct()`, `fixed_slot()` (F5).
+- Per-opcode completion latency in driver ticks (`DriverStats::op_ticks_by_opcode`) shows punted ops; AGENTS.md lists which file ops run inline and which punt on Linux 7.0. File splice always runs in io-wq (M6).
+
+**Runtime setup**
+- `utils::ThreadPerCore::new(cpus).run(|core| ..)`: one pinned runtime per CPU, `CoreInfo` with every core's `RingHandle`, optional shared io-wq, `TpcHandle::join()` (F4). Example `thread_per_core`.
+- `RuntimeBuilder::sqpoll(idle, cpu)`: SQPOLL applied at `build()`. Warns once per process when the poller would share the runtime's only CPU; `deny_sqpoll_conflict()` makes `build()` fail with `InvalidInput` instead (M8).
+
+**Examples**: `fairness` (load reproducer with `--upstream` proxy model and runtime stats), `smallframes` (M5 reproducer), `thread_per_core`.
+
+**Measured** against 0.7.1 (gatotkaca-transport harness, 5 rounds, builds without `metrics`): 64 KiB mix payload per CPU-second +1.8%, json p99 −5.7%, proxy p99 −4.2%; encrypted mix +1.8%. Many connections with small frames are now within 8% of tokio (−7.9% at 4 KiB, −7.4% at 16 KiB, was −8.3% / −8.9%).
+
 ## 0.7.1 (2026-11-06)
 No public API changes. Commits `ec850da`..HEAD.
 
