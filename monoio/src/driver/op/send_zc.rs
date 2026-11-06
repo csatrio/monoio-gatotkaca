@@ -17,7 +17,7 @@ use std::{
 use io_uring::opcode;
 
 use super::{
-    super::shared_fd::{sqe_fd, SharedFd},
+    super::shared_fd::{sqe_fd, SharedFd, TxFd},
     submit::SubmitResult,
     Op, OpAble, OpKind,
 };
@@ -36,8 +36,9 @@ const NOSIGNAL: i32 = libc::MSG_NOSIGNAL;
 /// `IORING_OP_SEND_ZC` of one buffer, optionally a registered one (`buf_index`).
 pub(crate) struct SendZcBuf<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed while the operation
-    /// is in-flight.
-    fd: SharedFd,
+    /// is in-flight. Counts as a send in flight on the socket until the notification CQE (the
+    /// data lives that long), which is later than needed for ordering but never too early.
+    fd: TxFd,
     pub(crate) buf: T,
     /// The registered-buffer index (sets `IORING_RECVSEND_FIXED_BUF`), if the buffer is
     /// registered on this ring.
@@ -48,7 +49,7 @@ impl<T: IoBuf> Op<SendZcBuf<T>> {
     /// Zero-copy send of a plain buffer.
     pub(crate) fn send_zc_buf(fd: SharedFd, buf: T) -> SubmitResult<Self, T> {
         Op::submit_or_return(SendZcBuf {
-            fd,
+            fd: TxFd::new(fd),
             buf,
             buf_index: None,
         })
@@ -61,7 +62,12 @@ impl<T: FixedIoBuf> Op<SendZcBuf<T>> {
     /// a plain one (its index means nothing to this ring).
     pub(crate) fn send_zc_fixed(fd: SharedFd, buf: T) -> SubmitResult<Self, T> {
         let buf_index = on_current_ring(&buf).then(|| buf.buf_index());
-        Op::submit_or_return(SendZcBuf { fd, buf, buf_index }).map_err(|(e, d)| (e, d.buf))
+        Op::submit_or_return(SendZcBuf {
+            fd: TxFd::new(fd),
+            buf,
+            buf_index,
+        })
+        .map_err(|(e, d)| (e, d.buf))
     }
 }
 
@@ -91,8 +97,8 @@ impl<T: IoBuf> OpAble for SendZcBuf<T> {
 /// `IORING_OP_SENDMSG_ZC` on a connected socket (no address), with `MSG_NOSIGNAL`.
 pub(crate) struct SendMsgZc<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed while the operation
-    /// is in-flight.
-    fd: SharedFd,
+    /// is in-flight. Counts as a send in flight on the socket (until the notification CQE).
+    fd: TxFd,
     /// The in-flight buffers; `msg` points at their iovecs.
     pub(crate) buf_vec: T,
     /// Boxed so the kernel sees a stable address after the op moves.
@@ -103,7 +109,12 @@ impl<T: IoVecBuf> Op<SendMsgZc<T>> {
     pub(crate) fn send_msg_zc(fd: SharedFd, buf_vec: T) -> SubmitResult<Self, T> {
         // SAFETY: an all-zero msghdr is valid (no name, no control). `uring_op` sets the iovecs.
         let msg: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
-        Op::submit_or_return(SendMsgZc { fd, buf_vec, msg }).map_err(|(e, d)| (e, d.buf_vec))
+        Op::submit_or_return(SendMsgZc {
+            fd: TxFd::new(fd),
+            buf_vec,
+            msg,
+        })
+        .map_err(|(e, d)| (e, d.buf_vec))
     }
 
     /// Wait for both CQEs.

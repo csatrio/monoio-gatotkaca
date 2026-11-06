@@ -279,13 +279,21 @@ impl std::fmt::Debug for UnixStream {
 impl AsyncWriteRent for UnixStream {
     #[inline]
     fn write<T: IoBuf>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
-        // Submit the write operation
-        self.send_op(buf)
+        // Submit the write operation; with `set_eager_send`, a direct send first.
+        if self.fd.eager_send() {
+            self.send_eager(buf)
+        } else {
+            self.send_op(buf)
+        }
     }
 
     #[inline]
     fn writev<T: IoVecBuf>(&mut self, buf_vec: T) -> impl Future<Output = BufResult<usize, T>> {
-        self.writev_op(buf_vec)
+        if self.fd.eager_send() {
+            crate::driver::op::write::writev_eager(&self.fd, buf_vec)
+        } else {
+            self.writev_op(buf_vec)
+        }
     }
 
     #[inline]
