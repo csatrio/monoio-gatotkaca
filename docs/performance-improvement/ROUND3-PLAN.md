@@ -139,7 +139,7 @@ A design below that depends on a statement is fixed only after its probe. **Verd
 | E6 | `AsyncWriteRentExt::write_all` | wraps the buffer in a `Slice` and loops even when the first send takes everything | first send on the plain buffer, loop only after a short write | measure, r3-op (a second await point grows the future) |
 | E7 | S1 | ROUND3.md proposes a new `SendEagerFuture` | reuse `SendFuture` with `State::Ready`; carry a partial eager send as an offset inside `Send<T>` (fits in existing padding) | adopt, seed commit + r3-eager |
 | E8 | A1 | ROUND3.md proposes the `msghdr` inline in the op | unsound by finding 8 if KV4 holds. Use a per-thread free list of boxed `msghdr`s: no allocation in steady state, stable address | adopt, r3-vec; vectored SEND (KV5) as a follow-up to measure |
-| E9 | C1 | ROUND3.md: slot waits for one or two CQEs, told apart by order | if KV2 holds: always one CQE. Tag the head's `user_data` (bit 61) so the dispatcher knows which member posted it; the hot path keeps one test (`>> 61 == 0`) | decided by the probe, r3-pair |
+| E9 | C1 | ROUND3.md: slot waits for one or two CQEs, told apart by order | KV2 held: always one CQE. The head's `user_data` carries bit 61 and the member position (bits 32..60), so the dispatcher knows which member posted; the hot path keeps one test (`>> 61 == 0`) | done, r3-pair |
 | E10 | B1 | ROUND3.md: window-based grow/shrink policy | keep retired buffers on a LIFO stack and publish from its top, so the published set is always the most recently used buffers | adopt, r3-bufring |
 
 ---
@@ -499,6 +499,6 @@ seed (r3-base)
 | G0 | done ([round3/G0.md](round3/G0.md)): KV2–KV5 hold, KV1 partly (cap since 6.13, wake-up run capped at `min_complete`); D1 reproduced in direction (`defer` leaves task work after 47% of waiting enters, `coop` 2%); D2 = one accept per round on the bench under `coop`'s one-round-per-sweep regime (run 122: p99 7.1 s → 22 ms with `acceptmulti`), no driver fix; baselines recorded |
 | wave 1 | done (tag `r3-wave1`): r3-slot, r3-op, r3-drain (variant A; B removed after the quiet slot), r3-bufring, r3-eager (+ its guard diffs), r3-direct, r3-timer (without the fresh list); fixups: inline hints, one waker vtable address |
 | G1 | done ([round3/G1.md](round3/G1.md)): D1, S1, D2, T1, O1, B1 (72 KiB buffers), K1 all pass; one configuration `defer:…:wset72:drain2:eagerack` passes G3's bounds on MIX, R2000 and R8 |
-| wave 2 | not started |
-| G2 | not started |
+| wave 2 | done (tag `r3-wave2`): r3-pair, r3-vec (+ vectorized SEND on 6.17+), r3-docs; lead: `reqresp --path vec`, AGENTS.md for the wave-2 APIs |
+| G2 | done ([round3/G2.md](round3/G2.md)): A1 passes; C1 passes at R8 and on `coop`, fails at R2000 on `defer` (−5%: a linked receive costs a deferred task-work item), documented rule |
 | release, G3 | not started |

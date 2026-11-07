@@ -16,7 +16,7 @@ Measured so far (do not re-open): `defer` against `coop` (round 3 G0/G1: many co
 - **A3, direct-only Unix sockets.** `UnixListener` has no `accept_direct`/`accept_multi_direct`/`accept_batch_direct_into`; a `UnixStream` always has an fd (`register_fixed` works). `BatchAcceptor::accept_direct` works on any listening fd, so the Unix twin is small.
 
 ## Gaps in the new APIs
-- Named futures (`_op` methods) are missing for `send_vectored`, `write_zc`, and `File` `read`/`readv`. Each is one `named_future!` line plus a `BufOp` impl.
+- Named futures (`_op` methods) are missing for `write_zc` and `File` `read`/`readv`. Each is one `named_future!` line plus a `BufOp` impl.
 - `read_with_deadline` / `write_with_deadline` exist only on `TcpStream`; add them for UDP and Unix sockets.
 - `send_zc_early` covers single buffers only; vectored zero-copy (`send_vectored_zc`) waits for the notification.
 - Fixed buffers: no `FixedBufPool::get_or_wait()`, no `recv_fixed`/`send_fixed` on `UnixStream`, no `write_all_fixed` helper.
@@ -39,7 +39,9 @@ Measured so far (do not re-open): `defer` against `coop` (round 3 G0/G1: many co
 - Dropping a raw `MultiOp` does not inspect its remaining CQEs, so fds or provided buffers in them leak. The typed streams (`AcceptStream`, `RecvStream`, ...) handle this.
 - `msg_ring_nowait` keeps target handles alive until the driver's submitted-SQE count passes them. It can only hold them too long, never release them early.
 - `BufRing` hugetlb pools fail when no huge pages are reserved instead of falling back.
-- Dropped in-flight op data is stored inline up to 48 bytes; `ReadFixed` (64) and `SendMsgVec` (72) are still boxed.
+- Dropped in-flight op data is stored inline up to 48 bytes; `ReadFixed` (64) is still boxed, and so is any vectored send whose buffer type is over 24 bytes (`VecBuf`, every `IoVecArray`; a bare `Vec<libc::iovec>` is inline). Making `IoVecArray` ops inline needs the array's buffers behind its existing iovec box (round3/r3-vec.md, open question 1).
+- `send_vectored_zc` and the datagram `SendMsg`/`SendMsgUnix` still box a `msghdr` per op; the pool in `driver/msghdr_pool.rs` and `IORING_SEND_VECTORIZED` (for `SEND_ZC`) cover both (round3/r3-vec.md, open questions 2 and 3).
+- A `send_then_recv` dropped in flight is boxed once (its op data is 56 bytes, 72 for the fixed form).
 - The submit-failure path (SQ can't be flushed) has no test that forces it.
 - `IORING_SQ_TASKRUN` can stay set with nothing pending after an enter that asked for more than one completion (`min_wait`): `enter_left_taskrun` over-counts and `skip_empty_enter` makes one enter it could have skipped. No user-space fix: the ring does not expose "nothing pending".
 - `drain_taskrun` runs only after a park that waited, not after the submit-only park (`sync`, foreign wakers) and not on the cold-path submit.
