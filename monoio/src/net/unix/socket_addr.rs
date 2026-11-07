@@ -13,7 +13,7 @@ use std::{
 use super::path_offset;
 
 /// Unix SocketAddr.
-/// There is no way to create a [`net::SocketAddr`] so we forked it from mio.
+/// There is no way to create a [`std::net::SocketAddr`] so we forked it from mio.
 #[derive(Clone)]
 pub struct SocketAddr {
     sockaddr: libc::sockaddr_un,

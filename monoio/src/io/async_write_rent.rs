@@ -71,7 +71,7 @@ pub trait AsyncWriteRent {
 
     /// Shuts down the output stream, ensuring that the value can be cleanly dropped.
     ///
-    /// Similar to [`flush`], all buffered data is written to the underlying stream. After this
+    /// Similar to [`flush`](AsyncWriteRent::flush), all buffered data is written to the underlying stream. After this
     /// operation completes, the caller should no longer attempt to write to the stream.
     fn shutdown(&mut self) -> impl Future<Output = std::io::Result<()>>;
 }

@@ -22,6 +22,10 @@ Changes made to Monoio and monoio-tls:
 - Removed unused code, bumped all dependencies and adapted to their new APIs.
 - Renamed the packages to adaptif-gatotkaca-monoio and adaptif-gatotkaca-monoio-macros
   (the library name stays `monoio`).
+- Extended the io_uring surface (multishot ops, provided and registered buffers, fixed
+  files, linked chains, cross-ring messages, zero-copy and eager sends), the scheduler
+  and the timer, and added the load reproducers under monoio/examples; the changes of
+  each release are listed in docs/RELEASES.md.
 
 Modifications are made by csatrio for Adaptif (https://www.adaptif.co.id) and are made
 available under the same MIT or Apache-2.0 terms.

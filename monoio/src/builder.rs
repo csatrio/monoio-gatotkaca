@@ -57,7 +57,7 @@ impl<T> Default for RuntimeBuilder<T> {
     /// # Note
     ///
     /// When the sync feature is enabled, the default behavior of
-    /// [monoio::blocking::BlockingStrategy] is to execute tasks on the local thread. In other
+    /// [`BlockingStrategy`](crate::blocking::BlockingStrategy) is to execute tasks on the local thread. In other
     /// words, there is no thread pool involved—all blocking I/O operations and heavy computations
     /// will block the current thread.
     fn default() -> Self {
@@ -71,7 +71,7 @@ impl<T> RuntimeBuilder<T> {
     /// # Note
     ///
     /// When the sync feature is enabled, the default behavior of
-    /// [monoio::blocking::BlockingStrategy] is to execute tasks on the local thread. In other
+    /// [`BlockingStrategy`](crate::blocking::BlockingStrategy) is to execute tasks on the local thread. In other
     /// words, there is no thread pool involved—all blocking I/O operations and heavy computations
     /// will block the current thread.
     #[must_use]

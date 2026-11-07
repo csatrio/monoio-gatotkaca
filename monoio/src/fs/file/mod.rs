@@ -146,7 +146,7 @@ impl File {
     /// The method returns the operation result and the same buffer value passed
     /// as an argument.
     ///
-    /// If the method returns [`Ok(n)`], then the read was successful. A nonzero
+    /// If the method returns `Ok(n)`, then the read was successful. A nonzero
     /// `n` value indicates that the buffer has been filled with `n` bytes of
     /// data from the file. If `n` is `0`, then one of the following happened:
     ///
@@ -211,7 +211,7 @@ impl File {
     /// The method returns the operation result and the same buffer value passed
     /// as an argument.
     ///
-    /// If the method returns [`Ok(())`], then the read was successful.
+    /// If the method returns `Ok(())`, then the read was successful.
     ///
     /// # Errors
     ///
@@ -336,7 +336,7 @@ impl File {
     /// }
     /// ```
     ///
-    /// [`Ok(n)`]: Ok
+    /// `Ok(n)`: Ok
     pub async fn write_at<T: IoBuf>(&self, buf: T, pos: u64) -> crate::BufResult<usize, T> {
         self.write_at_op(buf, pos).await
     }
@@ -620,7 +620,7 @@ impl AsyncWriteRent for File {
         self.flush().await
     }
 
-    /// This function will call [`flush`] inside.
+    /// This function will call [`flush`](AsyncWriteRent::flush) inside.
     async fn shutdown(&mut self) -> std::io::Result<()> {
         self.flush().await
     }
@@ -687,7 +687,7 @@ impl AsyncReadRent for File {
     /// The method returns the operation result and the same array of buffers
     /// passed as an argument.
     ///
-    /// If the method returns [`Ok(n)`], then the read was successful. A nonzero
+    /// If the method returns `Ok(n)`, then the read was successful. A nonzero
     /// `n` value indicates that the buffers have been filled with `n` bytes of
     /// data from the file. If `n` is `0`, then one of the following happened:
     ///

@@ -353,8 +353,8 @@ impl Default for MissedTickBehavior {
 /// Interval returned by [`interval`] and [`interval_at`]
 ///
 /// This type allows you to wait on a sequence of instants with a certain
-/// duration between each instant. Unlike calling [`sleep`] in a loop, this lets
-/// you count the time spent between the calls to [`sleep`] as well.
+/// duration between each instant. Unlike calling [`sleep`](crate::time::sleep()) in a loop, this lets
+/// you count the time spent between the calls to [`sleep`](crate::time::sleep()) as well.
 #[derive(Debug)]
 pub struct Interval {
     /// Future that completes the next time the `Interval` yields a value.

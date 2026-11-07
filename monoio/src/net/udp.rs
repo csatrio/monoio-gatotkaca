@@ -14,13 +14,13 @@ use crate::{
 
 /// A UDP socket.
 ///
-/// After creating a `UdpSocket` by [`bind`]ing it to a socket address, data can be
+/// After creating a `UdpSocket` by [`bind`](UdpSocket::bind)ing it to a socket address, data can be
 /// [sent to] and [received from] any other socket address.
 ///
 /// Although UDP is a connectionless protocol, this implementation provides an interface
 /// to set an address where data should be sent and received from. After setting a remote
-/// address with [`connect`], data can be sent to and received from that address with
-/// [`send`] and [`recv`].
+/// address with [`connect`](UdpSocket::connect), data can be sent to and received from that address with
+/// [`send`](UdpSocket::send) and [`recv`](UdpSocket::recv).
 #[derive(Debug)]
 pub struct UdpSocket {
     fd: SharedFd,
@@ -142,26 +142,18 @@ impl UdpSocket {
     }
 
     /// Set value for the `SO_REUSEADDR` option on this socket.
-    #[allow(unused_variables)]
     pub fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
-        let r = {
-            let socket = unsafe { socket2::Socket::from_raw_fd(self.fd.as_raw_fd()) };
-            let r = socket.set_reuse_address(reuse);
-            let _ = socket.into_raw_fd();
-            r
-        };
+        let socket = unsafe { socket2::Socket::from_raw_fd(self.fd.as_raw_fd()) };
+        let r = socket.set_reuse_address(reuse);
+        let _ = socket.into_raw_fd();
         r
     }
 
     /// Set value for the `SO_REUSEPORT` option on this socket.
-    #[allow(unused_variables)]
     pub fn set_reuse_port(&self, reuse: bool) -> io::Result<()> {
-        let r = {
-            let socket = unsafe { socket2::Socket::from_raw_fd(self.fd.as_raw_fd()) };
-            let r = socket.set_reuse_port(reuse);
-            let _ = socket.into_raw_fd();
-            r
-        };
+        let socket = unsafe { socket2::Socket::from_raw_fd(self.fd.as_raw_fd()) };
+        let r = socket.set_reuse_port(reuse);
+        let _ = socket.into_raw_fd();
         r
     }
 

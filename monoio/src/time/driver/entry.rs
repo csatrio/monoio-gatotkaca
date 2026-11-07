@@ -309,12 +309,12 @@ impl TimerShared {
 
 /// Whether `a` and `b` wake the same task.
 ///
-/// `Waker::will_wake` alone says "no" far too often here: it compares the vtable *addresses*, and
-/// this runtime's task wakers take their vtable from a promoted constant (`task/waker.rs`,
-/// `raw_waker`), which the compiler emits once per place it is inlined into. The waker a task is
-/// polled with and a clone of it then differ in that address, and a timer polled once per
-/// request would clone a waker and drop one on every poll. So when the addresses differ, the
-/// vtables' contents (four function pointers) decide.
+/// Same data pointer and same vtable. This runtime's task wakers take their vtable from one
+/// `#[inline(never)]` function per task type (`task/waker.rs`, `vtable`), so a task's waker and
+/// its clones share the vtable address and the pointer comparison decides. The content
+/// comparison (four function pointers) is the fallback for wakers whose vtable is a promoted
+/// constant emitted once per inlining site, as this runtime's used to be: without it a timer
+/// polled once per request would clone a waker and drop one on every poll.
 #[inline]
 fn same_waker(a: &Waker, b: &Waker) -> bool {
     a.data() == b.data() && (std::ptr::eq(a.vtable(), b.vtable()) || a.vtable() == b.vtable())
