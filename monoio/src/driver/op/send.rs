@@ -4,7 +4,10 @@ use io_uring::opcode;
 use socket2::SockAddr;
 
 use super::{super::shared_fd::SharedFd, submit::SubmitResult, Completion, Op, OpAble};
-use crate::driver::shared_fd::{sqe_fd, TxFd};
+use crate::driver::{
+    msghdr_pool::{vectorized_send, PooledMsgHdr, IORING_SEND_VECTORIZED},
+    shared_fd::{sqe_fd, TxFd},
+};
 use crate::net::unix::SocketAddr as UnixSocketAddr;
 use crate::{
     buf::{IoBuf, IoVecBuf, IoVecBufMut, IoVecMeta, MsgMeta},
@@ -392,7 +395,9 @@ impl<T: IoBuf> OpAble for SendZc<T> {
     }
 }
 
-/// Vectored send on a connected socket: `sendmsg` with no address and `MSG_NOSIGNAL`.
+/// Vectored send on a connected socket, with `MSG_NOSIGNAL` and no address: a plain `SEND`
+/// with `IORING_SEND_VECTORIZED` (6.17+) or, on older kernels, `sendmsg` with a pooled
+/// `msghdr` (`driver::msghdr_pool` decides, once per process).
 ///
 /// Unlike `writev`, a reset peer gives `EPIPE` and no `SIGPIPE`.
 pub(crate) struct SendMsgVec<T> {
@@ -400,24 +405,31 @@ pub(crate) struct SendMsgVec<T> {
     /// while the operation is in-flight. Counts as a send in flight on the socket.
     fd: TxFd,
 
-    /// The in-flight buffers; `msg` points at their iovecs.
+    /// The in-flight buffers; the SQE (or `msg`) points at their iovecs.
     pub(crate) buf_vec: T,
 
-    /// Boxed so the kernel sees a stable address after the op moves.
-    msg: Box<libc::msghdr>,
+    /// `None`: a vectorized `SEND`, the SQE itself points at the iovecs. `Some`: `sendmsg`;
+    /// the `msghdr` is on the heap, from the thread's free list, since the kernel reads it at
+    /// the enter, after the op data moved into its future. Back on the list when the op data
+    /// is dropped, which is after the CQE on every path (see `driver::msghdr_pool`).
+    msg: Option<PooledMsgHdr>,
 
     /// Extra `MSG_*` flags, ORed with `MSG_NOSIGNAL`.
     flags: u32,
 }
 
 impl<T: IoVecBuf> Op<SendMsgVec<T>> {
+    #[inline]
     pub(crate) fn send_msg_vec(
         fd: SharedFd,
         buf_vec: T,
         flags: libc::c_int,
     ) -> SubmitResult<Self, T> {
-        // Safety: an all-zero msghdr is valid (no name, no control). `uring_op` sets the iovecs.
-        let msg: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
+        let msg = if vectorized_send() {
+            None
+        } else {
+            Some(PooledMsgHdr::take())
+        };
         Op::submit_or_return(SendMsgVec {
             fd: TxFd::new(fd),
             buf_vec,
@@ -428,7 +440,15 @@ impl<T: IoVecBuf> Op<SendMsgVec<T>> {
     }
 
     pub(crate) async fn result(self) -> BufResult<usize, T> {
-        let complete = self.await;
+        <SendMsgVec<T> as BufOp>::complete(self.await)
+    }
+}
+
+impl<T: IoVecBuf> BufOp for SendMsgVec<T> {
+    type Buf = T;
+
+    #[inline]
+    fn complete(complete: Completion<Self>) -> BufResult<usize, T> {
         (
             complete.meta.result.map(|v| v.into_inner() as _),
             complete.data.buf_vec,
@@ -440,11 +460,21 @@ impl<T: IoVecBuf> OpAble for SendMsgVec<T> {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
         #[allow(deprecated)]
         const NOSIGNAL: u32 = libc::MSG_NOSIGNAL as u32;
-        self.msg.msg_iov = self.buf_vec.read_iovec_ptr() as *mut _;
-        self.msg.msg_iovlen = self.buf_vec.read_iovec_len() as _;
-        sqe_fd!(self.fd, |fd| opcode::SendMsg::new(fd, &*self.msg)
-            .flags(NOSIGNAL | self.flags)
-            .build())
+        let (iov, len) = (self.buf_vec.read_iovec_ptr(), self.buf_vec.read_iovec_len());
+        match &mut self.msg {
+            None => sqe_fd!(self.fd, |fd| opcode::Send::new(fd, iov.cast(), len as _)
+                .flags((NOSIGNAL | self.flags) as _)
+                .ioprio(IORING_SEND_VECTORIZED)
+                .build()),
+            Some(msg) => {
+                let hdr = msg.get_mut();
+                hdr.msg_iov = iov as *mut _;
+                hdr.msg_iovlen = len as _;
+                sqe_fd!(self.fd, |fd| opcode::SendMsg::new(fd, msg.as_ptr())
+                    .flags(NOSIGNAL | self.flags)
+                    .build())
+            }
+        }
     }
 }
 
@@ -468,6 +498,22 @@ mod tests {
             assert_eq!(size_of::<Send<bytes::BytesMut>>(), 48);
         }
         assert_eq!(size_of::<SendZc<Vec<u8>>>(), 32);
+    }
+
+    /// The optional pooled `msghdr` is one pointer (niche), like the box before it. What
+    /// decides whether a dropped in-flight vectored send fits the 48 bytes of inline storage
+    /// is the buffer type: a bare iovec `Vec` fits, `VecBuf` (two `Vec`s) and every
+    /// `IoVecArray` (its buffers are inline) do not.
+    #[test]
+    fn send_msg_vec_data_sizes() {
+        use crate::buf::{IoVecArray, VecBuf};
+        assert_eq!(size_of::<Option<PooledMsgHdr>>(), size_of::<usize>());
+        assert_eq!(size_of::<SendMsgVec<Vec<libc::iovec>>>(), 48);
+        assert_eq!(size_of::<SendMsgVec<VecBuf>>(), 72);
+        assert_eq!(size_of::<SendMsgVec<IoVecArray<Vec<u8>, 1>>>(), 64);
+        assert_eq!(size_of::<SendMsgVec<IoVecArray<Vec<u8>, 4>>>(), 136);
+        #[cfg(feature = "bytes")]
+        assert_eq!(size_of::<SendMsgVec<IoVecArray<bytes::Bytes, 4>>>(), 168);
     }
 
     #[test]

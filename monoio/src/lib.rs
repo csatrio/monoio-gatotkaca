@@ -44,6 +44,9 @@ pub use builder::{Buildable, RuntimeBuilder};
 /// Sizes for the tests (`tests/metrics_off.rs`). Not API.
 #[doc(hidden)]
 pub use driver::layout as __private;
+/// Hooks for the tests of the vectored sends (`tests/vectored_alloc.rs`). Not API.
+#[doc(hidden)]
+pub use driver::msghdr_pool::hooks as __vectored;
 #[cfg(feature = "metrics")]
 #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
 pub use driver::{driver_stats, reset_driver_stats, DriverStats};
