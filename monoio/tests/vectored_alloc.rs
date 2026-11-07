@@ -145,15 +145,17 @@ async fn frame(
     (parts, reply, bufs)
 }
 
-#[test]
-fn steady_state_vectored_sends_do_not_allocate() {
+/// `mode`: `Some(true)` the vectorized `SEND` (6.17+), `Some(false)` `sendmsg` with the
+/// pooled `msghdr`, `None` whatever the kernel probe chose.
+fn steady_state_allocations(mode: Option<bool>) -> (u64, usize) {
     const WARMUP: usize = 64;
     const N: usize = 1000;
 
+    monoio::__vectored::set_vectored_send(mode);
     let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
         .build()
         .unwrap();
-    let (made, idle) = rt.block_on(async {
+    let out = rt.block_on(async {
         let (a, b) = tcp_pair().await;
         let mut parts: IoVecArray<Vec<u8>, 3> = IoVecArray::new();
         let bufs = [b"HDR-0001".to_vec(), vec![0x42u8; 40], b"\r\n\r\n".to_vec()];
@@ -169,13 +171,152 @@ fn steady_state_vectored_sends_do_not_allocate() {
         }
         (allocs() - before, monoio::__vectored::idle_msghdrs())
     });
-    println!("allocations over {N} vectored sends: {made}; idle msghdrs on the thread: {idle}");
+    monoio::__vectored::set_vectored_send(None);
+    println!(
+        "mode {mode:?}: allocations over {N} vectored sends: {}; idle msghdrs on the thread: {}",
+        out.0, out.1
+    );
+    out
+}
+
+#[test]
+fn steady_state_vectored_sends_do_not_allocate() {
+    let (made, idle) = steady_state_allocations(None);
     assert_eq!(made, 0, "vectored sends allocated in steady state");
     assert!(
         idle <= 1,
         "one send at a time keeps at most one idle msghdr"
     );
 }
+
+/// The `sendmsg` form, forced: the pooled `msghdr` is reused, nothing is allocated.
+#[test]
+fn steady_state_sendmsg_fallback_does_not_allocate() {
+    let (made, idle) = steady_state_allocations(Some(false));
+    assert_eq!(made, 0, "sendmsg fallback allocated in steady state");
+    assert_eq!(idle, 1, "the one msghdr of the loop is idle between sends");
+}
+
+/// The vectorized `SEND` form, forced (6.17+ only): no `msghdr` at all.
+#[test]
+fn steady_state_vectorized_send_does_not_allocate() {
+    if !monoio::__vectored::vectored_send_is_vectorized() {
+        println!("kernel without IORING_SEND_VECTORIZED: skipped");
+        return;
+    }
+    let (made, idle) = steady_state_allocations(Some(true));
+    assert_eq!(made, 0, "vectorized SEND allocated in steady state");
+    assert_eq!(idle, 0, "the vectorized SEND touches no msghdr");
+}
+
+/// Three iovecs, in one send, arrive in order and complete; with `MSG_WAITALL` too; on TCP
+/// and Unix; in both SQE forms (the vectorized one only on 6.17+).
+#[monoio::test]
+async fn both_forms_send_three_iovecs() {
+    use monoio::net::UnixStream;
+
+    async fn check<S: Vectored>(a: &S, b: &S, flags: MsgFlags) {
+        let mut parts: IoVecArray<Vec<u8>, 3> = IoVecArray::new();
+        parts.push(b"one|".to_vec()).unwrap();
+        parts.push(vec![0x77u8; 5000]).unwrap();
+        parts.push(b"|three".to_vec()).unwrap();
+        let total = parts.total_len();
+        let (res, parts) = a.send(parts, flags).await;
+        assert_eq!(res.unwrap(), total);
+        assert_eq!(parts.len(), 3);
+        let mut got = Vec::new();
+        while got.len() < total {
+            let (res, buf) = b.recv(Vec::with_capacity(total - got.len())).await;
+            let n = res.unwrap();
+            assert!(n > 0);
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(&got[..4], b"one|");
+        assert!(got[4..5004].iter().all(|&x| x == 0x77));
+        assert_eq!(&got[5004..], b"|three");
+    }
+
+    let probed = monoio::__vectored::vectored_send_is_vectorized();
+    let modes: &[bool] = if probed { &[true, false] } else { &[false] };
+    for &vectorized in modes {
+        monoio::__vectored::set_vectored_send(Some(vectorized));
+        assert_eq!(
+            monoio::__vectored::vectored_send_is_vectorized(),
+            vectorized
+        );
+        for flags in [MsgFlags::EMPTY, MsgFlags::WAITALL] {
+            let (a, b) = tcp_pair().await;
+            check(&a, &b, flags).await;
+            check(&b, &a, flags).await;
+            let (a, b) = UnixStream::pair().unwrap();
+            check(&a, &b, flags).await;
+            check(&b, &a, flags).await;
+        }
+    }
+    monoio::__vectored::set_vectored_send(None);
+}
+
+/// On a kernel without the flag, forcing the vectorized form fails every send with `EINVAL`
+/// (that is what the probe protects against); on 6.17+ the forced form works. Either way the
+/// probe's own choice works.
+#[monoio::test]
+async fn forced_vectorized_form_matches_the_probe() {
+    let probed = monoio::__vectored::vectored_send_is_vectorized();
+    monoio::__vectored::set_vectored_send(Some(true));
+    let (a, b) = tcp_pair().await;
+    let mut parts: IoVecArray<Vec<u8>, 2> = IoVecArray::new();
+    parts.push(b"ab".to_vec()).unwrap();
+    parts.push(b"cd".to_vec()).unwrap();
+    let (res, _) = a.send_vectored_op(parts).await;
+    monoio::__vectored::set_vectored_send(None);
+    match res {
+        Ok(n) => {
+            assert_eq!(n, 4);
+            assert!(probed, "the probe said no, but the vectorized SEND worked");
+            let (res, buf) = b
+                .recv_with_flags_op(Vec::with_capacity(4), MsgFlags::WAITALL)
+                .await;
+            assert_eq!(res.unwrap(), 4);
+            assert_eq!(&buf, b"abcd");
+        }
+        Err(e) => {
+            assert_eq!(e.raw_os_error(), Some(libc::EINVAL), "{e}");
+            assert!(
+                !probed,
+                "the probe said yes, but the kernel rejected the SQE"
+            );
+        }
+    }
+}
+
+/// Shim over the two stream types for `both_forms_send_three_iovecs`.
+trait Vectored {
+    async fn send(
+        &self,
+        bufs: IoVecArray<Vec<u8>, 3>,
+        flags: MsgFlags,
+    ) -> monoio::BufResult<usize, IoVecArray<Vec<u8>, 3>>;
+    async fn recv(&self, buf: Vec<u8>) -> monoio::BufResult<usize, Vec<u8>>;
+}
+
+macro_rules! vectored {
+    ($t:ty) => {
+        impl Vectored for $t {
+            async fn send(
+                &self,
+                bufs: IoVecArray<Vec<u8>, 3>,
+                flags: MsgFlags,
+            ) -> monoio::BufResult<usize, IoVecArray<Vec<u8>, 3>> {
+                self.send_vectored_with_flags_op(bufs, flags).await
+            }
+            async fn recv(&self, buf: Vec<u8>) -> monoio::BufResult<usize, Vec<u8>> {
+                self.recv_op(buf).await
+            }
+        }
+    };
+}
+vectored!(TcpStream);
+vectored!(monoio::net::UnixStream);
 
 /// The rent method `send_vectored` uses the same op, so it allocates nothing either.
 #[test]
@@ -344,6 +485,8 @@ fn drop_in_flight(stream: &TcpStream, drops: &Rc<Cell<usize>>) -> u64 {
 #[cfg(feature = "async-cancel")]
 #[monoio::test(timer_enabled = true)]
 async fn dropped_in_flight_keeps_buffers_until_the_cqe() {
+    // The `sendmsg` form: the pooled `msghdr` must live as long as the buffers.
+    monoio::__vectored::set_vectored_send(Some(false));
     let (a, _b) = tcp_pair().await;
     set_sndbuf(&a, 4096);
     fill_fully(&a).await;
@@ -382,6 +525,7 @@ async fn dropped_in_flight_keeps_buffers_until_the_cqe() {
     assert_eq!(drops.get(), N);
     // The msghdrs of both bursts went back to the free list.
     assert!(monoio::__vectored::idle_msghdrs() >= N);
+    monoio::__vectored::set_vectored_send(None);
 }
 
 /// A bare `Vec<libc::iovec>` makes 48 bytes of op data: dropped in flight it is stored inline
