@@ -607,3 +607,24 @@ What I had to derive by hand or could not see:
   server's send on loopback.** Kernel and benchmark-setup matters, the same for both runtimes.
 - **A `MSG_TRUNC`-style "discard the body in the kernel" receive.** It would remove the copy, and no real
   replication server could use it.
+
+---
+
+## Item status after round 3 (0.9.0, 2026-11-07)
+
+Plan: [ROUND3-PLAN.md](ROUND3-PLAN.md); gates: [round3/G0.md](round3/G0.md), [G1.md](round3/G1.md), [G2.md](round3/G2.md), [G3.md](round3/G3.md).
+
+| id | status | where |
+|---|---|---|
+| D1 | done: `RuntimeBuilder::drain_taskrun(max)`, `uring::set_min_wait`; G1 pass (MIX +1.9% against `FEW` with the eager ack, p99 below `FEW`'s; R2000 at the 2% bound with `drain2`) | G1 |
+| S1 | done: `try_send`, `try_send_vectored`, `try_recv`, `send_eager`, `set_eager_send`; G1 pass (R8 ack p99 109 µs, inside tokio's range) | G1 |
+| D2 | explained: one accept per round under `coop`'s one-round-per-sweep regime, not the driver; bench-side fix (`acceptmulti`), p99 7.1 s → 22 ms; rule in AGENTS.md | G0, G1 |
+| C1 | done: `send_then_recv`, `send_then_recv_fixed`, skip-shape `submit_chain`; one slot, one CQE (the kernel skips the cancelled receive's CQE, so the ask's two-CQE rule was wrong). Pass at R8 on both rings and at R2000 on `coop`; −5% at R2000 on `defer` (a linked receive costs a deferred task-work item): documented rule | G0, G2 |
+| B1 | done: `working_set`, `published`/`grow_published`/`shrink_published`; G1 pass with whole-frame buffers (R8 −0.1%, R2000 +2.1%) | G1 |
+| B2 | done: `next_rearm`, `rearm_on`, `ring`, `wait_free` | G1 |
+| T1 | done: `Deadline`, `with_deadline`, `timeout_coarse`, `Instant::recent`; `timeout` −40%; G1 pass (+0.2% against the sweeper). The fresh list was built, measured below 1%, left out | G1 |
+| O1 | done: −21% to −27% user instructions per frame (asked ≥ 5%) | G1 |
+| K1 | done: `shutdown_with`/`shutdown_both`, async `set_sockopt`/`get_sockopt`, `accept_batch_direct_into`; G1 pass (+0.4%, 0 syscalls per connection) | G1 |
+| A1 | done: `send_vectored_op`, pooled `msghdr` (inline was unsound: the futures move after the SQE push), vectorized `SEND` on 6.17+; facade rebuilt without `into_split`; G2 pass | G2 |
+| X1 | done: `reqresp` example, `ops_completed`, `enter_left_taskrun` | wave 0 |
+| W1 | done: README, AGENTS.md (all round-3 APIs, the patterns, the recommended configuration), TODO | r3-docs |

@@ -2,6 +2,35 @@
 
 Releases of `adaptif-gatotkaca-monoio` (library name `monoio`), newest first. The fork starts from upstream [Monoio](https://github.com/bytedance/monoio) 0.2.4 (`8675e94`). Open work is in [TODO.md](TODO.md).
 
+## 0.9.0 (2026-11-07)
+Round 3 performance work on the request/response (replication) path, specified in [performance-improvement/ROUND3.md](performance-improvement/ROUND3.md), planned in [ROUND3-PLAN.md](performance-improvement/ROUND3-PLAN.md), measured in [round3/](performance-improvement/round3/) (gates [G0](performance-improvement/round3/G0.md), [G1](performance-improvement/round3/G1.md), [G2](performance-improvement/round3/G2.md), [G3](performance-improvement/round3/G3.md)). Everything new is opt-in; a default builder behaves as 0.8.0 did, only cheaper. Commits `957f8c5`..HEAD.
+
+**Breaking** (only with `metrics`)
+- `DriverStats` gained `enter_left_taskrun` and `drain_enters`, `RuntimeStats` gained `ops_completed`, `BufRingStats` gained `published` (always) and `grown`/`retired` (`metrics`). A new ring's stats no longer equal `BufRingStats::default()`.
+- `IORING_OP_SHUTDOWN` (direct-only streams) is no longer cancelled when its future is dropped.
+
+**Per-op cost** (O1, no API change). User instructions per request/response frame −21% to −27% (2000 connections × 4 KiB: 2,342 → 1,798; with a `time::timeout` per frame 3,341 → 2,433). One SQ view per push; a finished op is consumed without drop glue; `write_all` sends the plain buffer first; every op slot is one 64-byte cache line (inline storage for dropped ops stays 48 bytes); timers lost their multi-thread padding (`Sleep` 640 → 72 bytes); task wakers have one vtable address, so `Waker::will_wake` holds for the same task.
+
+**Driver**
+- `RuntimeBuilder::drain_taskrun(max)` (D1): on a `defer_taskrun` ring, up to `max` extra enters after a waiting enter while the kernel flags deferred task work (each delivers at most 20 completions on Linux 6.13+). Use 2 for request/response servers next to bulk work; it replaces `min_wait` there without adding latency. `uring::set_min_wait(wait, batch)` changes the batching wait at run time.
+- The kernel facts behind it, verified on 7.0 and written up in [round3/r3-probe.md](performance-improvement/round3/r3-probe.md): a run of deferred task work handles at most max(20, `min_complete`) items; an enter that slept delivers exactly `min_complete`; after a `min_wait` enter the task-run flag can stay set with nothing pending.
+
+**Net**
+- Eager sends (S1): `try_send`, `try_send_vectored`, `try_recv` (one non-blocking syscall, `WouldBlock` while a ring op of that direction is in flight or on a direct-only stream), `send_eager(buf)` (a `SendFuture` that is ready at once when the direct send took everything, else a ring send of the rest), `set_eager_send(true)` per socket for `write`/`write_all`. At 8 connections the ack p99 falls from 135 to 109 µs, inside tokio's range, at −1.1% frames/s.
+- `send_then_recv(reply, buf, flags)` / `send_then_recv_fixed` (C1): a `SEND` linked to a `RECV` on one op slot, one CQE, one task wake; `SendThenRecv`/`SendThenRecvFixed` named futures. `uring::submit_chain` accepts the skip shape (`CQE_SKIP_SUCCESS` on all but the last member, `uring::link_skip`). Use it on `coop_taskrun` rings or with few connections; on `defer_taskrun` with many connections `send_eager` + `recv_poll_first_op` is faster (a linked receive costs a deferred task-work item).
+- `send_vectored_op` / `send_vectored_with_flags_op` (A1): `send_vectored` as a named future. No allocation per vectored send: a pooled `msghdr`, or on 6.17+ a plain `SEND` with `IORING_SEND_VECTORIZED` and no `msghdr` at all.
+- Provided-buffer working set (B1): `BufRingOptions::working_set(initial, step)` publishes only what demand needs (grows on `ENOBUFS`, shrinks when idle; retired buffers come back hottest first), `BufRing::{published, grow_published, shrink_published, wait_free}`; `RecvStream`/`RecvBundleStream::{next_rearm, rearm_on, ring}` (B2). With whole-frame buffers a single ring ties per-connection buffers at 8 connections and gains 2–3.5% at 2000.
+- fd-less sockets in a server (K1): `shutdown_with`/`shutdown_both` (`&self`), async `set_sockopt`/`get_sockopt`, `set_nodelay_async`, `set_tcp_keepalive_async`, `TcpListener::accept_batch_direct_into`. Zero syscalls per connection from accept to close (3 with `register_fixed`), +0.4% frames/s at 2000 connections.
+
+**Time**
+- `time::Deadline` (`arm`, `disarm`, `poll_expired`, `Deadline::timeout(after, fut)`), `with_deadline`, `timeout_coarse`, `Instant::recent()` (T1): a request deadline for two stores per request instead of a wheel insert and remove. `time::timeout` itself costs about 40% less than in 0.8.0.
+
+**Stats** (`metrics`): `RuntimeStats::ops_completed`, `DriverStats::{enter_left_taskrun, drain_enters}`, `BufRingStats::{published, grown, retired}`.
+
+**Examples**: `reqresp` (closed-loop request/response reproducer with bulk neighbours, every server path of this round, per-frame hardware counters).
+
+**Measured** (gatotkaca-transport harness, 3 rounds, builds without `metrics`, [G1](performance-improvement/round3/G1.md)): one configuration (`defer_taskrun`, `skip_empty_enter`, `register_ring_fd`, batch accept, `drain_taskrun(2)`, eager acks, multishot receive on a 72 KiB working-set ring) now serves all three replication loads: next to 2 encrypted 1 MiB streams 55,173 frames/s with ack p99 204 µs (tokio 54,758 / 230 µs); 2000 connections × 4 KiB 113,212 frames/s (tokio 108,373); 8 connections 98,275 frames/s with ack p99 113 µs (tokio 92,557 / 103–120 µs). Against 0.8.0 on the same paths ([G3](performance-improvement/round3/G3.md)): +0.7% to +4.4% frames/s, never below. The 1.3 s ack p99 of `coop_taskrun` at 2000 connections (ROUND3.md D2) was a single-accept loop under `coop`'s one-round-per-sweep regime, not the driver: batch accept brings it to 22 ms.
+
 ## 0.8.0 (2026-11-07)
 Round 2 performance work, specified in [performance-improvement/ROUND2.md](performance-improvement/ROUND2.md), planned in [ROUND2-PLAN.md](performance-improvement/ROUND2-PLAN.md), measured in [round2/](performance-improvement/round2/) (final gate: [G3.md](performance-improvement/round2/G3.md)). Everything new is opt-in: a default builder schedules and submits as 0.7.1 did. Commits `a4de6cf`..HEAD.
 

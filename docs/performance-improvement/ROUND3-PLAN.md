@@ -501,4 +501,4 @@ seed (r3-base)
 | G1 | done ([round3/G1.md](round3/G1.md)): D1, S1, D2, T1, O1, B1 (72 KiB buffers), K1 all pass; one configuration `defer:…:wset72:drain2:eagerack` passes G3's bounds on MIX, R2000 and R8 |
 | wave 2 | done (tag `r3-wave2`): r3-pair, r3-vec (+ vectorized SEND on 6.17+), r3-docs; lead: `reqresp --path vec`, AGENTS.md for the wave-2 APIs |
 | G2 | done ([round3/G2.md](round3/G2.md)): A1 passes; C1 passes at R8 and on `coop`, fails at R2000 on `defer` (−5%: a linked receive costs a deferred task-work item), documented rule |
-| release, G3 | not started |
+| release, G3 | done ([round3/G3.md](round3/G3.md)): no loss against 0.8.0 (+0.7% to +4.4% on the default path), one configuration confirmed; 0.9.0 |
