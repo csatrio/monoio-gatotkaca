@@ -182,12 +182,6 @@ pub async fn conn(stream: TcpStream, ctx: Rc<Ctx>) {
     }
 }
 
-/// For the paths a later package fills.
-pub fn not_available(path: &str) -> ! {
-    eprintln!("path {path}: not available in this build");
-    std::process::exit(2)
-}
-
 // Helpers for the paths that receive into their own buffer (plain, pipe).
 
 /// A receive buffer for one connection. It holds the largest frame, so it never grows.

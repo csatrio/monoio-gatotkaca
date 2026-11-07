@@ -28,7 +28,7 @@ use std::{
 pub use io_uring::{cqueue, opcode, squeue, types, IoUring, Probe};
 
 pub use super::buf_ring::{BufRing, BufRingOptions, BufRingStats, Bundle, SelectedBuf, WaitFree};
-pub use super::chain::{link, ChainOp};
+pub use super::chain::{link, link_skip, ChainOp};
 pub use super::fixed_buf::{
     FixedBuf, FixedBufPool, FixedBufStats, FixedIoBuf, FrozenFixedBuf, ReadFixedFuture,
     WriteFixedFuture,
@@ -202,11 +202,25 @@ pub unsafe fn submit_with_timeout<T: Unpin + 'static>(
 /// The [`ChainOp`] resolves to `([Cqe; N], data)` once all `N` SQEs completed (each posts exactly
 /// one CQE). Dropping it first keeps `data` alive until then.
 ///
+/// **The skip shape.** With `IO_LINK | CQE_SKIP_SUCCESS` on every SQE but the last (and neither
+/// on the last; [`link_skip`] sets them) the chain takes **one op slot and posts one CQE**: the
+/// last SQE's if all before it succeeded, else that of the first SQE that failed (its link then
+/// cancels the rest without a CQE). The array then holds `Cqe::new(0, 0)` ("skipped") for the
+/// SQEs before the one that posted, its CQE for that one, and `-ECANCELED` for those after it.
+/// Two things to know: a short read/write breaks an `IO_LINK` but counts as a success for
+/// `CQE_SKIP_SUCCESS`, so put `MSG_WAITALL` on a `SEND`/`RECV` member whose short result must
+/// not be skipped; and when a member after the first is rejected by the kernel at submit, the
+/// first member reports `-ECANCELED` (the rejected member's own error is not reported). The
+/// buffer-id field (bits 16..31) of a failed skipped member's CQE flags is not reported.
+/// Linux 5.17+ (`IOSQE_CQE_SKIP_SUCCESS`; older kernels fail the first member with `EINVAL`).
+///
 /// # Errors
 /// `InvalidInput` if `N` is 0 or larger than the submission queue, if the last SQE sets
-/// `IO_LINK`/`IO_HARDLINK` (it would link into the next, unrelated SQE) or if an SQE sets
-/// `CQE_SKIP_SUCCESS`. `EBUSY` if the queue stayed full. Nothing is queued on error, and `data`
-/// is dropped.
+/// `IO_LINK`/`IO_HARDLINK` (it would link into the next, unrelated SQE), or if
+/// `CQE_SKIP_SUCCESS` is set in any other way than the skip shape above (on the last SQE, on
+/// some SQEs only, without `IO_LINK`, with `IO_HARDLINK`, or on a `LINK_TIMEOUT`: for those the
+/// kernel's CQEs follow no simple rule, or the slot would never be freed). `EBUSY` if the queue
+/// stayed full. Nothing is queued on error, and `data` is dropped.
 ///
 /// # Safety
 /// The caller must ensure that every SQE is valid for its opcode and single-shot, that every
