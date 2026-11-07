@@ -12,7 +12,7 @@ resolver = "2"
 [workspace.package]
 authors = ["ChiHai <ihciah@gmail.com>", "XuShuai <dyxushuai@gmail.com>", "csatrio"]
 edition = "2021"
-keywords = ["runtime", "iouring", "async"]
+keywords = ["runtime", "async", "io-uring", "thread-per-core", "zero-copy"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/csatrio/monoio-gatotkaca"
 
