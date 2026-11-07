@@ -36,17 +36,59 @@ pub(crate) const EVENTFD_USERDATA: u64 = u64::MAX - 2;
 /// `user_data` of the driver's own `LINK_TIMEOUT` SQEs: their CQEs are only counted.
 const LINK_TIMEOUT_USERDATA: u64 = u64::MAX - 16;
 
-/// Tag bit on the `user_data` of the **head** of a `send_then_recv` pair (`op/send_recv.rs`):
-/// the send, pushed with `CQE_SKIP_SUCCESS`, whose CQE only arrives when it failed. Both
-/// members of a pair share one slab slot, so the slot index alone cannot say which member
-/// posted the one CQE of the pair; the tag does.
+/// Tag bit on the `user_data` of a **skipped member**: an SQE pushed with `CQE_SKIP_SUCCESS`
+/// as a member of a linked chain that shares **one slab slot** (the head of a
+/// `send_then_recv` pair, `op/send_recv.rs`; every member but the last of a `submit_chain`
+/// with the skip shape, `chain.rs`). Such a member posts a CQE only when it failed, and the
+/// members after it then post nothing (KV2), so the chain gets exactly one CQE: the last
+/// member's (untagged `user_data = index`) or a skipped member's. The slot index alone cannot
+/// say which; the tag and the member's position do: a tagged `user_data` is
+/// `SKIP_MEMBER_TAG | member << 32 | index` ([`tagged_user_data`]).
 ///
 /// Why bit 61: the driver's slab indices are far below it, `uring::user_data` ids live at
 /// `0b10` in the top two bits (so `>> 61` gives `0b100`/`0b101`), the doorbells at
 /// `0b1101`/`0b1110` of the top four (`>> 61` gives `0b110`/`0b111`), and the driver's own
 /// cancel/timeout/eventfd values have every top bit set. So `>> 61 == 0` selects a plain op
-/// (one test, as `>> 62 == 0` did before) and `>> 61 == 1` the head of a pair.
-pub(crate) const PAIR_HEAD_TAG: u64 = 1 << 61;
+/// (one test, as `>> 62 == 0` did before) and `>> 61 == 1` a skipped member.
+pub(crate) const SKIP_MEMBER_TAG: u64 = 1 << 61;
+/// Position of the member in a tagged `user_data`, above the 32 bits of the slot index.
+const TAG_MEMBER_SHIFT: u32 = 32;
+
+/// In the stored CQE flags of a shared slot: the CQE came from a skipped member (the chain
+/// failed there), whose position is in bits 16..31 ([`cqe_member`]). Those bits are the
+/// kernel's buffer-id field, which a failed member's CQE does not carry (and a `SEND` never
+/// does), so nothing the kernel set is lost below bit 16.
+///
+/// Why the flags word and not a field of the slot: the dispatcher already hands `flags` to
+/// `complete`, and the future already reads them back, so marking the member costs the hot
+/// path of ordinary ops nothing (no byte in the slot's `Meta`, no new state).
+pub(crate) const MEMBER_CQE_FLAG: u32 = 1 << 31;
+const MEMBER_FLAG_SHIFT: u32 = 16;
+/// Members fit 15 bits: a chain is at most one SQ (the kernel's `IORING_MAX_ENTRIES` is
+/// 32768), checked by `reserve_sqes`.
+const MEMBER_FLAG_MASK: u32 = 0x7fff;
+
+/// The `user_data` of skipped member `member` of the chain at slot `index`.
+#[inline]
+fn tagged_user_data(index: usize, member: usize) -> u64 {
+    debug_assert!(index < 1 << TAG_MEMBER_SHIFT && member as u32 <= MEMBER_FLAG_MASK);
+    SKIP_MEMBER_TAG | (member as u64) << TAG_MEMBER_SHIFT | index as u64
+}
+
+/// Which member posted the CQE stored in a shared slot: `None` for the last member (the chain
+/// succeeded up to it), else the position of the skipped member that failed.
+#[inline]
+pub(crate) fn cqe_member(flags: u32) -> Option<usize> {
+    (flags & MEMBER_CQE_FLAG != 0)
+        .then_some(((flags >> MEMBER_FLAG_SHIFT) & MEMBER_FLAG_MASK) as usize)
+}
+
+/// The kernel's CQE flags of a skipped member's completion (the tag and the member position
+/// stripped; its buffer-id field is not kept).
+#[inline]
+pub(crate) fn tagged_cqe_flags(flags: u32) -> u32 {
+    flags & ((1 << MEMBER_FLAG_SHIFT) - 1)
+}
 
 // `IORING_SETUP_*` flags (the `io-uring` crate has no accessor for them).
 const SETUP_IOPOLL: u32 = 1 << 0;
@@ -908,9 +950,9 @@ impl UringInner {
                         self.deferred.push(slot);
                     }
                 }
-                // The head (send) of a `send_then_recv` pair failed; the pair's slot is
-                // `index` without the tag. Rare: a reset peer, a short send.
-                _ if index >> 61 == 1 => self.complete_pair_head(index, cqe, small_io_max),
+                // A skipped member of a chain on a shared slot failed (the head of a
+                // `send_then_recv` pair: a reset peer, a short send). Rare.
+                _ if index >> 61 == 1 => self.complete_skipped_member(index, cqe, small_io_max),
                 // Operations pushed by the user, see `uring::user_data`.
                 _ if index >> 62 == 0b10 => self.external.push(index, cqe),
                 // Doorbells: a bell rung by another ring, or our own bell message completing.
@@ -929,33 +971,34 @@ impl UringInner {
         }
     }
 
-    /// The CQE of the head of a `send_then_recv` pair (`user_data` tagged with
-    /// [`PAIR_HEAD_TAG`]): the send failed, and the receive linked to it posts nothing
-    /// (`REQ_F_SKIP_LINK_CQES`). This is the pair's only CQE, so it completes the slot like any
-    /// single-shot completion, with [`PAIR_HEAD_FLAG`](super::op::send_recv::PAIR_HEAD_FLAG)
-    /// set in the stored flags so that the future knows which member reported. Out of line:
-    /// the hot path of `handle_cqe` pays one test for it.
+    /// The CQE of a skipped member of a chain on a shared slot (`user_data` tagged with
+    /// [`SKIP_MEMBER_TAG`]): that member failed, and the members linked after it post nothing
+    /// (`REQ_F_SKIP_LINK_CQES`). This is the chain's only CQE, so it completes the slot like
+    /// any single-shot completion, with [`MEMBER_CQE_FLAG`] and the member's position in the
+    /// stored flags so that the future knows which member reported. Out of line: the hot
+    /// path of `handle_cqe` pays one test for it.
     #[cold]
     #[inline(never)]
-    fn complete_pair_head(
+    fn complete_skipped_member(
         &mut self,
         tagged: u64,
         cqe: &io_uring::cqueue::Entry,
         small_io_max: u32,
     ) {
-        let index = tagged & !PAIR_HEAD_TAG;
-        metric!(if let Some(mut slot) = self.ops.slab.get(index as _) {
+        let index = (tagged & (u32::MAX as u64)) as usize;
+        let member = ((tagged >> TAG_MEMBER_SHIFT) as u32) & MEMBER_FLAG_MASK;
+        metric!(if let Some(mut slot) = self.ops.slab.get(index) {
             if let Some((op, bucket)) = slot.take_op_ticks(self.tick) {
                 self.stats.op_ticks_by_opcode[op][bucket] += 1;
             }
         });
-        // A failed send is a small completion (an error, or a short count).
+        // A failed member is a small completion (an error, or a short count).
         if small_io_max != 0 {
             crate::scheduler::set_cqe_hint(cqe.result(), small_io_max);
         }
-        let flags = cqe.flags() | super::op::send_recv::PAIR_HEAD_FLAG;
-        // SAFETY: the CQE comes from the kernel for the pair at `index` (never a fd).
-        let done = unsafe { self.ops.complete(index as _, cqe.result(), flags) };
+        let flags = tagged_cqe_flags(cqe.flags()) | MEMBER_CQE_FLAG | member << MEMBER_FLAG_SHIFT;
+        // SAFETY: the CQE comes from the kernel for the chain at `index` (never a fd).
+        let done = unsafe { self.ops.complete(index, cqe.result(), flags) };
         if small_io_max != 0 {
             crate::scheduler::clear_cqe_hint();
         }
@@ -1352,7 +1395,7 @@ impl UringInner {
 
     /// Push the two SQEs of a `send_then_recv` pair (`op/send_recv.rs`) back to back, with one
     /// reservation so the link is never split, **both on one slab slot**: the head (the send,
-    /// `IO_LINK | CQE_SKIP_SUCCESS`) with `user_data = index | PAIR_HEAD_TAG`, the tail (the
+    /// `IO_LINK | CQE_SKIP_SUCCESS`) with the tagged `user_data` of member 0, the tail (the
     /// receive) with `user_data = index`. Exactly one of them posts a CQE (KV2), which
     /// completes the slot. Returns the slot index; on failure nothing is left behind.
     fn push_pair<T: super::op::send_recv::PairAble>(&mut self, data: &mut T) -> io::Result<usize> {
@@ -1369,8 +1412,7 @@ impl UringInner {
         }
 
         let index = self.ops.insert(false, OpKind::Single);
-        debug_assert!((index as u64) & PAIR_HEAD_TAG == 0);
-        let head = head.user_data(index as u64 | PAIR_HEAD_TAG);
+        let head = head.user_data(tagged_user_data(index, 0));
         let tail = tail.user_data(index as u64);
 
         #[cfg(feature = "metrics")]
@@ -1403,39 +1445,99 @@ impl UringInner {
         inner.push_pair(data)
     }
 
-    /// The future of a `send_then_recv` pair is dropped: [`drop_op`](Self::drop_op) (the slot
-    /// keeps `data` until the pair's CQE) and, with `async-cancel`, a cancel for each member.
-    pub(crate) fn drop_pair<T: 'static>(
+    /// Push a chain of the skip shape (`chain.rs`: `IO_LINK | CQE_SKIP_SUCCESS` on every SQE
+    /// but the last, validated by the caller) back to back with one reservation, **all on one
+    /// slab slot**: member `i < N - 1` gets the tagged `user_data` of member `i`, the last
+    /// `index`. Exactly one member posts a CQE (KV2): the last on success, else the first that
+    /// failed; it completes the slot. Returns the slot index; on failure nothing is left behind.
+    fn push_shared_chain<const N: usize>(&mut self, sqes: [squeue::Entry; N]) -> io::Result<usize> {
+        // One SQ view for the room check and the push, see `push_op`.
+        let mut sq = self.uring.submission();
+        if sq.capacity() - sq.len() < N {
+            drop(sq);
+            self.reserve_sqes(N)?;
+            sq = self.uring.submission();
+        }
+        let index = self.ops.insert(false, OpKind::Single);
+        let mut i = 0;
+        let sqes = sqes.map(|sqe| {
+            i += 1;
+            if i < N {
+                sqe.user_data(tagged_user_data(index, i - 1))
+            } else {
+                sqe.user_data(index as u64)
+            }
+        });
+        // Can't fail: there is room for all; if it does, free the slot again.
+        let pushed = unsafe { sq.push_multiple(&sqes) };
+        drop(sq);
+        if pushed.is_err() {
+            return Err(self.push_failed(&[index]));
+        }
+        metric!(
+            for sqe in &sqes {
+                self.stats.ops_by_opcode[(sqe.get_opcode() as usize).min(63)] += 1;
+            }
+            if let (Some(last), Some(mut slot)) = (sqes.last(), self.ops.slab.get(index)) {
+                slot.set_submit_tick(last.get_opcode(), self.tick);
+            }
+            self.stats.chains_submitted += 1;
+        );
+        Ok(index)
+    }
+
+    /// Submit a chain of the skip shape on one slot, see
+    /// [`push_shared_chain`](Self::push_shared_chain).
+    pub(crate) fn submit_shared_chain<const N: usize>(
+        this: &Rc<UnsafeCell<UringInner>>,
+        sqes: [squeue::Entry; N],
+    ) -> io::Result<usize> {
+        let inner = unsafe { &mut *this.get() };
+        inner.push_shared_chain(sqes)
+    }
+
+    /// The future of a chain on a shared slot (a `send_then_recv` pair, a skip-shape
+    /// `ChainOp`) with `members` SQEs is dropped: [`drop_op`](Self::drop_op) (the slot keeps
+    /// `data` until the chain's one CQE) and, with `async-cancel`, a cancel for each member.
+    pub(crate) fn drop_shared<T: 'static>(
         this: &Rc<UnsafeCell<UringInner>>,
         index: usize,
         data: &mut Option<T>,
+        members: usize,
     ) {
         Self::drop_op(this, index, data, true);
         #[cfg(feature = "async-cancel")]
-        Self::cancel_pair(this, index);
+        Self::cancel_shared(this, index, members);
+        #[cfg(not(feature = "async-cancel"))]
+        let _ = members;
     }
 
-    /// Push an `AsyncCancel` for each member of the `send_then_recv` pair at `index`, if it is
-    /// still in flight. A cancel by `user_data` finds only the member the kernel is running
-    /// (the other answers `-ENOENT`, which nobody reads), so both values are tried. Counts lost
-    /// cancels instead of failing, like [`push_cancel`](Self::push_cancel).
-    pub(crate) fn cancel_pair(this: &Rc<UnsafeCell<UringInner>>, index: usize) {
+    /// Push an `AsyncCancel` for each of the `members` SQEs of the chain on the shared slot
+    /// `index`, if it is still in flight. A cancel by `user_data` finds only the member the
+    /// kernel is running (the others answer `-ENOENT`, which nobody reads), so every value is
+    /// tried. Counts lost cancels instead of failing, like [`push_cancel`](Self::push_cancel).
+    pub(crate) fn cancel_shared(this: &Rc<UnsafeCell<UringInner>>, index: usize, members: usize) {
         let inner = unsafe { &mut *this.get() };
-        if inner.reserve_sqes(2).is_err() {
-            metric!(inner.stats.cancels_lost += 2);
+        if inner.reserve_sqes(members).is_err() {
+            metric!(inner.stats.cancels_lost += members as u64);
             return;
         }
-        // Reaping CQEs to make room may have completed (and freed) the pair.
+        // Reaping CQEs to make room may have completed (and freed) the chain.
         if inner.ops.slab.get(index).is_none() {
             return;
         }
-        let cancels = [index as u64 | PAIR_HEAD_TAG, index as u64]
-            .map(|target| opcode::AsyncCancel::new(target).build().user_data(u64::MAX));
+        let cancel = |target: u64| opcode::AsyncCancel::new(target).build().user_data(u64::MAX);
+        let mut sq = inner.uring.submission();
         // Can't fail: `reserve_sqes` made room.
-        if unsafe { inner.uring.submission().push_multiple(&cancels) }.is_ok() {
-            metric!(inner.stats.cancels_pushed += 2);
+        let mut pushed = unsafe { sq.push(&cancel(index as u64)) }.is_ok();
+        for member in 0..members - 1 {
+            pushed &= unsafe { sq.push(&cancel(tagged_user_data(index, member))) }.is_ok();
+        }
+        drop(sq);
+        if pushed {
+            metric!(inner.stats.cancels_pushed += members as u64);
         } else {
-            metric!(inner.stats.cancels_lost += 2);
+            metric!(inner.stats.cancels_lost += members as u64);
         }
     }
 
@@ -1756,8 +1858,8 @@ impl Ops {
         Ops { slab: Slab::new() }
     }
 
-    /// Prefetch the slot of a driver op CQE (`user_data` is a slab index below 2^61; the
-    /// tagged head of a pair, see [`PAIR_HEAD_TAG`], is rare and skipped).
+    /// Prefetch the slot of a driver op CQE (`user_data` is a slab index below 2^61; a tagged
+    /// skipped member, see [`SKIP_MEMBER_TAG`], is rare and skipped).
     #[inline]
     fn prefetch(&self, user_data: u64) {
         if user_data >> 61 == 0 {

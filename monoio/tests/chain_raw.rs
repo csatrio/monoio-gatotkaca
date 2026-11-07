@@ -79,6 +79,31 @@ async fn invalid_chains_are_rejected() {
     let skip = [nop().flags(squeue::Flags::SKIP_SUCCESS)];
     let err = unsafe { uring::submit_chain(skip, ()) }.unwrap_err();
     assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    let skip_last = [
+        nop().flags(squeue::Flags::IO_LINK | squeue::Flags::SKIP_SUCCESS),
+        nop().flags(squeue::Flags::SKIP_SUCCESS),
+    ];
+    let err = unsafe { uring::submit_chain(skip_last, ()) }.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    // SKIP_SUCCESS on some members only: the kernel's CQEs follow no simple rule.
+    let mixed = [
+        nop().flags(squeue::Flags::IO_LINK | squeue::Flags::SKIP_SUCCESS),
+        nop().flags(squeue::Flags::IO_LINK),
+        nop(),
+    ];
+    let err = unsafe { uring::submit_chain(mixed, ()) }.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    // SKIP_SUCCESS without IO_LINK, or with IO_HARDLINK: a failed member would not cancel
+    // the rest, so the last member would post a second CQE for the one slot.
+    let unlinked = [nop().flags(squeue::Flags::SKIP_SUCCESS), nop()];
+    let err = unsafe { uring::submit_chain(unlinked, ()) }.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    let hard = [
+        nop().flags(squeue::Flags::IO_HARDLINK | squeue::Flags::SKIP_SUCCESS),
+        nop(),
+    ];
+    let err = unsafe { uring::submit_chain(hard, ()) }.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
 
     // Nothing was queued: the next op works as usual.
     let (cqe, _) = unsafe { uring::submit(nop(), ()) }.unwrap().await;
@@ -246,4 +271,130 @@ fn chain_on_the_driver_handle() {
         assert_eq!(data, 7);
         assert_eq!(cqes.map(|c| c.res()), [0, 0]);
     });
+}
+
+// ---- the skip shape: one slot, one CQE ----
+
+/// A `SEND` on a Unix socket, `MSG_WAITALL` so that a short send is a failure, not a skip.
+fn send(fd: &UnixStream, data: &[u8]) -> squeue::Entry {
+    opcode::Send::new(types::Fd(fd.as_raw_fd()), data.as_ptr(), data.len() as _)
+        .flags(libc::MSG_NOSIGNAL | libc::MSG_WAITALL)
+        .build()
+}
+
+fn recv(fd: &UnixStream, buf: &mut [u8]) -> squeue::Entry {
+    opcode::Recv::new(types::Fd(fd.as_raw_fd()), buf.as_mut_ptr(), buf.len() as _).build()
+}
+
+/// All members succeed: the last member's CQE, `Cqe::new(0, 0)` for the skipped ones.
+#[monoio::test]
+async fn skip_chain_all_succeed() {
+    let (a, mut b) = UnixStream::pair().unwrap();
+    #[cfg(feature = "metrics")]
+    let before = monoio::driver_stats();
+    let (one, two, mut buf) = (b"one".to_vec(), b"two".to_vec(), vec![0u8; 16]);
+    let sqes = uring::link_skip([send(&a, &one), send(&a, &two), recv(&a, &mut buf)]);
+    let op = unsafe { uring::submit_chain(sqes, (one, two, buf)) }.unwrap();
+    assert!(op.completed().iter().all(Option::is_none));
+    // Let the sends run, then answer.
+    raw_sleep(Duration::from_millis(5)).await;
+    let mut got = [0u8; 6];
+    std::io::Read::read_exact(&mut b, &mut got).unwrap();
+    assert_eq!(&got, b"onetwo");
+    b.write_all(b"back").unwrap();
+    let (cqes, (_, _, buf)) = op.await;
+    assert_eq!(cqes.map(|c| c.res()), [0, 0, 4], "{cqes:?}");
+    assert_eq!(&buf[..4], b"back");
+    #[cfg(feature = "metrics")]
+    {
+        let d = monoio::driver_stats();
+        assert_eq!(d.chains_submitted, before.chains_submitted + 1);
+        // One CQE for the chain (the sleep's timeout CQE is the other one).
+        assert_eq!(d.cqes_reaped, before.cqes_reaped + 2, "{d:?}");
+    }
+}
+
+/// A member in the middle fails: skipped before it, its CQE, cancelled after it.
+#[monoio::test]
+async fn skip_chain_member_fails() {
+    let mut buf = vec![0u8; 8];
+    let sqes = uring::link_skip([nop(), bad_read(&mut buf), nop()]);
+    let op = unsafe { uring::submit_chain(sqes, buf) }.unwrap();
+    assert_eq!(op.completed(), [None, None, None]);
+    let (cqes, _) = op.await;
+    assert_eq!(
+        cqes.map(|c| c.res()),
+        [0, -libc::EBADF, -libc::ECANCELED],
+        "{cqes:?}"
+    );
+}
+
+/// The head fails: its CQE, everything after it cancelled.
+#[monoio::test]
+async fn skip_chain_head_fails() {
+    let mut buf = vec![0u8; 8];
+    let sqes = uring::link_skip([bad_read(&mut buf), nop(), nop()]);
+    let (cqes, _) = unsafe { uring::submit_chain(sqes, buf) }.unwrap().await;
+    assert_eq!(
+        cqes.map(|c| c.res()),
+        [-libc::EBADF, -libc::ECANCELED, -libc::ECANCELED],
+        "{cqes:?}"
+    );
+}
+
+/// The last member fails: its own CQE, the members before it skipped.
+#[monoio::test]
+async fn skip_chain_last_fails() {
+    let mut buf = vec![0u8; 8];
+    let sqes = uring::link_skip([nop(), nop(), bad_read(&mut buf)]);
+    let (cqes, _) = unsafe { uring::submit_chain(sqes, buf) }.unwrap().await;
+    assert_eq!(cqes.map(|c| c.res()), [0, 0, -libc::EBADF], "{cqes:?}");
+}
+
+/// Dropped in flight: `data` lives in the one slot until the chain's CQE; with
+/// `async-cancel` every member is asked to cancel (one finds the receive).
+#[monoio::test]
+async fn dropped_skip_chain_keeps_data_until_the_cqe() {
+    let (a, mut b) = UnixStream::pair().unwrap();
+    let dropped = Rc::new(Cell::new(false));
+    let mut buf = vec![0u8; 8];
+    let sqes = uring::link_skip([nop(), recv(&a, &mut buf)]);
+    let data = (
+        buf,
+        Tracked {
+            dropped: dropped.clone(),
+            _ts: timespec(Duration::ZERO),
+        },
+    );
+    #[cfg(feature = "metrics")]
+    let before = monoio::driver_stats().cancels_pushed;
+    let op = unsafe { uring::submit_chain(sqes, data) }.unwrap();
+    raw_sleep(Duration::from_millis(1)).await;
+    drop(op);
+    assert!(!dropped.get());
+    #[cfg(all(feature = "metrics", feature = "async-cancel"))]
+    assert_eq!(monoio::driver_stats().cancels_pushed, before + 2);
+    // Cancelled (`async-cancel`), or completed by the peer's data: either way the data goes.
+    raw_sleep(Duration::from_millis(5)).await;
+    if !dropped.get() {
+        b.write_all(b"x").unwrap();
+    }
+    for _ in 0..50 {
+        if dropped.get() {
+            break;
+        }
+        raw_sleep(Duration::from_millis(5)).await;
+    }
+    assert!(dropped.get());
+    // The slot is free and nothing else is in flight: a plain op works as usual.
+    let (cqe, _) = unsafe { uring::submit(nop(), ()) }.unwrap().await;
+    assert_eq!(cqe.res(), 0);
+}
+
+/// The whole SQ as one skip chain: one slot, one CQE.
+#[monoio::test(entries = 256)]
+async fn skip_chain_filling_the_sq() {
+    let sqes: [squeue::Entry; 256] = uring::link_skip(std::array::from_fn(|_| nop()));
+    let (cqes, ()) = unsafe { uring::submit_chain(sqes, ()) }.unwrap().await;
+    assert!(cqes.iter().all(|c| c.res() == 0));
 }

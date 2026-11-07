@@ -15,10 +15,13 @@
 //!   a send that fails after partial progress reports the **byte count** (`res >= 0`), not an
 //!   errno.
 //! - The value of the one CQE cannot tell the head from the tail (both report `-ECONNRESET`,
-//!   `-ECANCELED`, or a count). So the head's `user_data` carries a tag bit
-//!   ([`PAIR_HEAD_TAG`](crate::driver::uring::PAIR_HEAD_TAG), bit 61); the dispatcher strips
-//!   it and completes the slot with [`PAIR_HEAD_FLAG`] set in the stored CQE flags, where the
-//!   future reads it. The flags of a `SEND` CQE are otherwise unused.
+//!   `-ECANCELED`, or a count). So the head's `user_data` carries a tag
+//!   ([`SKIP_MEMBER_TAG`](crate::driver::uring::SKIP_MEMBER_TAG), bit 61, with the member's
+//!   position); the dispatcher strips it and completes the slot with
+//!   [`MEMBER_CQE_FLAG`](crate::driver::uring::MEMBER_CQE_FLAG) set in the stored CQE flags,
+//!   where the future reads it ([`cqe_member`]). The flags of a `SEND` CQE are otherwise
+//!   unused. The same mechanism serves `uring::submit_chain` with the skip shape
+//!   (`driver/chain.rs`).
 //! - After 127 poll re-arms (a send of more than ~512 KiB into a full socket) the send moves to
 //!   an io-wq worker, and the linked `RECV(POLL_FIRST)` is then issued inline there and posts
 //!   `-EAGAIN`: "send complete, receive not started". The future hides it: it pushes a plain
@@ -54,20 +57,13 @@ use crate::{
     driver::{
         fixed_buf::{on_current_ring, FixedBuf},
         shared_fd::{sqe_fd, SharedFd},
-        uring::UringInner,
+        uring::{cqe_member, UringInner},
         Inner, CURRENT,
     },
 };
 
-/// Set in the stored CQE flags of a pair's slot when the CQE came from the **head** (the send
-/// failed). Bit 31 is in the kernel's buffer-id field (`IORING_CQE_BUFFER_SHIFT` = 16), which
-/// a `SEND` or a `RECV` without `BUFFER_SELECT` never carries, so it cannot collide with a
-/// flag the kernel set.
-///
-/// Why the flags word and not a field of the slot: the dispatcher already passes `flags` to
-/// `complete`, so marking the head's CQE costs the hot path of ordinary ops nothing (no new
-/// byte in the slot's `Meta`, no new state), and the future already receives the flags.
-pub(crate) const PAIR_HEAD_FLAG: u32 = 1 << 31;
+/// The SQEs of a pair, for the cancels on drop.
+const MEMBERS: usize = 2;
 
 /// `IORING_RECVSEND_POLL_FIRST`: poll before trying the receive (5.19+). The client sends the
 /// next request only after it got the reply, so the data is never there when the SQE is
@@ -367,7 +363,7 @@ impl<D: PairOp> PairFuture<D> {
     fn cancel(&self) {
         if let State::Running { driver, index, .. } = &self.0 {
             if *index != usize::MAX {
-                UringInner::cancel_pair(&driver.0, *index);
+                UringInner::cancel_shared(&driver.0, *index, MEMBERS);
             }
         }
     }
@@ -394,7 +390,7 @@ impl<D: PairOp> Drop for PairFuture<D> {
             };
             if index != usize::MAX {
                 // The slot keeps `data` (both buffers, the fd guard) until the one CQE.
-                UringInner::drop_pair(&driver.0, index, &mut Some(data));
+                UringInner::drop_shared(&driver.0, index, &mut Some(data), MEMBERS);
             }
         }
     }
@@ -404,7 +400,7 @@ impl<D: PairOp> Drop for PairFuture<D> {
 #[inline]
 fn interpret(meta: CompletionMeta, reply_len: usize) -> (io::Result<usize>, io::Result<usize>) {
     let res = meta.result.map(|v| v.into_inner() as usize);
-    if meta.flags & PAIR_HEAD_FLAG != 0 {
+    if cqe_member(meta.flags).is_some() {
         // The head's CQE: the send failed, before anything went out (`Err`) or after `n`
         // bytes (`Ok(n)`, `n < reply_len`); the receive was cancelled without a CQE.
         (res, Err(canceled()))
@@ -519,7 +515,7 @@ mod tests {
     /// interpretation of the one CQE follows the table of the module docs.
     #[test]
     fn interpret_one_cqe() {
-        use crate::driver::op::MaybeFd;
+        use crate::driver::{op::MaybeFd, uring::MEMBER_CQE_FLAG};
         let ok = |n: i32, flags: u32| CompletionMeta {
             result: unsafe { MaybeFd::new_result(Ok(n as u32), false) },
             flags,
@@ -542,16 +538,18 @@ mod tests {
         let (_, r) = interpret(err(libc::EAGAIN, 0), 70);
         assert!(is_eagain(&r));
         // Head, failed at once.
-        let (s, r) = interpret(err(libc::EPIPE, PAIR_HEAD_FLAG), 70);
+        let (s, r) = interpret(err(libc::EPIPE, MEMBER_CQE_FLAG), 70);
         assert_eq!(s.unwrap_err().raw_os_error(), Some(libc::EPIPE));
         assert_eq!(r.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
         // Head, failed after 12 bytes.
-        let (s, r) = interpret(ok(12, PAIR_HEAD_FLAG), 70);
+        let (s, r) = interpret(ok(12, MEMBER_CQE_FLAG), 70);
         assert_eq!(s.unwrap(), 12);
         assert_eq!(r.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
-        // The flag does not collide with the CQE flags the kernel defines (low bits) and is
-        // above the buffer-id field's low bit.
-        assert_eq!(PAIR_HEAD_FLAG & 0xffff, 0);
+        // The flag does not collide with the CQE flags the kernel defines (low bits).
+        assert_eq!(MEMBER_CQE_FLAG & 0xffff, 0);
+        assert_eq!(cqe_member(0), None);
+        assert_eq!(cqe_member(MEMBER_CQE_FLAG), Some(0));
+        assert_eq!(cqe_member(MEMBER_CQE_FLAG | 3 << 16), Some(3));
     }
 
     /// The op data of a typical pair (a static reply, a `Vec` receive buffer) and what a
