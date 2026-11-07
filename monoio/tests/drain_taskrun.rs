@@ -584,10 +584,9 @@ fn parks_with_a_timeout_return_on_time() {
 #[test]
 fn drain_enter_ignores_min_wait() {
     const WAIT: Duration = Duration::from_millis(400);
-    for (what, rb) in [(
-        "defer, drain 4",
-        Builder::new().defer_taskrun().drain_taskrun(4),
-    )] {
+    {
+        let what = "defer, drain 4";
+        let rb = Builder::new().defer_taskrun().drain_taskrun(4);
         let Some(mut rt) = build(what, rb) else {
             return;
         };
@@ -700,10 +699,9 @@ fn set_min_wait_round_trip() {
 // own (no runtime loop around it).
 #[test]
 fn bare_park_timeout() {
-    for (what, rb) in [(
-        "defer, drain 4",
-        Builder::new().defer_taskrun().drain_taskrun(4),
-    )] {
+    {
+        let what = "defer, drain 4";
+        let rb = Builder::new().defer_taskrun().drain_taskrun(4);
         let Some(rt) = build(what, rb) else {
             return;
         };

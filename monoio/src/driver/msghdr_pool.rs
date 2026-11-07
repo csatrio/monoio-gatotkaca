@@ -263,7 +263,7 @@ mod tests {
     fn taken_msghdr_is_zeroed_but_for_the_iovecs() {
         std::thread::spawn(|| {
             let mut a = PooledMsgHdr::take();
-            a.get_mut().msg_iov = 8 as *mut _;
+            a.get_mut().msg_iov = std::ptr::without_provenance_mut(8);
             a.get_mut().msg_iovlen = 3;
             drop(a);
             let b = PooledMsgHdr::take();
