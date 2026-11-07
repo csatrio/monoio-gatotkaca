@@ -2,6 +2,38 @@
 
 Releases of `adaptif-gatotkaca-monoio` (library name `monoio`), newest first. The fork starts from upstream [Monoio](https://github.com/bytedance/monoio) 0.2.4 (`8675e94`). Open work is in [TODO.md](TODO.md).
 
+## Performance since the fork (rounds 1–3)
+
+Where the runtime stands against upstream Monoio 0.2.4 after the three performance rounds (0.6.0, 0.8.0, 0.9.0). All numbers come from the gatotkaca-transport harness (one pinned core, loopback, Ryzen 5 4600G, Linux 7.0, tokio 1.54.1 as the reference) and the `reqresp`/`smallframes` reproducers in this crate; the gate files under [performance-improvement/](performance-improvement/) hold the full tables. Two things to keep in mind when reading them: upstream 0.2.4 was never run on the harness itself, but 0.5.0's default path submits the same SQEs as upstream (0.3.0–0.5.0 removed drivers and added opt-in APIs), so the first harness run on 0.5.0 is the upstream figure; and each round was measured against the previous release in the same session, so the per-round deltas describe that release's default path and must not be multiplied across rounds. The "against tokio" column is the one that is comparable across the whole period, since tokio was re-run every time.
+
+### Where it started (0.5.0, default path = upstream)
+
+Mixed web load, 64 KiB streams × 4096 connections next to 8 KiB json and proxy requests (FINDINGS.md §1, smoke-level): upstream monoio moved twice tokio's bulk payload (1,670 vs 850 MB/s, stream p99 23 vs 176 ms) but served only 35% of the small-request rate (tokio 72%) with a p99 of about 3.4 s (tokio 42–57 ms). Everything the small requests needed waited behind the stream tasks: a plain `accept()` loop (thousands of client timeouts per run at 4096 connections), a ready queue traversed in full for every completion, `defer_taskrun` rings that ran completions only in `park()`, timers that stalled while the queue never emptied, and a TLS write path that made 5–8 socket writes per 64 KiB. On replication (request/response frames) no configuration served few and many connections at once, and the per-frame user-space cost was only measured from 0.8.0 on (2,342 instructions at 2000 connections, 3,341 with a `timeout` per frame).
+
+### What each round changed on the default path
+
+| round, release | measured against | throughput | latency | per-op cost |
+|---|---|---|---|---|
+| **1** (0.6.0): io_uring surface, bug fixes, TLS batching | tests and single-op measurements only (the harness compared variants, not releases) | registered files +5–7% on single file reads; a 64 KiB TLS write is 1 socket write instead of 8 (rustls) / 5 (native-tls) | `defer_taskrun` completions no longer wait for `park()` (F7); submit paths return `EBUSY` instead of panicking | dropped in-flight op data inline up to 48 bytes (no box per cancelled op) |
+| **0.7.0 / 0.7.1**: lock-free `event_channel`, remote wakes, timer fix | 0.6.0, same session | 4 producers: 13–15 → 23–44 M msg/s, wakeups per 1M messages ~7,000 → under 20; remote wakes 4.2–4.9 M/s with 4 producers (was 4.0–4.8 through `flume`) | timers fire under saturation (they never did before 0.7.1) | the owner runtime spends 8.6% of its time draining remote wakers, was ~14% |
+| **2** (0.8.0): scheduler (`task_budget`, `lifo_slot`, `small_io_priority`, `coop_budget`), batch accept, cheaper reaping | 0.7.1, 5 rounds, [round2/G3.md](performance-improvement/round2/G3.md) | payload per CPU-second +1.8%, encrypted mix +1.8%; many small connections within 8% of tokio (−7.9% at 4 KiB, −7.4% at 16 KiB, was −8.3% / −8.9%) | json p99 −5.7%, proxy p99 −4.2% on the default path; with the recommended scheduler settings proxy p99 41.3 → 13.5 ms and json p99 13.0 → 6.2 ms on 64 KiB × 4096; the ~6,200 client timeouts per run of the `accept()` loop at 4096 connections → 0 | user instructions per frame −5% (CQEs reaped in batches of 32, slots removed without a refcount round trip) |
+| **3** (0.9.0): per-op cost, `drain_taskrun`, eager sends, linked send+recv, working-set buffer rings, fd-less sockets, `Deadline` | 0.8.0, 3 rounds, [round3/G3.md](performance-improvement/round3/G3.md) | +1.1% at 8 connections, +1.8% at 2000, +0.7% next to bulk writers, +4.4% on `smallframes` (never below) | ack p99 at 8 connections 135 → 109 µs with eager acks (inside tokio's range); `coop_taskrun` at 2000 connections 1.3 s → 22 ms (batch accept) | user instructions per frame −21% to −27% (2,342 → 1,795 at 2000 connections; 3,341 → 2,433 with a `timeout` per frame; `Sleep` 640 → 72 bytes; op slot one cache line) |
+
+### Where it stands against tokio (0.9.0)
+
+| load | upstream (0.5.0 run, or 0.8.0 `coop:skipenter` where 0.5.0 has no figure) | 0.9.0, one configuration¹ | tokio |
+|---|---|---|---|
+| mixed web load, 64 KiB × 4096: bulk payload | 2× tokio | +42% payload per CPU-second (round 2 G3; unchanged in round 3) | — |
+| mixed web load: json / proxy p99 | ~3.4 s (35% of the target rate) | 6.2 ms / 13.5 ms at the full rate (`task_budget(61)`, `lifo_slot`, `small_io_priority`) | 8.4 ms / 20.6 ms |
+| replication, 8 connections × 4/16/64 KiB | 91,940 frames/s (−1.4%), ack p99 138 µs (+27%) | 98,275 frames/s (+6.2%), ack p99 113 µs (inside tokio's 103–120) | 92,557, 103–120 µs |
+| replication, 2000 connections × 4 KiB | 104,563 (−7.4%), ack p99 22.6 ms | 113,212 (+4.5%), 18.6 ms | 108,373, 18.8 ms |
+| replication next to 2 encrypted 1 MiB streams | 36,948 (−31.9%), ack p99 369 µs | 55,173 (+0.8%), 204 µs | 54,758, 230 µs |
+| many small connections, frames per CPU-second (round 2 M5) | −8.3% / −8.9% (4 / 16 KiB) | −7.9% / −7.4% (0.8.0; not re-measured in round 3) | — |
+
+¹ `defer_taskrun`, `skip_empty_enter`, `register_ring_fd`, `drain_taskrun(2)`, batch accept, eager acks, multishot receive on a 72 KiB working-set ring (AGENTS.md, "Recommended configuration for request/response servers"). The replication figures in the second column are 0.8.0 with the ring flags of the time (`coop:skipenter`, FINDINGS.md §17), the closest measured stand-in for the upstream path on that load.
+
+In short: upstream monoio was already the faster runtime for bulk transfers and remains so (+42% payload per CPU-second); the rounds removed the cases where it lost, so that small requests next to bulk work, few and many replication connections, and their tail latencies are now at or ahead of tokio from one configuration, and a request/response frame costs about a quarter fewer user-space instructions than in 0.8.0. By the harness's 8% rule most of the replication wins are ties; the losses (−7% to −32%, and the 80× small-request tail) are gone. All of it on loopback and one machine; a real NIC, cold caches and connection churn are still unmeasured ([TODO.md](TODO.md)).
+
 ## 0.9.0 (2026-11-07)
 Round 3 performance work on the request/response (replication) path, specified in [performance-improvement/ROUND3.md](performance-improvement/ROUND3.md), planned in [ROUND3-PLAN.md](performance-improvement/ROUND3-PLAN.md), measured in [round3/](performance-improvement/round3/) (gates [G0](performance-improvement/round3/G0.md), [G1](performance-improvement/round3/G1.md), [G2](performance-improvement/round3/G2.md), [G3](performance-improvement/round3/G3.md)). Everything new is opt-in; a default builder behaves as 0.8.0 did, only cheaper. Commits `957f8c5`..HEAD.
 

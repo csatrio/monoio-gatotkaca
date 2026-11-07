@@ -115,32 +115,34 @@ kernel is from memory and marked **to verify**. Nothing was built or measured fo
 
 ## Kernel statements to verify in wave 0
 
-| id | statement (from memory) | matters for | how |
-|---|---|---|---|
-| KV1 | A `DEFER_TASKRUN` ring runs at most max(20, `min_complete`) deferred task-work items per run (`IO_LOCAL_TW_DEFAULT_MAX`, 6.12+) and sets `IORING_SQ_TASKRUN` again when items are left. **G0: 6.13+; an enter that slept delivers exactly `min_complete` items** | D1: one drain enter handles at most 20 completions; `max` must be documented in those units | read `io_uring/io_uring.c` at v7.0; probe: 200 ready receives, count CQEs per enter |
-| KV2 | If a link member with `CQE_SKIP_SUCCESS` fails, the kernel posts its CQE and **skips** the CQEs of the cancelled members after it (`REQ_F_SKIP_LINK_CQES`). ROUND3.md assumes the opposite ("the receive's CQE always arrives") | C1 slot bookkeeping. If true, a pair posts exactly one CQE in every case | probe: SEND(skip, link) + RECV; cases: send ok, peer reset, short send on a full socket, invalid SQE at prep |
-| KV3 | `MSG_WAITALL` on a stream SEND retries a short send in the kernel and fails the link if it stays short | C1: "skipped" must mean "fully sent" | probe with a full socket buffer |
-| KV4 | The kernel copies the `msghdr` and imports the iovec when it prepares the SQE (at `io_uring_enter`), not when the SQE is pushed | A1: lifetime of the `msghdr` | read `io_uring/net.c` at v7.0 |
-| KV5 | `IORING_SEND_VECTORIZED` (vectored plain SEND, no `msghdr`) exists from 6.17 | A1 alternative | read the uapi header; probe |
+| id | statement (from memory) | matters for | how | G0 verdict |
+|---|---|---|---|---|
+| KV1 | A `DEFER_TASKRUN` ring runs at most max(20, `min_complete`) deferred task-work items per run (`IO_LOCAL_TW_DEFAULT_MAX`, 6.12+) and sets `IORING_SQ_TASKRUN` again when items are left | D1: one drain enter handles at most 20 completions; `max` must be documented in those units | read `io_uring/io_uring.c` at v7.0; probe: 200 ready receives, count CQEs per enter | partly: the cap is 6.13+, and an enter that slept delivers exactly `min_complete` items (one), not 20; the drain's doc counts in "at most 20 per enter" |
+| KV2 | If a link member with `CQE_SKIP_SUCCESS` fails, the kernel posts its CQE and **skips** the CQEs of the cancelled members after it (`REQ_F_SKIP_LINK_CQES`). ROUND3.md assumes the opposite ("the receive's CQE always arrives") | C1 slot bookkeeping. If true, a pair posts exactly one CQE in every case | probe: SEND(skip, link) + RECV; cases: send ok, peer reset, short send on a full socket, invalid SQE at prep | true: exactly one CQE in every case; `send_then_recv` tags the head's `user_data` (bit 61) to tell which member posted |
+| KV3 | `MSG_WAITALL` on a stream SEND retries a short send in the kernel and fails the link if it stays short | C1: "skipped" must mean "fully sent" | probe with a full socket buffer | true, with additions: without `WAITALL` a short send is skipped as a success; a send that fails after partial progress reports the byte count, not an errno; after 127 poll re-arms the send goes to io-wq |
+| KV4 | The kernel copies the `msghdr` and imports the iovec when it prepares the SQE (at `io_uring_enter`), not when the SQE is pushed | A1: lifetime of the `msghdr` | read `io_uring/net.c` at v7.0 | true (on SQPOLL rings later still): an inline `msghdr` in a movable future is unsound, hence the per-thread pool (E8) |
+| KV5 | `IORING_SEND_VECTORIZED` (vectored plain SEND, no `msghdr`) exists from 6.17 | A1 alternative | read the uapi header; probe | true: `1 << 5` in `ioprio`, no feature bit (older kernels answer `-EINVAL` at prep); adopted on 6.17+ with a once-per-process probe |
 
 A design below that depends on a statement is fixed only after its probe. **Verdicts: [round3/G0.md](round3/G0.md), section 1.**
 
 ## Efficiency alternatives found while reading
 
-"Adopt" means the alternative is clearly cheaper and replaces the code. "Measure" means quick-measure first.
+"Adopt" means the alternative is clearly cheaper and replaces the code. "Measure" means quick-measure first. The last column is the outcome (details in the package notes under `round3/`).
 
-| id | where | today | alternative | decision, package |
-|---|---|---|---|---|
-| E1 | `time/driver/entry.rs` | `CachePadded` (128-byte alignment) around the waker and the driver state of every timer | remove the padding; one runtime thread cannot false-share | adopt, r3-timer; assert `size_of::<Sleep>()` in a test |
-| E2 | `UringInner::push_op` | three SQ views per op | one view: check `is_full`, else the cold `reserve_sqes`; then push | adopt, r3-op |
-| E3 | `OpFuture::poll_result`, `Op` | `State::Done` assignment drops the `Op` shell through a call | move the op out by value and consume it, so `Done` drops nothing | adopt, r3-op |
-| E4 | `Op::driver` | `Rc` clone and drop per op | resolve the driver through `CURRENT`, or keep a pointer that is valid while the slot exists | measure, r3-op; adopt only if ≥ 1% of user instructions and an op dropped after the runtime ended stays safe |
-| E5 | op slot (`lifecycle.rs`, `ignored.rs`, `slab.rs`) | 72 bytes, two cache lines | 64 bytes at 64-byte alignment. Costs inline storage for dropped ops (48 → 40 bytes: `Bytes`/`BytesMut` ops would be boxed when dropped in flight) | measure, r3-slot: cycles and cache misses per frame at 2000 connections against a drop-heavy case (timeouts firing). Round 1 added the inline storage on purpose, so the lead confirms in a quiet slot |
-| E6 | `AsyncWriteRentExt::write_all` | wraps the buffer in a `Slice` and loops even when the first send takes everything | first send on the plain buffer, loop only after a short write | measure, r3-op (a second await point grows the future) |
-| E7 | S1 | ROUND3.md proposes a new `SendEagerFuture` | reuse `SendFuture` with `State::Ready`; carry a partial eager send as an offset inside `Send<T>` (fits in existing padding) | adopt, seed commit + r3-eager |
-| E8 | A1 | ROUND3.md proposes the `msghdr` inline in the op | unsound by finding 8 if KV4 holds. Use a per-thread free list of boxed `msghdr`s: no allocation in steady state, stable address | adopt, r3-vec; vectored SEND (KV5) as a follow-up to measure |
-| E9 | C1 | ROUND3.md: slot waits for one or two CQEs, told apart by order | KV2 held: always one CQE. The head's `user_data` carries bit 61 and the member position (bits 32..60), so the dispatcher knows which member posted; the hot path keeps one test (`>> 61 == 0`) | done, r3-pair |
-| E10 | B1 | ROUND3.md: window-based grow/shrink policy | keep retired buffers on a LIFO stack and publish from its top, so the published set is always the most recently used buffers | adopt, r3-bufring |
+| id | where | today | alternative | decision, package | outcome |
+|---|---|---|---|---|---|
+| E1 | `time/driver/entry.rs` | `CachePadded` (128-byte alignment) around the waker and the driver state of every timer | remove the padding; one runtime thread cannot false-share | adopt, r3-timer; assert `size_of::<Sleep>()` in a test | done: `Sleep` 640 bytes / alignment 128 → 72 / 8, `Deadline` 56; most of the 2,230 instructions a `timeout` per frame used to cost (r3-timer.md) |
+| E2 | `UringInner::push_op` | three SQ views per op | one view: check `is_full`, else the cold `reserve_sqes`; then push | adopt, r3-op | done (`27f21c3`) |
+| E3 | `OpFuture::poll_result`, `Op` | `State::Done` assignment drops the `Op` shell through a call | move the op out by value and consume it, so `Done` drops nothing | adopt, r3-op | done (`441af6d`); plus: the named futures' poll always inlined, `poll_op` fast path inlined with the page search out of line |
+| E4 | `Op::driver` | `Rc` clone and drop per op | resolve the driver through `CURRENT`, or keep a pointer that is valid while the slot exists | measure, r3-op; adopt only if ≥ 1% of user instructions and an op dropped after the runtime ended stays safe | not adopted: 0.7–0.8% of a frame even as an unsound upper bound, below the bar |
+| E5 | op slot (`lifecycle.rs`, `ignored.rs`, `slab.rs`) | 72 bytes, two cache lines | 64 bytes at 64-byte alignment. Costs inline storage for dropped ops (48 → 40 bytes: `Bytes`/`BytesMut` ops would be boxed when dropped in flight) | measure, r3-slot: cycles and cache misses per frame at 2000 connections against a drop-heavy case (timeouts firing). Round 1 added the inline storage on purpose, so the lead confirms in a quiet slot | done (`e3e1229`), and the 48 bytes of inline storage were kept: the slot's meta shrank instead, so `Bytes`/`BytesMut` ops dropped in flight still allocate nothing; confirmed in the quiet slot before G1 |
+| E6 | `AsyncWriteRentExt::write_all` | wraps the buffer in a `Slice` and loops even when the first send takes everything | first send on the plain buffer, loop only after a short write | measure, r3-op (a second await point grows the future) | done (`7a10f91`, `51aa1c9`): the short-write loop lives in its own block, `write_all::<Bytes>` stays 192 bytes; the one shape where it lost (LLVM stopped inlining `Op::recv_with`/`send_with_flags`) is fixed by `#[inline(always)]` on those four |
+| E7 | S1 | ROUND3.md proposes a new `SendEagerFuture` | reuse `SendFuture` with `State::Ready`; carry a partial eager send as an offset inside `Send<T>` (fits in existing padding) | adopt, seed commit + r3-eager | done: `send_eager` returns the plain `SendFuture`; the direct-send guard is a per-direction in-flight count in the stream |
+| E8 | A1 | ROUND3.md proposes the `msghdr` inline in the op | unsound by finding 8 if KV4 holds. Use a per-thread free list of boxed `msghdr`s: no allocation in steady state, stable address | adopt, r3-vec; vectored SEND (KV5) as a follow-up to measure | done: `driver/msghdr_pool.rs` (256 idle per thread) for `SENDMSG`; on 6.17+ a plain `SEND` with `IORING_SEND_VECTORIZED` and no `msghdr` at all (probed once per process). `send_vectored_zc` and the datagram ops still box theirs (TODO.md) |
+| E9 | C1 | ROUND3.md: slot waits for one or two CQEs, told apart by order | KV2 held: always one CQE. The head's `user_data` carries bit 61 and the member position (bits 32..60), so the dispatcher knows which member posted; the hot path keeps one test (`>> 61 == 0`) | done, r3-pair | done; also `uring::link_skip` for raw chains of the same shape |
+| E10 | B1 | ROUND3.md: window-based grow/shrink policy | keep retired buffers on a LIFO stack and publish from its top, so the published set is always the most recently used buffers | adopt, r3-bufring | done: intrusive reserve stack in `buf_ring.rs`; G1 B1 passes with 72 KiB buffers (16 KiB buffers lose 6% at 8 connections: a frame split over buffers costs a completion per piece) |
+
+Left out after measuring (both on the package branches only, now deleted; described in the notes): the pre-tick drain variant B (−12–15% at 2000 connections, r3-drain.md), the drain pause on a standing backlog (r3-drain.md, "The optional commit"), and the timer fresh list (under the 1% bar, r3-timer.md).
 
 ---
 
@@ -481,14 +483,12 @@ seed (r3-base)
 - r3-drain needs the D2 result and KV1; r3-pair needs KV2, KV3 and the merged slot layout; r3-vec needs KV4 and
   r3-eager's guard. Everything else in wave 1 needs only the wave-0 tree.
 
-## Open decisions (my default in brackets)
+## Open decisions (decided before the start)
 
-1. **Bench repo edits.** May the lead add the `--tune` items above to `sut-monoio` and point its
-   `[patch.crates-io]` at this tree, without committing there? [yes; otherwise a patch per gate for you to apply]
-2. **Gate runs.** They need a quiet machine and the `performance` governor. [the lead runs them when you say the
-   machine is free; the next wave starts after the gate]
-3. **Scope if time is short.** [G1 is the cut line: everything in waves 0 and 1 is a releasable 0.9.0; wave 2 can
-   follow as 0.9.x]
+1. **Bench repo edits.** Yes: the `--tune` items above were added to `sut-monoio` and `[patch.crates-io]` points at
+   this tree, uncommitted there (to be committed, and the patch removed, once 0.9.0 is published).
+2. **Gate runs.** The machine was quiet for the whole round; gates ran with no agent active.
+3. **Scope.** Not needed: both waves and all three gates were completed; 0.9.0 is the full round.
 
 ## Status
 
