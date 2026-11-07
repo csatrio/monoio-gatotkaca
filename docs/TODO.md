@@ -54,4 +54,3 @@ Measured so far (do not re-open): `defer` against `coop` (round 3 G0/G1: many co
 - 16 old rustdoc warnings (unresolved intra-doc links in `builder.rs`, `fs/file/mod.rs`, `net/udp.rs`, `time/interval.rs`, `net/tcp/cancel.rs`, `io/async_write_rent.rs`, `macros/join.rs`, `net/unix/socket_addr.rs`).
 - `rustfmt.toml` sets nightly-only options (import grouping, comment wrapping); with stable rustfmt they are ignored. Run nightly `cargo fmt` once to normalize.
 - `time/driver/entry.rs`, `same_waker`: its comment says the task wakers' vtable is a promoted constant with one address per inlining site; `task/waker.rs` now has one `#[inline(never)]` vtable per task type, so `Waker::will_wake` holds and the content comparison is only a fallback. Update the comment, or drop the fallback.
-- `reqresp`: `--path pair` is a stub until r3-pair lands; the `RESULT` line has no `accept=direct|fd` label.
