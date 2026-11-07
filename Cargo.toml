@@ -19,4 +19,4 @@ repository = "https://github.com/csatrio/monoio-gatotkaca"
 [workspace.dependencies]
 # The proc macros must be their own crate; publish it before the runtime.
 monoio-macros = { package = "adaptif-gatotkaca-monoio-macros", version = "0.2.0", path = "monoio-macros" }
-monoio = { package = "adaptif-gatotkaca-monoio", version = "0.8.0", path = "monoio", default-features = false }
+monoio = { package = "adaptif-gatotkaca-monoio", version = "0.9.0", path = "monoio", default-features = false }
