@@ -36,6 +36,18 @@ pub(crate) const EVENTFD_USERDATA: u64 = u64::MAX - 2;
 /// `user_data` of the driver's own `LINK_TIMEOUT` SQEs: their CQEs are only counted.
 const LINK_TIMEOUT_USERDATA: u64 = u64::MAX - 16;
 
+/// Tag bit on the `user_data` of the **head** of a `send_then_recv` pair (`op/send_recv.rs`):
+/// the send, pushed with `CQE_SKIP_SUCCESS`, whose CQE only arrives when it failed. Both
+/// members of a pair share one slab slot, so the slot index alone cannot say which member
+/// posted the one CQE of the pair; the tag does.
+///
+/// Why bit 61: the driver's slab indices are far below it, `uring::user_data` ids live at
+/// `0b10` in the top two bits (so `>> 61` gives `0b100`/`0b101`), the doorbells at
+/// `0b1101`/`0b1110` of the top four (`>> 61` gives `0b110`/`0b111`), and the driver's own
+/// cancel/timeout/eventfd values have every top bit set. So `>> 61 == 0` selects a plain op
+/// (one test, as `>> 62 == 0` did before) and `>> 61 == 1` the head of a pair.
+pub(crate) const PAIR_HEAD_TAG: u64 = 1 << 61;
+
 // `IORING_SETUP_*` flags (the `io-uring` crate has no accessor for them).
 const SETUP_IOPOLL: u32 = 1 << 0;
 const SETUP_SQPOLL: u32 = 1 << 1;
@@ -867,8 +879,10 @@ impl UringInner {
             match index {
                 #[cfg(feature = "sync")]
                 EVENTFD_USERDATA => self.eventfd_installed = false,
-                // Operations of this driver: `user_data` is a slab index.
-                _ if index >> 62 == 0 => {
+                // Operations of this driver: `user_data` is a slab index (bit 61 clear: the
+                // tail of a `send_then_recv` pair lands here too, it is the pair's plain
+                // completion).
+                _ if index >> 61 == 0 => {
                     metric!(if cqe.flags() & CQE_F_NOTIF != 0 {
                         self.stats.zc_notifs += 1;
                     });
@@ -894,6 +908,9 @@ impl UringInner {
                         self.deferred.push(slot);
                     }
                 }
+                // The head (send) of a `send_then_recv` pair failed; the pair's slot is
+                // `index` without the tag. Rare: a reset peer, a short send.
+                _ if index >> 61 == 1 => self.complete_pair_head(index, cqe, small_io_max),
                 // Operations pushed by the user, see `uring::user_data`.
                 _ if index >> 62 == 0b10 => self.external.push(index, cqe),
                 // Doorbells: a bell rung by another ring, or our own bell message completing.
@@ -909,6 +926,41 @@ impl UringInner {
                 // Driver internal (cancel, timeout) or unknown: nothing waits for it.
                 _ => (),
             }
+        }
+    }
+
+    /// The CQE of the head of a `send_then_recv` pair (`user_data` tagged with
+    /// [`PAIR_HEAD_TAG`]): the send failed, and the receive linked to it posts nothing
+    /// (`REQ_F_SKIP_LINK_CQES`). This is the pair's only CQE, so it completes the slot like any
+    /// single-shot completion, with [`PAIR_HEAD_FLAG`](super::op::send_recv::PAIR_HEAD_FLAG)
+    /// set in the stored flags so that the future knows which member reported. Out of line:
+    /// the hot path of `handle_cqe` pays one test for it.
+    #[cold]
+    #[inline(never)]
+    fn complete_pair_head(
+        &mut self,
+        tagged: u64,
+        cqe: &io_uring::cqueue::Entry,
+        small_io_max: u32,
+    ) {
+        let index = tagged & !PAIR_HEAD_TAG;
+        metric!(if let Some(mut slot) = self.ops.slab.get(index as _) {
+            if let Some((op, bucket)) = slot.take_op_ticks(self.tick) {
+                self.stats.op_ticks_by_opcode[op][bucket] += 1;
+            }
+        });
+        // A failed send is a small completion (an error, or a short count).
+        if small_io_max != 0 {
+            crate::scheduler::set_cqe_hint(cqe.result(), small_io_max);
+        }
+        let flags = cqe.flags() | super::op::send_recv::PAIR_HEAD_FLAG;
+        // SAFETY: the CQE comes from the kernel for the pair at `index` (never a fd).
+        let done = unsafe { self.ops.complete(index as _, cqe.result(), flags) };
+        if small_io_max != 0 {
+            crate::scheduler::clear_cqe_hint();
+        }
+        if let Some(slot) = done.deferred {
+            self.deferred.push(slot);
         }
     }
 
@@ -1298,6 +1350,95 @@ impl UringInner {
         Ok(index)
     }
 
+    /// Push the two SQEs of a `send_then_recv` pair (`op/send_recv.rs`) back to back, with one
+    /// reservation so the link is never split, **both on one slab slot**: the head (the send,
+    /// `IO_LINK | CQE_SKIP_SUCCESS`) with `user_data = index | PAIR_HEAD_TAG`, the tail (the
+    /// receive) with `user_data = index`. Exactly one of them posts a CQE (KV2), which
+    /// completes the slot. Returns the slot index; on failure nothing is left behind.
+    fn push_pair<T: super::op::send_recv::PairAble>(&mut self, data: &mut T) -> io::Result<usize> {
+        // Built before the SQ is looked at, see `push_op`.
+        let head = data.head_sqe();
+        let tail = data.uring_op();
+
+        // One SQ view for the room check and the push, see `push_op`.
+        let mut sq = self.uring.submission();
+        if sq.capacity() - sq.len() < 2 {
+            drop(sq);
+            self.reserve_sqes(2)?;
+            sq = self.uring.submission();
+        }
+
+        let index = self.ops.insert(false, OpKind::Single);
+        debug_assert!((index as u64) & PAIR_HEAD_TAG == 0);
+        let head = head.user_data(index as u64 | PAIR_HEAD_TAG);
+        let tail = tail.user_data(index as u64);
+
+        #[cfg(feature = "metrics")]
+        let opcodes = (head.get_opcode(), tail.get_opcode());
+
+        // Can't fail: there is room for both; if it does, free the slot again.
+        let pushed = unsafe { sq.push_multiple(&[head, tail]) };
+        drop(sq);
+        if pushed.is_err() {
+            return Err(self.push_failed(&[index]));
+        }
+        metric!(
+            self.stats.ops_by_opcode[(opcodes.0 as usize).min(63)] += 1;
+            self.stats.ops_by_opcode[(opcodes.1 as usize).min(63)] += 1;
+            if let Some(mut slot) = self.ops.slab.get(index) {
+                // The tail's opcode: in the normal case its CQE is the pair's.
+                slot.set_submit_tick(opcodes.1, self.tick);
+            }
+        );
+        Ok(index)
+    }
+
+    /// Push `data` as a `send_then_recv` pair and return its slot index; the caller keeps
+    /// `data` (see `op/send_recv.rs`).
+    pub(crate) fn submit_pair<T: super::op::send_recv::PairAble>(
+        this: &Rc<UnsafeCell<UringInner>>,
+        data: &mut T,
+    ) -> io::Result<usize> {
+        let inner = unsafe { &mut *this.get() };
+        inner.push_pair(data)
+    }
+
+    /// The future of a `send_then_recv` pair is dropped: [`drop_op`](Self::drop_op) (the slot
+    /// keeps `data` until the pair's CQE) and, with `async-cancel`, a cancel for each member.
+    pub(crate) fn drop_pair<T: 'static>(
+        this: &Rc<UnsafeCell<UringInner>>,
+        index: usize,
+        data: &mut Option<T>,
+    ) {
+        Self::drop_op(this, index, data, true);
+        #[cfg(feature = "async-cancel")]
+        Self::cancel_pair(this, index);
+    }
+
+    /// Push an `AsyncCancel` for each member of the `send_then_recv` pair at `index`, if it is
+    /// still in flight. A cancel by `user_data` finds only the member the kernel is running
+    /// (the other answers `-ENOENT`, which nobody reads), so both values are tried. Counts lost
+    /// cancels instead of failing, like [`push_cancel`](Self::push_cancel).
+    pub(crate) fn cancel_pair(this: &Rc<UnsafeCell<UringInner>>, index: usize) {
+        let inner = unsafe { &mut *this.get() };
+        if inner.reserve_sqes(2).is_err() {
+            metric!(inner.stats.cancels_lost += 2);
+            return;
+        }
+        // Reaping CQEs to make room may have completed (and freed) the pair.
+        if inner.ops.slab.get(index).is_none() {
+            return;
+        }
+        let cancels = [index as u64 | PAIR_HEAD_TAG, index as u64]
+            .map(|target| opcode::AsyncCancel::new(target).build().user_data(u64::MAX));
+        // Can't fail: `reserve_sqes` made room.
+        if unsafe { inner.uring.submission().push_multiple(&cancels) }.is_ok() {
+            metric!(inner.stats.cancels_pushed += 2);
+        } else {
+            metric!(inner.stats.cancels_lost += 2);
+        }
+    }
+
     /// Submit a chain of raw SQEs, see `uring::submit_chain`.
     pub(crate) fn submit_chain<const N: usize>(
         this: &Rc<UnsafeCell<UringInner>>,
@@ -1615,10 +1756,11 @@ impl Ops {
         Ops { slab: Slab::new() }
     }
 
-    /// Prefetch the slot of a driver op CQE (`user_data` is a slab index below 2^62).
+    /// Prefetch the slot of a driver op CQE (`user_data` is a slab index below 2^61; the
+    /// tagged head of a pair, see [`PAIR_HEAD_TAG`], is rare and skipped).
     #[inline]
     fn prefetch(&self, user_data: u64) {
-        if user_data >> 62 == 0 {
+        if user_data >> 61 == 0 {
             self.slab.prefetch(user_data as usize);
         }
     }
@@ -1626,7 +1768,7 @@ impl Ops {
     /// Prefetch the task (header) the waker of a driver op CQE would wake.
     #[inline]
     fn prefetch_task(&self, user_data: u64) {
-        if user_data >> 62 == 0 {
+        if user_data >> 61 == 0 {
             if let Some(waker) = self
                 .slab
                 .peek(user_data as usize)

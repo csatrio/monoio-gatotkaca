@@ -17,6 +17,7 @@ mod zero_copy;
 
 pub use crate::driver::op::{
     recv_multi::RecvBundleStream,
+    send_recv::{PairResult, SendThenRecv, SendThenRecvFixed},
     send_zc::{SendZcFuture, ZcPending},
 };
 pub use listener::TcpListener;
