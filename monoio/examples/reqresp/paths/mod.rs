@@ -21,6 +21,7 @@ pub mod mshot;
 pub mod pair;
 pub mod pipe;
 pub mod plain;
+pub mod vec;
 
 use std::{
     any::Any,
@@ -52,6 +53,7 @@ pub enum Path {
     Mshot,
     Eager,
     Pair,
+    Vec,
 }
 
 impl Path {
@@ -62,6 +64,7 @@ impl Path {
             "mshot" => Path::Mshot,
             "eager" => Path::Eager,
             "pair" => Path::Pair,
+            "vec" => Path::Vec,
             _ => return None,
         })
     }
@@ -73,6 +76,7 @@ impl Path {
             Path::Mshot => "mshot",
             Path::Eager => "eager",
             Path::Pair => "pair",
+            Path::Vec => "vec",
         }
     }
 }
@@ -155,6 +159,7 @@ pub fn setup(ctx: &Ctx) -> io::Result<()> {
         Path::Mshot => mshot::setup(ctx),
         Path::Eager => eager::setup(ctx),
         Path::Pair => pair::setup(ctx),
+        Path::Vec => vec::setup(ctx),
     }
 }
 
@@ -166,6 +171,7 @@ pub async fn conn(stream: TcpStream, ctx: Rc<Ctx>) {
         Path::Mshot => mshot::serve(stream, &ctx).await,
         Path::Eager => eager::serve(stream, &ctx).await,
         Path::Pair => pair::serve(stream, &ctx).await,
+        Path::Vec => vec::serve(stream, &ctx).await,
     };
     if let Err(e) = res {
         let n = ctx.count.errors.get();

@@ -58,7 +58,7 @@ one server core
                        a byte-serial pass, about 2 us per KiB: models a server that encrypts
                        its stream chunks; may exceed --chunk)
   --think US           client pause between a reply and its next frame, microseconds (default 0)
-  --path P             plain | pipe | mshot | eager | pair (default pipe)
+  --path P             plain | pipe | mshot | eager | pair | vec (default pipe)
   --deadline D         none | timeout | coarse | timeoutpin | deadline | nonepin (default none)
   --ring a,b,..        coop, defer, skipenter, ringfd, fixedfd, minwait<us>, drain<N>
                        (default: none)
