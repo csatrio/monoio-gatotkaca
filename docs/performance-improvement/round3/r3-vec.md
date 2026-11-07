@@ -5,6 +5,8 @@ Branch `r3/r3-vec` on `r3-g1`, two commits:
 1. `feat(net): send_vectored_op, msghdr pool instead of a box per vectored send (r3-vec: A1)`
 2. `perf(net): vectored sends as a plain SEND with IORING_SEND_VECTORIZED on 6.17+ (r3-vec: KV5)`
 
+plus this file and a doc-comment commit (`docs(net): send_vectored_op docs name both SQE forms`).
+
 Files (all in the package's list): `driver/msghdr_pool.rs` (was empty), `driver/op/send.rs` (`SendMsgVec`),
 `io/futures.rs` (one `named_future!` and its import), `net/tcp/vectored.rs`, `net/unix/vectored.rs` (were
 empty), `net/tcp/split.rs` and `net/unix/split.rs` (the two methods on the write halves), `tests/named_futures.rs`

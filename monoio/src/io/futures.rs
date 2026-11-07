@@ -322,14 +322,14 @@ named_future! {
 }
 
 named_future! {
-    /// An in-flight vectored send (`sendmsg` with `MSG_NOSIGNAL`), returned by
-    /// `send_vectored_op` and `send_vectored_with_flags_op` on
-    /// [`TcpStream`](crate::net::TcpStream), [`UnixStream`](crate::net::UnixStream) and the
-    /// owned write halves. Same op and result as
+    /// An in-flight vectored send with `MSG_NOSIGNAL` (a `SEND` with `IORING_SEND_VECTORIZED`
+    /// on Linux 6.17+, else `sendmsg`), returned by `send_vectored_op` and
+    /// `send_vectored_with_flags_op` on [`TcpStream`](crate::net::TcpStream),
+    /// [`UnixStream`](crate::net::UnixStream) and the owned write halves. Same op and result as
     /// [`TcpStream::send_vectored`](crate::net::TcpStream::send_vectored): a reset peer gives
-    /// `EPIPE`/`ECONNRESET`, never `SIGPIPE`. No allocation per send (the `msghdr` comes from
-    /// a per-thread free list), so with an [`IoVecArray`](crate::buf::IoVecArray) the steady
-    /// state allocates nothing.
+    /// `EPIPE`/`ECONNRESET`, never `SIGPIPE`. No allocation per send (the `sendmsg` form takes
+    /// its `msghdr` from a per-thread free list), so with an
+    /// [`IoVecArray`](crate::buf::IoVecArray) the steady state allocates nothing.
     SendVectoredFuture<T: IoVecBuf> => SendMsgVec<T>
 }
 

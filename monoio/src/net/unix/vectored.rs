@@ -6,7 +6,7 @@ use super::UnixStream;
 use crate::{buf::IoVecBuf, driver::op::Op, io::futures::SendVectoredFuture, net::MsgFlags};
 
 impl UnixStream {
-    /// Starts a vectored send of `bufs` (`sendmsg` with `MSG_NOSIGNAL`) and returns it as a
+    /// Starts a vectored send of `bufs` (with `MSG_NOSIGNAL`) and returns it as a
     /// named [`SendVectoredFuture`]. Same SQE and result as
     /// [`send_vectored`](Self::send_vectored); see
     /// [`TcpStream::send_vectored_op`](crate::net::TcpStream::send_vectored_op).
