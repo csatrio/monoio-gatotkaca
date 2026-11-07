@@ -5,7 +5,7 @@ use crate::{
     buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut},
     io::{
         as_fd::{AsReadFd, AsWriteFd, SharedFdWrapper},
-        futures::{ReadvFuture, RecvFuture, SendFuture, WritevFuture},
+        futures::{ReadvFuture, RecvFuture, SendFuture, SendVectoredFuture, WritevFuture},
         OwnedReadHalf, OwnedWriteHalf,
     },
     net::MsgFlags,
@@ -150,6 +150,22 @@ impl TcpOwnedWriteHalf {
     #[inline]
     pub fn writev_op<T: IoVecBuf>(&self, buf_vec: T) -> WritevFuture<T> {
         unsafe { &*self.0.get() }.writev_op(buf_vec)
+    }
+
+    /// See [`TcpStream::send_vectored_op`]. The future does not borrow the half.
+    #[inline]
+    pub fn send_vectored_op<T: IoVecBuf>(&self, bufs: T) -> SendVectoredFuture<T> {
+        unsafe { &*self.0.get() }.send_vectored_op(bufs)
+    }
+
+    /// See [`TcpStream::send_vectored_with_flags_op`].
+    #[inline]
+    pub fn send_vectored_with_flags_op<T: IoVecBuf>(
+        &self,
+        bufs: T,
+        flags: MsgFlags,
+    ) -> SendVectoredFuture<T> {
+        unsafe { &*self.0.get() }.send_vectored_with_flags_op(bufs, flags)
     }
 
     /// See [`TcpStream::try_send`]: one non-blocking `send(2)`; `WouldBlock` also while a ring

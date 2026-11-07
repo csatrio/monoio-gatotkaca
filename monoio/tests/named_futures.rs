@@ -12,8 +12,11 @@ use std::{
 };
 
 use monoio::{
-    buf::VecBuf,
-    io::futures::{ReadAtFuture, ReadvFuture, RecvFuture, SendFuture, WriteAtFuture, WritevFuture},
+    buf::{IoVecArray, VecBuf},
+    io::futures::{
+        ReadAtFuture, ReadvFuture, RecvFuture, SendFuture, SendVectoredFuture, WriteAtFuture,
+        WritevFuture,
+    },
     net::{MsgFlags, TcpListener, TcpStream, UnixStream},
     BufResult,
 };
@@ -71,6 +74,7 @@ struct Stored {
     send: Option<SendFuture<Vec<u8>>>,
     readv: Option<ReadvFuture<VecBuf>>,
     writev: Option<WritevFuture<VecBuf>>,
+    send_vectored: Option<SendVectoredFuture<IoVecArray<Vec<u8>, 3>>>,
     read_at: Option<ReadAtFuture<Vec<u8>>>,
     write_at: Option<WriteAtFuture<&'static [u8]>>,
 }
@@ -83,6 +87,8 @@ fn named_futures_are_unpin_and_static() {
     assert_unpin_static::<SendFuture<Vec<u8>>>();
     assert_unpin_static::<ReadvFuture<VecBuf>>();
     assert_unpin_static::<WritevFuture<VecBuf>>();
+    assert_unpin_static::<SendVectoredFuture<VecBuf>>();
+    assert_unpin_static::<SendVectoredFuture<IoVecArray<Vec<u8>, 3>>>();
     assert_unpin_static::<ReadAtFuture<Vec<u8>>>();
     assert_unpin_static::<WriteAtFuture<Vec<u8>>>();
     assert_unpin_static::<Stored>();
@@ -119,6 +125,28 @@ async fn echo_ops<S: OpStream>(a: &S, b: &S) {
     let (res, buf) = b.recv_flags(Vec::with_capacity(4), MsgFlags::WAITALL).await;
     assert_eq!(res.unwrap(), 4);
     assert_eq!(&buf, b"more");
+
+    // send_vectored_op: three iovecs (header, body, trailer) in one sendmsg
+    let mut parts: IoVecArray<Vec<u8>, 3> = IoVecArray::new();
+    parts.push(b"head|".to_vec()).unwrap();
+    parts.push(b"body".to_vec()).unwrap();
+    parts.push(b"|tail".to_vec()).unwrap();
+    let (res, parts) = a.send_vectored(parts).await;
+    assert_eq!(res.unwrap(), 14);
+    assert_eq!(parts.len(), 3, "the buffers come back untouched");
+    let (res, buf) = b
+        .recv_flags(Vec::with_capacity(14), MsgFlags::WAITALL)
+        .await;
+    assert_eq!(res.unwrap(), 14);
+    assert_eq!(&buf, b"head|body|tail");
+
+    // send_vectored_with_flags_op, with VecBuf
+    let iov: VecBuf = vec![b"wait".to_vec(), b"all".to_vec()].into();
+    let (res, _) = a.send_vectored_flags(iov, MsgFlags::WAITALL).await;
+    assert_eq!(res.unwrap(), 7);
+    let (res, buf) = b.recv_flags(Vec::with_capacity(7), MsgFlags::WAITALL).await;
+    assert_eq!(res.unwrap(), 7);
+    assert_eq!(&buf, b"waitall");
 }
 
 /// Small shim so the echo runs over both stream types.
@@ -129,6 +157,11 @@ trait OpStream {
     fn recv_flags(&self, buf: Vec<u8>, flags: MsgFlags) -> RecvFuture<Vec<u8>>;
     fn writev(&self, buf: VecBuf) -> WritevFuture<VecBuf>;
     fn readv(&self, buf: VecBuf) -> ReadvFuture<VecBuf>;
+    fn send_vectored(
+        &self,
+        bufs: IoVecArray<Vec<u8>, 3>,
+    ) -> SendVectoredFuture<IoVecArray<Vec<u8>, 3>>;
+    fn send_vectored_flags(&self, bufs: VecBuf, flags: MsgFlags) -> SendVectoredFuture<VecBuf>;
 }
 
 macro_rules! op_stream {
@@ -151,6 +184,19 @@ macro_rules! op_stream {
             }
             fn readv(&self, buf: VecBuf) -> ReadvFuture<VecBuf> {
                 self.readv_op(buf)
+            }
+            fn send_vectored(
+                &self,
+                bufs: IoVecArray<Vec<u8>, 3>,
+            ) -> SendVectoredFuture<IoVecArray<Vec<u8>, 3>> {
+                self.send_vectored_op(bufs)
+            }
+            fn send_vectored_flags(
+                &self,
+                bufs: VecBuf,
+                flags: MsgFlags,
+            ) -> SendVectoredFuture<VecBuf> {
+                self.send_vectored_with_flags_op(bufs, flags)
             }
         }
     };
@@ -192,6 +238,60 @@ async fn split_halves_ops() {
         .await;
     assert_eq!(res.unwrap(), 4);
     assert_eq!(&buf, b"pong");
+
+    // send_vectored_op on the write halves, both directions
+    let mut parts: IoVecArray<Vec<u8>, 2> = IoVecArray::new();
+    parts.push(b"vec".to_vec()).unwrap();
+    parts.push(b"tored".to_vec()).unwrap();
+    let (res, _) = aw.send_vectored_op(parts).await;
+    assert_eq!(res.unwrap(), 8);
+    let (res, buf) = br
+        .recv_with_flags_op(Vec::with_capacity(8), MsgFlags::WAITALL)
+        .await;
+    assert_eq!(res.unwrap(), 8);
+    assert_eq!(&buf, b"vectored");
+    let (res, _) = bw
+        .send_vectored_with_flags_op(
+            VecBuf::from(vec![b"ba".to_vec(), b"ck".to_vec()]),
+            MsgFlags::WAITALL,
+        )
+        .await;
+    assert_eq!(res.unwrap(), 4);
+    let (res, buf) = ar
+        .recv_with_flags_op(Vec::with_capacity(4), MsgFlags::WAITALL)
+        .await;
+    assert_eq!(res.unwrap(), 4);
+    assert_eq!(&buf, b"back");
+}
+
+#[monoio::test]
+async fn unix_split_halves_vectored_ops() {
+    use monoio::io::Splitable;
+    let (a, b) = UnixStream::pair().unwrap();
+    let (ar, aw) = a.into_split();
+    let (br, bw) = b.into_split();
+    let mut parts: IoVecArray<Vec<u8>, 2> = IoVecArray::new();
+    parts.push(b"uni".to_vec()).unwrap();
+    parts.push(b"x".to_vec()).unwrap();
+    let (res, _) = aw.send_vectored_op(parts).await;
+    assert_eq!(res.unwrap(), 4);
+    let (res, buf) = br
+        .recv_with_flags_op(Vec::with_capacity(4), MsgFlags::WAITALL)
+        .await;
+    assert_eq!(res.unwrap(), 4);
+    assert_eq!(&buf, b"unix");
+    let (res, _) = bw
+        .send_vectored_with_flags_op(
+            VecBuf::from(vec![b"so".to_vec(), b"ck".to_vec()]),
+            MsgFlags::EMPTY,
+        )
+        .await;
+    assert_eq!(res.unwrap(), 4);
+    let (res, buf) = ar
+        .recv_with_flags_op(Vec::with_capacity(4), MsgFlags::WAITALL)
+        .await;
+    assert_eq!(res.unwrap(), 4);
+    assert_eq!(&buf, b"sock");
 }
 
 #[monoio::test]

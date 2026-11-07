@@ -23,7 +23,9 @@
 //!
 //! The methods that create them end in `_op`: [`TcpStream::recv_op`](crate::net::TcpStream::recv_op),
 //! [`send_op`](crate::net::TcpStream::send_op), [`readv_op`](crate::net::TcpStream::readv_op),
-//! [`writev_op`](crate::net::TcpStream::writev_op), the `*_with_flags_op` variants, the same on
+//! [`writev_op`](crate::net::TcpStream::writev_op),
+//! [`send_vectored_op`](crate::net::TcpStream::send_vectored_op), the `*_with_flags_op`
+//! variants, the same on
 //! [`UnixStream`](crate::net::UnixStream) and on the owned split halves, and
 //! [`File::read_at_op`](crate::fs::File::read_at_op) /
 //! [`File::write_at_op`](crate::fs::File::write_at_op). They take `&self` and the returned future
@@ -91,7 +93,7 @@ use crate::{
     driver::op::{
         read::{ReadAt, ReadVec},
         recv::Recv,
-        send::Send as SendData,
+        send::{Send as SendData, SendMsgVec},
         write::{WriteAt, WriteVec},
         Completion, Op, OpAble,
     },
@@ -317,6 +319,18 @@ named_future! {
     /// streams. Note: like `writev`, a reset peer can raise `SIGPIPE`; use
     /// `send_vectored` when that matters.
     WritevFuture<T: IoVecBuf> => WriteVec<T>
+}
+
+named_future! {
+    /// An in-flight vectored send (`sendmsg` with `MSG_NOSIGNAL`), returned by
+    /// `send_vectored_op` and `send_vectored_with_flags_op` on
+    /// [`TcpStream`](crate::net::TcpStream), [`UnixStream`](crate::net::UnixStream) and the
+    /// owned write halves. Same op and result as
+    /// [`TcpStream::send_vectored`](crate::net::TcpStream::send_vectored): a reset peer gives
+    /// `EPIPE`/`ECONNRESET`, never `SIGPIPE`. No allocation per send (the `msghdr` comes from
+    /// a per-thread free list), so with an [`IoVecArray`](crate::buf::IoVecArray) the steady
+    /// state allocates nothing.
+    SendVectoredFuture<T: IoVecBuf> => SendMsgVec<T>
 }
 
 named_future! {
