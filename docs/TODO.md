@@ -6,7 +6,7 @@ What is still open after round 3 (0.9.0). Item ids (A1, F7, ...) refer to [perfo
 Measured so far (do not re-open): `defer` against `coop` (round 3 G0/G1: many connections → `defer`), `skip_empty_enter` and `register_ring_fd` (in every round-3 variant, not isolated), `min_wait` (round 3 G1, `minwait80`), `task_budget`/`lifo_slot`/`small_io_priority` (round 2 G2/G3), multishot accept (round 2 G0, round 3 G0/G1), multishot recv and the working set (round 2 G3, round 3 G1), fixed files and direct accept (round 2 G3, round 3 G1), fixed buffers and `zc` (round 2 G0/G2), `drain_taskrun`, `send_eager`, `Deadline` (round 3 G1). All on loopback.
 - Recv bundles (`recv_multi_bundle`, `recv_bundle`) and `send_zc_early` have no gate run of their own.
 - Confirm the TLS write counts (A15) with `strace -c` on a real 64 KiB TLS echo. Today they come from a counting wrapper in `tests/tls_throughput.rs`.
-- `event_channel`: the 1/4/8-producer comparison against the 0.6.0 mutex queue was a throwaway test (1M `u64` messages, best of 5). Add it as a proper benchmark and run it on the target hardware, also with larger `T`.
+- `event_channel` and remote wakes: `examples/lfq_bench.rs` (`--features sync`) is the benchmark now (1M `u64` messages into one receiver from 1/4/8 pinned producers, best of 5; 256 tasks woken from 1/4/8 threads). Run it on the target hardware, and with a larger `T` than `u64`.
 - Fixed files (A3) and direct accept: measured on loopback only (round 3 G1: direct accept +0.4% against `register_fixed`, 3 syscalls fewer per connection). Measure on a real NIC, and on a connection-churn load (accept and close per request), where the per-connection savings would show.
 - Zero-copy receive (`zcrx`) and NAPI busy poll need a real NIC (ROUND3.md, "Not asked").
 

@@ -18,7 +18,7 @@ name = "monoio"
 [dependencies]
 # Lock-free Treiber stack, cache padding and CAS backoff (re-exported crossbeam-utils) for
 # `uring::event_channel` and the remote-waker queue.
-adaptif-gatotkaca-utils = "0.11.3"
+adaptif-gatotkaca-utils = "0.11.4"
 monoio-macros = { workspace = true, optional = true }
 
 auto-const-array = "0.2.2"
@@ -117,3 +117,7 @@ required-features = ["bytes", "utils"]
 name = "reqresp"
 path = "examples/reqresp/main.rs"
 required-features = ["bytes", "utils"]
+
+[[example]]
+name = "lfq_bench"
+required-features = ["utils"]
